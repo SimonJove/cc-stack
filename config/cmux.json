@@ -1,0 +1,38 @@
+{
+  "$schema" : "https://raw.githubusercontent.com/manaflow-ai/cmux/main/web/data/cmux.schema.json",
+  "schemaVersion" : 1,
+  "app" : {
+    "minimalMode" : true,
+    "reorderOnNotification" : false,
+    "globalFontMagnification" : 120
+  },
+  "markdown" : {
+    "fontSize" : 14
+  },
+  "shortcuts" : {
+    "bindings" : {
+      "showHideAllWindows" : {
+        "first" : {
+          "command" : false,
+          "control" : false,
+          "key" : " ",
+          "keyCode" : 49,
+          "option" : true,
+          "shift" : false
+        }
+      },
+      "nextSidebarTab" : {
+        "first" : { "command" : true, "control" : false, "option" : false, "shift" : false, "key" : "j", "keyCode" : 38 }
+      },
+      "prevSidebarTab" : {
+        "first" : { "command" : true, "control" : false, "option" : false, "shift" : false, "key" : "k", "keyCode" : 40 }
+      },
+      "prevSurface" : {
+        "first" : { "command" : true, "control" : false, "option" : false, "shift" : false, "key" : "h", "keyCode" : 4 }
+      },
+      "nextSurface" : {
+        "first" : { "command" : true, "control" : false, "option" : false, "shift" : false, "key" : "l", "keyCode" : 37 }
+      }
+    }
+  }
+}

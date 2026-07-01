@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# cc-stack · claude launch router
+#   - inside cmux + interactive launch → cmux claude-teams (team-ready; teammates can be spawned mid-task)
+#   - subcommands (mcp/config…), headless (-p), queries (--version/-h) → native claude
+#   - remote (SSH) or inside Zellij (no cmux GUI) → native claude
+# Force native temporarily: command claude …  or  \claude …
+set -u
+
+case "${1:-}" in
+  -p|--print|--version|-v|-h|--help|mcp|config|agents|doctor|update|install|migrate-installer|setup-token|setup)
+    exec claude "$@" ;;
+esac
+
+# headless/print flags may not be first (e.g. claude --model x -p "..."); scan all args to catch them
+for _a in "$@"; do
+  case "$_a" in -p|--print) exec claude "$@" ;; esac
+done
+
+# Note: use CMUX_PANEL_ID to detect "inside cmux". CMUX_SOCKET is often empty in cmux-spawned shells;
+# the old code used it and so always fell through to else → claude/cld never actually entered claude-teams.
+if [ -n "${CMUX_PANEL_ID:-}" ] && [ -z "${ZELLIJ:-}" ] && [ -z "${SSH_CONNECTION:-}" ]; then
+  exec cmux claude-teams "$@"     # inside cmux: team-ready launch
+else
+  exec claude "$@"                # remote / Zellij / non-cmux: native claude
+fi
