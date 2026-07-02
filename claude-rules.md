@@ -31,3 +31,7 @@ Whether spawned automatically or started manually via `gwt-claude`, a worktree s
 - When a sub-task finishes implementing, **stop and report back**: what changed, test results, branch name — then **wait for my authorization**. Default to "keep the branch / don't land".
 - **Don't** let the superpowers `finishing-a-development-branch` skill auto-run "merge + remove worktree" — in an unattended autonomous sub-task it picks "merge locally" by itself. **This rule takes priority over that skill**: it may only "present options and stop for me", never pick merge/discard on my behalf.
 - The only exception: do the corresponding step only when I explicitly say "commit it / merge it / clean it up / delete it / discard".
+- When a sub-task finishes implementing and has reported back, run `gwt-done`
+  to light it green on `gwt-tree`. Its merge target was recorded automatically
+  at creation — you do not decide where to merge. Merging itself is a separate,
+  human-gated step (`gwt-merge` / `gwt-collect`); never merge autonomously.

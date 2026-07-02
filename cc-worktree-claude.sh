@@ -31,6 +31,7 @@ else
 fi
 echo "✔ worktree : $wtpath"
 echo "✔ branch   : $branch"
+"$HOME/.config/cc-stack/cc-merge.sh" capture "$root" "$branch" "$PWD" >/dev/null 2>&1
 
 # ── Delegate: open tab + copy .env + start ccteam (plan) + pre-trust + send prompt + register ──
 exec "$HOME/.config/cc-stack/cc-cmux-surface-claude.sh" "$wtpath" "$prompt"

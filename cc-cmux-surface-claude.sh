@@ -43,6 +43,16 @@ if [ -n "$root" ] && [ "$root" != "$abspath" ]; then
   done
 fi
 
+# Record the merge target (parent = caller's branch) — HOOK PATH ONLY.
+# On the gwt-claude path CC_CALLER_CWD is unset and cc-worktree-claude.sh already
+# captured with the real caller cwd; skipping here avoids overwriting it.
+if [ -n "${CC_CALLER_CWD:-}" ] && command -v git >/dev/null 2>&1; then
+  _root="$(git -C "$abspath" rev-parse --git-common-dir 2>/dev/null)" && _root="$(cd "$_root/.." && pwd -P)"
+  _br="$(git -C "$abspath" symbolic-ref --short HEAD 2>/dev/null)"
+  [ -n "$_root" ] && [ -n "$_br" ] && \
+    "$HOME/.config/cc-stack/cc-merge.sh" capture "$_root" "$_br" "$CC_CALLER_CWD" >/dev/null 2>&1
+fi
+
 # Pre-authorize trust for this worktree, skipping claude's "Do you trust this folder?" prompt (more robust than screen-scraping; CC_WT_PRETRUST=0 disables)
 [ "${CC_WT_PRETRUST:-1}" != "0" ] && "$HOME/.config/cc-stack/cc-trust.sh" "$abspath" >/dev/null 2>&1
 
@@ -81,8 +91,8 @@ done
 full="$prompt"
 if [ -n "$prompt" ]; then
   full="$full
-——[Working agreement] (1) You are in plan mode: present a plan first and wait for human approval before changing code; don't start editing right away. (2) Follow this project's own CLAUDE.md and .claude config (harness) throughout; don't drift toward your own defaults. (3) After making changes, commit / rebase / merge / push / removing the worktree or branch ALL require human authorization — even if the finishing-a-development-branch skill prompts you, just stop at 'keep the branch'."
-  [ -n "$caller_surface" ] && full="$full (4) To report back / ask the main task: cmux send --surface $caller_surface \"message\" then cmux send-key --surface $caller_surface Enter."
+——[Working agreement] (1) You are in plan mode: present a plan first and wait for human approval before changing code; don't start editing right away. (2) Follow this project's own CLAUDE.md and .claude config (harness) throughout; don't drift toward your own defaults. (3) After making changes, commit / rebase / merge / push / removing the worktree or branch ALL require human authorization — even if the finishing-a-development-branch skill prompts you, just stop at 'keep the branch'. (4) When you finish implementing and have reported back, run \`gwt-done\` to mark this branch ready; your merge target is already recorded, so you never choose where to merge, and you never merge without my authorization."
+  [ -n "$caller_surface" ] && full="$full (5) To report back / ask the main task: cmux send --surface $caller_surface \"message\" then cmux send-key --surface $caller_surface Enter."
 fi
 
 # Start the team-ready claude (ccteam). Key point: don't type the prompt straight into the terminal (a very long line gets shredded,

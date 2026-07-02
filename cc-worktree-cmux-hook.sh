@@ -138,6 +138,7 @@ prompt="${line#*$'\t'}"
 [ -n "$newpath" ] || exit 0
 
 # Synchronously open surface + start ccteam (+send prompt). Must be synchronous: see the header notes.
-"$HOME/.config/cc-stack/cc-cmux-surface-claude.sh" "$newpath" "$prompt" >/dev/null 2>&1
+CC_CALLER_CWD="$(printf '%s' "$input" | python3 -c 'import json,sys;d=json.load(sys.stdin);print(d.get("cwd",""))' 2>/dev/null || true)" \
+  "$HOME/.config/cc-stack/cc-cmux-surface-claude.sh" "$newpath" "$prompt" >/dev/null 2>&1
 
 exit 0

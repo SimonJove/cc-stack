@@ -85,6 +85,7 @@ gwt-new() {
     fi
   done
   echo "✔ worktree: $wtpath   branch: $branch"
+  ~/.config/cc-stack/cc-merge.sh capture "$root" "$branch" "$PWD" >/dev/null 2>&1
   # When inside cmux, open a workspace (empty shell, focus it) for this worktree; no-op when not in cmux
   ~/.config/cc-stack/cc-cmux-workspace.sh "$wtpath" "$name" true >/dev/null 2>&1
   cd "$wtpath"
@@ -158,6 +159,144 @@ gwt-prune() {
   echo "✔ task list compacted"
 }
 
+# _gwt_tree_render <node> <prefix> — recursive tree drawer (uses _gt_* globals set by gwt-tree)
+_gwt_tree_render() {
+  emulate -L zsh
+  local node="$1" prefix="$2"
+  local kids=(${=_gt_kids[$node]:-})
+  local n=${#kids} i=1 kid conn childprefix
+  for kid in $kids; do
+    if (( i == n )); then conn="└─ "; childprefix="$prefix   "; else conn="├─ "; childprefix="$prefix│  "; fi
+    local ahead="${_gt_ahead[$kid]}" dirty="${_gt_dirty[$kid]}" dn="${_gt_done[$kid]}"
+    local doneflag=""; [[ "$dn" == done ]] && doneflag="✓done"
+    local rf="${_gt_ref[$kid]:-}" tab=""
+    if [[ -z "$_gt_live" ]]; then tab="?"
+    elif [[ -n "$rf" ]] && grep -qF "$rf" <<<"$_gt_live"; then tab="✔live"
+    elif [[ -n "$rf" ]]; then tab="⌫closed"; else tab="-"; fi
+    local ready=""
+    # NOTE: tab= and ready= MUST keep initial values — a bare `local x` in this
+    # recursive function reprints x (zsh typeset-p behavior) at depth >=2.
+    if [[ "$dirty" == clean && "$dn" == done ]]; then ready="ready ✅"; else ready="not ready ⏳"; fi
+    local grandkids=(${=_gt_kids[$kid]:-}) summary=""
+    if (( ${#grandkids} )); then
+      local r=0 gk
+      for gk in $grandkids; do [[ "${_gt_dirty[$gk]}" == clean && "${_gt_done[$gk]}" == done ]] && (( r++ )); done
+      summary="  children: $r/${#grandkids} ready"
+    fi
+    printf '%s%s%-14s ↑%-3s %-5s %-6s [%s]  → %s%s\n' \
+      "$prefix" "$conn" "$kid" "$ahead" "$dirty" "$doneflag" "$tab" "$ready" "$summary"
+    _gwt_tree_render "$kid" "$childprefix"
+    (( i++ ))
+  done
+}
+
+# gwt-tree — hierarchical board: nested branch tree by merge-target, git state, ready flag, tab liveness
+gwt-tree() {
+  emulate -L zsh
+  local root; root="$(_gwt_root)" || { echo "✗ not inside a git repo"; return 1 }
+  local data; data="$(~/.config/cc-stack/cc-merge.sh tree "$root")"
+  [[ -n "$data" ]] || { echo "no worktree branches (nothing to show)"; return 0 }
+  local trunk; trunk="$(~/.config/cc-stack/cc-merge.sh trunk "$root")"
+  # tab liveness (best-effort)
+  typeset -gA _gt_ref _gt_parent _gt_ahead _gt_dirty _gt_done _gt_kids
+  _gt_ref=(); _gt_parent=(); _gt_ahead=(); _gt_dirty=(); _gt_done=(); _gt_kids=()
+  _gt_live=""
+  command -v cmux >/dev/null 2>&1 && cmux ping >/dev/null 2>&1 && _gt_live="$(cmux list-pane-surfaces 2>/dev/null)"
+  local f; f="$(_gwt_tasks_file)"
+  if [[ -f "$f" ]]; then
+    local ts br rf dir cl tk
+    while IFS=$'\t' read -r ts br rf dir cl tk; do [[ -n "$br" ]] && _gt_ref[$br]="$rf"; done < "$f"
+  fi
+  local branch parent ahead dirty dn
+  while IFS=$'\t' read -r branch parent ahead dirty dn; do
+    [[ -n "$branch" ]] || continue
+    _gt_parent[$branch]="$parent"; _gt_ahead[$branch]="$ahead"
+    _gt_dirty[$branch]="$dirty"; _gt_done[$branch]="$dn"
+    _gt_kids[$parent]="${_gt_kids[$parent]:-} $branch"
+  done <<< "$data"
+  echo "$trunk"
+  _gwt_tree_render "$trunk" ""
+  unset _gt_ref _gt_parent _gt_ahead _gt_dirty _gt_done _gt_kids _gt_live
+}
+
+# gwt-done / gwt-undone — mark the current worktree's branch ready (harmless annotation, no gate)
+gwt-done() {
+  emulate -L zsh
+  local root b; root="$(_gwt_root)" || return 1
+  b="$(git symbolic-ref --short HEAD 2>/dev/null)" || { echo "✗ detached HEAD"; return 1 }
+  ~/.config/cc-stack/cc-merge.sh done "$root" "$b" true && echo "✔ $b marked ready (gwt-done)"
+}
+gwt-undone() {
+  emulate -L zsh
+  local root b; root="$(_gwt_root)" || return 1
+  b="$(git symbolic-ref --short HEAD 2>/dev/null)" || { echo "✗ detached HEAD"; return 1 }
+  ~/.config/cc-stack/cc-merge.sh done "$root" "$b" false && echo "✔ $b marked not-ready"
+}
+
+# gwt-merge <name-or-branch> [--squash|--no-ff|--rebase] [--into <b>] [--force] — GATED merge
+gwt-merge() {
+  emulate -L zsh
+  local root; root="$(_gwt_root)" || { echo "✗ not inside a git repo"; return 1 }
+  local arg="$1"; shift 2>/dev/null
+  [[ -n "$arg" ]] || { echo "usage: gwt-merge <name|branch> [--squash|--no-ff|--rebase] [--into <b>] [--force]"; return 1 }
+  # accept a bare name (feat/<name>) or a full branch
+  local child="$arg"
+  git -C "$root" show-ref --verify --quiet "refs/heads/$child" || child="feat/$arg"
+  git -C "$root" show-ref --verify --quiet "refs/heads/$child" || { echo "✗ no such branch: $arg"; return 1 }
+  local strategy="" target="" force=""
+  while (( $# )); do
+    case "$1" in
+      --squash) strategy=squash ;; --no-ff) strategy=no-ff ;; --rebase) strategy=rebase ;;
+      --into) shift; target="$1" ;; --force) force=1 ;;
+      *) echo "unknown flag: $1"; return 1 ;;
+    esac; shift
+  done
+  [[ -n "$target" ]] || target="$(~/.config/cc-stack/cc-merge.sh get-parent "$root" "$child")"
+  # ordering guard: if child itself has not-ready children, warn
+  local kids; kids="$(~/.config/cc-stack/cc-merge.sh tree "$root" | awk -F'\t' -v p="$child" '$2==p && !($4=="clean" && $5=="done"){print $1}')"
+  [[ -n "$kids" ]] && echo "⚠ $child still has not-ready children: ${kids//$'\n'/, } — consider 'gwt-collect $child' first"
+  echo "── preflight: $child → $target ──"
+  local pf rc; pf="$(~/.config/cc-stack/cc-merge.sh preflight "$root" "$child" "$target")"; rc=$?
+  echo "$pf" | grep '^check:'
+  if (( rc != 0 )) && [[ -z "$force" ]]; then
+    echo "✗ preflight not clean. Re-run with --force to override, or fix the flagged items."; return 1
+  fi
+  # strategy prompt (default squash)
+  if [[ -z "$strategy" ]]; then
+    printf "strategy? [S]quash / [n]o-ff / [r]ebase (default squash): "
+    local ans; read -r ans
+    case "$ans" in n|N|no-ff) strategy=no-ff ;; r|R|rebase) strategy=rebase ;; *) strategy=squash ;; esac
+  fi
+  # AUTHORIZATION GATE
+  printf "About to merge \033[1m%s\033[0m --%s into \033[1m%s\033[0m. Proceed? [y/N] " "$child" "$strategy" "$target"
+  local ok; read -r ok
+  [[ "$ok" == y || "$ok" == Y ]] || { echo "aborted."; return 1 }
+  ~/.config/cc-stack/cc-merge.sh do-merge "$root" "$child" "$strategy" "$target"
+  local mrc=$?
+  (( mrc == 0 )) && echo "  (cleanup when ready: gwt-rm ${child#feat/} --branch)"
+  return $mrc
+}
+
+# gwt-collect <parent-name-or-branch> — run one GATED gwt-merge per ready child
+gwt-collect() {
+  emulate -L zsh
+  local root; root="$(_gwt_root)" || { echo "✗ not inside a git repo"; return 1 }
+  local p="$1"; [[ -n "$p" ]] || { echo "usage: gwt-collect <parent-name|branch>"; return 1 }
+  git -C "$root" show-ref --verify --quiet "refs/heads/$p" || p="feat/$p"
+  local ready skipped line branch dirty done
+  while IFS=$'\t' read -r branch _ _ dirty done; do
+    [[ -n "$branch" ]] || continue
+    if [[ "$dirty" == clean && "$done" == done ]]; then ready+=" $branch"; else skipped+=" $branch"; fi
+  done < <(~/.config/cc-stack/cc-merge.sh tree "$root" | awk -F'\t' -v p="$p" '$2==p')
+  [[ -n "$skipped" ]] && echo "⏭ skipping not-ready:${skipped}"
+  [[ -n "$ready" ]] || { echo "no ready children of $p"; return 0 }
+  local b
+  for b in ${=ready}; do
+    echo "════ collect: $b → $p ════"
+    gwt-merge "$b" --into "$p" || { echo "  ↳ aborted/failed at $b — nothing further merged; re-run 'gwt-collect $1' to continue"; break }
+  done
+}
+
 # gwt-help — cc-stack worktree command cheatsheet
 gwt-help() {
   cat <<'EOF'
@@ -165,6 +304,11 @@ cc-stack · worktree sub-task commands
   gwt-claude <name> "<initial-prompt>"   build worktree + new tab running claude (plan mode) + send prompt
   gwt-new <name>                         build worktree and cd into it (opens an empty workspace, no claude)
   gwt-ls                                 git worktree list
+  gwt-tree                               hierarchical board: branch tree, merge target, ready state, tab liveness
+  gwt-done / gwt-undone                  (inside a sub-task) mark this branch ready / not-ready for merge
+  gwt-merge <name> [--squash|--no-ff|--rebase] [--into <b>] [--force]
+                                         GATED merge into its recorded parent (asks strategy [default: squash] + confirms first)
+  gwt-collect <parent>                   run one gated gwt-merge per ready child of <parent>
   gwt-status                             list sub-tasks: status/branch/surface/dir/what-it's-doing (auto-cleans deleted dirs)
   gwt-rm <name> [--branch]               remove worktree (+ clear task record + pre-trust; optionally the branch)
   gwt-prune                              compact the task list (drop dead records + keep newest per dir)
@@ -187,6 +331,7 @@ gwt-rm() {
   _gwt_tasks_drop_dir "${wtabs:-$wtpath}" && echo "  ↳ removed from task list"
   ~/.config/cc-stack/cc-trust.sh --remove "${wtabs:-$wtpath}" >/dev/null 2>&1   # clear the pre-trust entry (only pure-trust-signature ones)
   [[ "$2" == "--branch" ]] && { git branch -D "feat/$name" 2>/dev/null && echo "✔ deleted branch feat/$name" }
+  [[ "$2" == "--branch" ]] && git config --remove-section "branch.feat/$name" 2>/dev/null   # drop ccMergeInto/ccDone
   return 0
 }
 

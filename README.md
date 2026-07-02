@@ -109,6 +109,25 @@ CC_WT_PROMPT='the full first instruction for the task (may be multi-line)' git w
 
 ---
 
+## Hierarchical worktrees (A ⊃ {A1,A2,A3})
+
+When a sub-task claude spins off its own worktrees, cc-stack records each
+child's merge target automatically (`git config branch.<b>.ccMergeInto`,
+captured from the caller's branch at creation). You then drive the merges
+back up the tree — each stops at a confirmation gate.
+
+    gwt-tree                 # see the whole tree: A ⊃ {A1,A2,A3}, ready state, tabs
+    gwt-done                 # (run inside A1) mark A1 ready when it's finished
+    gwt-merge A1             # gated merge A1 → feat/A (asks strategy [default: squash] + confirmation)
+    gwt-collect A            # merge every ready child of A into A, one gate each
+    gwt-merge A              # finally merge A → main (its recorded/def target)
+
+`gwt-merge` never merges without an explicit `y`. Readiness = clean working
+tree **and** `gwt-done`; otherwise it warns and needs `--force`. Cleanup
+(`gwt-rm`) stays a separate, explicit step.
+
+---
+
 ## Command cheatsheet
 
 ### cmux native teams
