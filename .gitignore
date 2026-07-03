@@ -5,3 +5,6 @@ cc-failures.log
 *.bak.*
 .DS_Store
 /.superpowers/
+# worktrees + local settings
+/.claude/worktrees/
+/.claude/settings.local.json
