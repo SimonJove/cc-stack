@@ -164,6 +164,51 @@ eq "tree has a tree guide"     "$(echo "$GTOUT" | grep -c '├─\|└─')" "2"
 eq "no stray typeset output"   "$(echo "$GTOUT" | grep -c '^tab=\|^ready=')" "0"
 rm -rf "$GT"
 
+echo "== 14. cc-worktree-shared seed/collect =="
+SR=$(mktemp -d); ( cd "$SR"; git init -q; git config user.email t@t; git config user.name t
+  git commit -q --allow-empty -m i; git worktree add -q wtL -b feat/L >/dev/null )
+SROOT="$(cd "$SR" && pwd -P)"; WT="$SR/wtL"
+mkdir -p "$SROOT/scratchpad/e2e/lib" "$SROOT/scratchpad/e2e/a1-shots"
+printf 'MAIN\n'  > "$SROOT/scratchpad/e2e/lib/harness.mjs"
+printf 'same\n'  > "$SROOT/scratchpad/e2e/existing.mjs"
+printf 'png\n'   > "$SROOT/scratchpad/e2e/a1-shots/x.png"
+# seed: copies corpus into worktree, excluding regenerable outputs
+"$CC/cc-worktree-shared.sh" seed "$SROOT" "$WT" scratchpad/e2e >/dev/null 2>&1
+eq "seed copies harness"        "$(cat "$WT/scratchpad/e2e/lib/harness.mjs" 2>/dev/null)" "MAIN"
+eq "seed copies existing"       "$(cat "$WT/scratchpad/e2e/existing.mjs" 2>/dev/null)" "same"
+eq "seed excludes *-shots"      "$( [ -e "$WT/scratchpad/e2e/a1-shots" ] && echo yes || echo no )" "no"
+# in worktree: add a new test, diverge the harness (conflict), keep existing identical, add an output
+printf 'new\n' > "$WT/scratchpad/e2e/newtest.mjs"
+printf 'WT\n'  > "$WT/scratchpad/e2e/lib/harness.mjs"
+mkdir -p "$WT/scratchpad/e2e/b1-shots"; printf 'png2\n' > "$WT/scratchpad/e2e/b1-shots/y.png"
+# collect: fold new work back into main
+"$CC/cc-worktree-shared.sh" collect "$SROOT" "$WT" scratchpad/e2e >/dev/null 2>&1
+eq "collect folds new file"     "$(cat "$SROOT/scratchpad/e2e/newtest.mjs" 2>/dev/null)" "new"
+eq "collect never overwrites main" "$(cat "$SROOT/scratchpad/e2e/lib/harness.mjs" 2>/dev/null)" "MAIN"
+eq "collect preserves conflict" "$(cat "$SROOT/scratchpad/e2e/lib/harness.from-feat-L.mjs" 2>/dev/null)" "WT"
+eq "collect excludes *-shots"   "$( [ -e "$SROOT/scratchpad/e2e/b1-shots" ] && echo yes || echo no )" "no"
+# regression: glob-char filenames must never glob-expand (x[1].mjs used to vanish when x1.mjs existed)
+printf 'BR\n' > "$WT/scratchpad/e2e/x[1].mjs"
+printf 'PL\n' > "$WT/scratchpad/e2e/x1.mjs"
+"$CC/cc-worktree-shared.sh" collect "$SROOT" "$WT" scratchpad/e2e >/dev/null 2>&1
+eq "collect keeps bracket-name file" "$(cat "$SROOT/scratchpad/e2e/x[1].mjs" 2>/dev/null)" "BR"
+eq "collect keeps its glob sibling"  "$(cat "$SROOT/scratchpad/e2e/x1.mjs" 2>/dev/null)" "PL"
+# regression: trailing slash in relbase must not mangle target paths
+mkdir -p "$SROOT/shareX"; printf 'ts\n' > "$SROOT/shareX/t.mjs"
+"$CC/cc-worktree-shared.sh" seed "$SROOT" "$WT" "shareX/" >/dev/null 2>&1
+eq "seed tolerates trailing slash" "$(cat "$WT/shareX/t.mjs" 2>/dev/null)" "ts"
+# no <relbase> args → default corpus from cc-worktree-shared.sh itself; exported-EMPTY disables
+( cd "$SR"; git worktree add -q wtM -b feat/M >/dev/null; git worktree add -q wtN -b feat/N >/dev/null )
+env -u CC_WT_SHARE "$CC/cc-worktree-shared.sh" seed "$SROOT" "$SR/wtM" >/dev/null 2>&1
+eq "no-arg seed uses default corpus" "$(cat "$SR/wtM/scratchpad/e2e/existing.mjs" 2>/dev/null)" "same"
+CC_WT_SHARE= "$CC/cc-worktree-shared.sh" seed "$SROOT" "$SR/wtN" >/dev/null 2>&1
+eq "empty CC_WT_SHARE disables seed" "$( [ -e "$SR/wtN/scratchpad/e2e" ] && echo yes || echo no )" "no"
+# zsh side: an exported-empty CC_WT_SHARE must survive sourcing (docs say empty disables)
+eq "zsh keeps empty CC_WT_SHARE" "$(CC_WT_SHARE= zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; printf '%s' \"\$CC_WT_SHARE\"")" ""
+# gwt-claude + hook both go through the surface script → it must be the one seeding
+grep -q 'cc-worktree-shared.sh" seed' "$CC/cc-cmux-surface-claude.sh" && ok "surface script seeds corpus" || no "surface script seeds corpus" missing present
+rm -rf "$SR"
+
 echo ""
 echo "== syntax =="
 for s in "$CC"/*.sh; do bash -n "$s" && : || { echo "  ✗ syntax $s"; fail=$((fail+1)); }; done

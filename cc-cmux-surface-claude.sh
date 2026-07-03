@@ -41,6 +41,9 @@ if [ -n "$root" ] && [ "$root" != "$abspath" ]; then
     mkdir -p "$abspath/$(dirname "$f")" 2>/dev/null
     cp -p "$root/$f" "$abspath/$f" 2>/dev/null
   done
+  # Seed the shared test corpus (CC_WT_SHARE; default + docs live in cc-worktree-shared.sh;
+  # exported-empty disables). Idempotent — never overwrites files already in the worktree.
+  "$HOME/.config/cc-stack/cc-worktree-shared.sh" seed "$root" "$abspath" 2>/dev/null
 fi
 
 # Record the merge target (parent = caller's branch) — HOOK PATH ONLY.

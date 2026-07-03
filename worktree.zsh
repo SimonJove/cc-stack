@@ -6,6 +6,13 @@
 #   branch         <prefix>/<name> (default prefix: feat)
 #   files auto-copied into a new worktree (gitignored but needed; space-separated relative paths, no spaces in paths):
 : ${CC_WT_COPY:=".env .env.local .claude/settings.local.json"}
+#   dir(s) SHARED across worktrees as independent copies: seeded from the main repo on create, and
+#   merged back into the main repo on gwt-rm (new files folded in; same-name-different-content clashes
+#   preserved as <name>.from-<branch>.<ext>, never overwriting main). Regenerable outputs (*-shots,
+#   reports, output, html) are skipped. Space-separated relbase dirs; set EMPTY ("") to disable.
+#   EXPORT it when customizing/disabling — the hook & gwt-claude paths run outside this shell and
+#   otherwise use the default (which lives in cc-worktree-shared.sh).
+: ${CC_WT_SHARE="scratchpad/e2e"}
 
 # Main repo root: returns the main repo root whether you're in the main repo or in some worktree
 _gwt_root() {
@@ -84,6 +91,7 @@ gwt-new() {
       mkdir -p "$wtpath/${f:h}"; cp -p "$root/$f" "$wtpath/$f" && echo "  ↳ copied $f"
     fi
   done
+  [[ -n "$CC_WT_SHARE" ]] && ~/.config/cc-stack/cc-worktree-shared.sh seed "$root" "$wtpath" ${(s: :)CC_WT_SHARE}
   echo "✔ worktree: $wtpath   branch: $branch"
   ~/.config/cc-stack/cc-merge.sh capture "$root" "$branch" "$PWD" >/dev/null 2>&1
   # When inside cmux, open a workspace (empty shell, focus it) for this worktree; no-op when not in cmux
@@ -326,6 +334,17 @@ gwt-rm() {
   [[ -n "$name" ]] || { echo "usage: gwt-rm <name> [--branch]"; return 1 }
   local wtpath="$(_gwt_dir)/$name"
   local wtabs; wtabs="$(cd "$wtpath" 2>/dev/null && pwd -P)"   # canonical path (before removal) for bookkeeping
+  # Merge the worktree's shared corpus (new e2e tests) back into the main repo BEFORE removal, so
+  # nothing is lost. Same-name-different-content clashes are preserved as <name>.from-<branch>.<ext>.
+  if [[ -n "$CC_WT_SHARE" && -d "$wtpath" ]]; then
+    local _root _b _has=""
+    _root="$(_gwt_root)"
+    for _b in ${(s: :)CC_WT_SHARE}; do [[ -d "$wtpath/${_b%/}" ]] && { _has=1; break }; done
+    if [[ -n "$_has" ]]; then
+      echo "  ↳ merging shared corpus back into main…"
+      ~/.config/cc-stack/cc-worktree-shared.sh collect "$_root" "$wtpath" ${(s: :)CC_WT_SHARE}
+    fi
+  fi
   git worktree remove "$wtpath" 2>/dev/null || git worktree remove --force "$wtpath" || return 1
   echo "✔ removed worktree: $wtpath"
   _gwt_tasks_drop_dir "${wtabs:-$wtpath}" && echo "  ↳ removed from task list"

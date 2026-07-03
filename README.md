@@ -164,6 +164,7 @@ gwt-test                       # run the smoke test (self-check for regressions 
 | `CC_WT_PERMISSION_MODE` | `plan` | The sub-task claude's `--permission-mode`. Set `default`/`acceptEdits` to skip planning and edit directly. |
 | `CC_WT_PRETRUST` | `1` | Whether to pre-trust the worktree dir (skip the trust prompt). Set `0` to disable (falls back to screen-scrape confirmation). |
 | `CC_WT_COPY` | `.env .env.local .claude/settings.local.json` | Files copied from the main repo into a new worktree (space-separated, no spaces in paths). |
+| `CC_WT_SHARE` | `scratchpad/e2e` | Gitignored dir(s) shared across worktrees as **independent copies**: seeded into a new worktree on create, merged back into the main repo on `gwt-rm` (never overwrites main; clashes kept as `<name>.from-<branch>.<ext>`). Space-separated; **export** it to customize, exported-empty (`""`) disables. |
 | `CC_TASKS_FILE` | `~/.config/cc-stack/worktree-tasks.tsv` | Task list path (rarely changed). |
 
 ---
