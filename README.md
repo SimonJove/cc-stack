@@ -142,6 +142,10 @@ ccteam --model sonnet  # pick a model
 ```
 gwt-claude <name> "<prompt>"   # build worktree + new tab running claude (plan) + send prompt (manual spawn)
 gwt-new <name>                 # build worktree and cd into it (opens an empty workspace, no claude)
+gwt-adopt <branch> [--into <parent>] [--no-worktree]  # enroll an EXISTING branch into the tree: record its
+                               #   merge parent (→ shows in gwt-tree, mergeable via gwt-merge/gwt-collect) and,
+                               #   by default, give it a worktree so an agent can start on it. Does not cd or
+                               #   steal focus, so an orchestrating claude can fold hand-made branches in.
 gwt-ls                         # git worktree list
 gwt-status                     # board: status (✔live/⌫closed/?old-session) + branch + surface + dir + what it's doing (auto-cleans deleted dirs)
 gwt-rm <name> [--branch]       # remove worktree (+ clear task record + clear pre-trust; optionally the branch)

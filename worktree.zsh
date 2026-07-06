@@ -99,6 +99,61 @@ gwt-new() {
   cd "$wtpath"
 }
 
+# gwt-adopt <branch> [--into <parent>] [--no-worktree] — enroll an EXISTING branch
+# into the tree. Records its merge parent (branch.<b>.ccMergeInto) so it shows up
+# in gwt-tree and can be gwt-merge'd/gwt-collect'd along the tree, and — unless
+# --no-worktree — gives it a worktree (reusing the branch) + a cmux workspace so an
+# agent can start on it. Parent defaults to the trunk; --into hangs it elsewhere.
+# Unlike gwt-new it does NOT cd and does NOT steal cmux focus, so an orchestrating
+# claude can fold hand-made branches into the workflow without disrupting you.
+gwt-adopt() {
+  emulate -L zsh
+  local branch="" parent="" no_wt=""
+  while (( $# )); do
+    case "$1" in
+      --into) parent="$2"; shift 2 ;;
+      --no-worktree) no_wt=1; shift ;;
+      -*) echo "gwt-adopt: unknown flag $1"; return 1 ;;
+      *) if [[ -z "$branch" ]]; then branch="$1"; shift; else echo "gwt-adopt: unexpected arg $1"; return 1; fi ;;
+    esac
+  done
+  [[ -n "$branch" ]] || { echo "usage: gwt-adopt <branch> [--into <parent>] [--no-worktree]"; return 1 }
+  local root; root="$(_gwt_root)" || { echo "✗ not inside a git repo"; return 1 }
+  git -C "$root" show-ref --verify --quiet "refs/heads/$branch" || { echo "✗ no such branch: $branch"; return 1 }
+  local trunk; trunk="$(~/.config/cc-stack/cc-merge.sh trunk "$root")"
+  [[ "$branch" == "$trunk" ]] && { echo "✗ $branch is the trunk — nothing to adopt"; return 1 }
+  [[ -n "$parent" ]] || parent="$trunk"
+  [[ "$parent" == "$branch" ]] && { echo "✗ a branch cannot be its own parent"; return 1 }
+  git -C "$root" show-ref --verify --quiet "refs/heads/$parent" || { echo "✗ no such parent branch: $parent"; return 1 }
+
+  # Record the merge parent → the branch now participates in the tree/merge.
+  ~/.config/cc-stack/cc-merge.sh set-parent "$root" "$branch" "$parent" || return 1
+  echo "✔ adopted $branch  → merges into $parent"
+  [[ -n "$no_wt" ]] && { echo "  (registered only — run without --no-worktree to add a worktree)"; return 0 }
+
+  # Already checked out somewhere? leave that worktree in place.
+  if git -C "$root" worktree list --porcelain | grep -qxF "branch refs/heads/$branch"; then
+    echo "  ↳ $branch already has a worktree; leaving it in place"; return 0
+  fi
+  local wtdir; wtdir="$(_gwt_dir)"
+  local rel="${wtdir#$root/}"
+  _gwt_ensure_ignore "$root" "/$rel/"
+  local name="${branch//\//-}"                 # feature/x → feature-x (collision-free dir)
+  local wtpath="$wtdir/$name"
+  mkdir -p "$wtdir"
+  git -C "$root" worktree add "$wtpath" "$branch" || return 1
+  local f
+  for f in ${(s: :)CC_WT_COPY}; do
+    if [[ -f "$root/$f" ]]; then
+      mkdir -p "$wtpath/${f:h}"; cp -p "$root/$f" "$wtpath/$f" && echo "  ↳ copied $f"
+    fi
+  done
+  [[ -n "$CC_WT_SHARE" ]] && ~/.config/cc-stack/cc-worktree-shared.sh seed "$root" "$wtpath" ${(s: :)CC_WT_SHARE}
+  echo "  ↳ worktree: $wtpath"
+  # focus=false: enrolling a branch must not yank you out of what you're doing.
+  ~/.config/cc-stack/cc-cmux-workspace.sh "$wtpath" "$name" false >/dev/null 2>&1
+}
+
 # gwt-ls — list all worktrees
 gwt-ls() { git worktree list }
 

@@ -210,13 +210,39 @@ grep -q 'cc-worktree-shared.sh" seed' "$CC/cc-cmux-surface-claude.sh" && ok "sur
 rm -rf "$SR"
 
 echo ""
+echo "== 12. gwt-adopt (enroll an existing branch into the tree) =="
+AR=$(mktemp -d); ( cd "$AR"; git init -q; git config user.email t@t; git config user.name t
+  git commit -q --allow-empty -m i; git branch -M main
+  mkdir .claude                        # so _gwt_dir resolves to .claude/worktrees
+  git branch feature/orphan-x; git branch feature/orphan-y )
+# register-only: sets parent to the trunk, makes NO worktree, appears in the tree
+zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; cd '$AR'; gwt-adopt feature/orphan-x --no-worktree" >/dev/null 2>&1
+eq "adopt --no-worktree parent=trunk" "$(git -C "$AR" config branch.feature/orphan-x.ccMergeInto)" "main"
+eq "adopt --no-worktree makes no wt"  "$(git -C "$AR" worktree list | wc -l | tr -d ' ')" "1"
+# gwt-tree enumerates WORKTREES, so a register-only branch is intentionally not in it yet
+eq "no-worktree branch not in tree"   "$("$CC/cc-merge.sh" tree "$AR" | awk -F'\t' '$1=="feature/orphan-x"{print $2}')" ""
+# full adopt with --into a non-trunk parent: sets parent + creates a sanitized worktree
+zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; cd '$AR'; gwt-adopt feature/orphan-y --into feature/orphan-x" >/dev/null 2>&1
+eq "adopt --into sets the parent"     "$(git -C "$AR" config branch.feature/orphan-y.ccMergeInto)" "feature/orphan-x"
+eq "adopt creates a worktree"         "$(git -C "$AR" worktree list | wc -l | tr -d ' ')" "2"
+eq "adopt worktree dir sanitized"     "$([ -d "$AR/.claude/worktrees/feature-orphan-y" ] && echo yes || echo no)" "yes"
+# a worktree'd adopt DOES appear in the tree, hung under the given parent
+eq "worktreed adopt is in the tree"   "$("$CC/cc-merge.sh" tree "$AR" | awk -F'\t' '$1=="feature/orphan-y"{print $2}')" "feature/orphan-x"
+# guards: a missing branch writes no config; the trunk cannot be adopted
+zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; cd '$AR'; gwt-adopt no/such" >/dev/null 2>&1
+eq "adopt rejects missing branch"     "$(git -C "$AR" config branch.no/such.ccMergeInto 2>/dev/null)" ""
+zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; cd '$AR'; gwt-adopt main" >/dev/null 2>&1; arc=$?
+eq "adopt rejects the trunk"          "$arc" "1"
+rm -rf "$AR"
+
+echo ""
 echo "== syntax =="
 for s in "$CC"/*.sh; do bash -n "$s" && : || { echo "  ✗ syntax $s"; fail=$((fail+1)); }; done
 zsh -n "$CC/worktree.zsh" && ok "worktree.zsh syntax" || { no "worktree.zsh syntax" x x; }
 
 echo ""
 echo "== 10. zsh commands present =="
-for fn in gwt-tree gwt-done gwt-undone gwt-merge gwt-collect; do
+for fn in gwt-tree gwt-done gwt-undone gwt-merge gwt-collect gwt-adopt; do
   grep -q "^$fn()" "$CC/worktree.zsh" && ok "$fn defined" || no "$fn defined" missing present
 done
 
@@ -224,6 +250,7 @@ echo "== 11. docs mention new commands =="
 grep -q "gwt-merge" "$CC/worktree.zsh" && grep -q "gwt-merge" "$CC/README.md" \
   && ok "gwt-merge documented" || no "gwt-merge documented" missing present
 grep -q "gwt-done" "$CC/README.md" && ok "gwt-done documented" || no "gwt-done documented" missing present
+grep -q "gwt-adopt" "$CC/README.md" && ok "gwt-adopt documented" || no "gwt-adopt documented" missing present
 
 echo ""
 echo "result: $pass passed, $fail failed"
