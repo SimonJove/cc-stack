@@ -32,7 +32,8 @@
       },
       "nextSurface" : {
         "first" : { "command" : true, "control" : false, "option" : false, "shift" : false, "key" : "l", "keyCode" : 37 }
-      }
+      },
+      "clearScreenKeepScrollback" : "disabled"
     }
   }
 }
