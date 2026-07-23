@@ -58,7 +58,7 @@ cd ~/Desktop/cc-stack && ./install.sh                                     # guid
 1. Install the source into the target dir (excluding `.git`/backups/runtime-generated files)
 2. Executable bits + dependency check (cmux / claude / git / python3 / zsh / shasum / column)
 3. Make `~/.zshrc` load `worktree.zsh` + `aliases.zsh`
-4. Add hooks to `~/.claude/settings.json` (PostToolUse to open the tab + notification placeholders)
+4. Add the PostToolUse hook to `~/.claude/settings.json` (opens the tab on `git worktree add`; also strips any stale `cc-notify` hooks left by older installs)
 5. Add the worktree rules to `~/.claude/CLAUDE.md` (a managed block, sourced from `claude-rules.md`)
 6. cmux.json workflow settings (optional, `--cmux`; deep-merged, your config is backed up)
 
@@ -225,7 +225,6 @@ cc-cmux-workspace.sh         # used by gwt-new: open an empty workspace for a di
 cc-tasks-log.sh              # single task-registration entry point (keeps TSV format consistent)
 cc-trust.sh                  # pre-authorize/revoke trust for a dir (edits ~/.claude.json, atomic write, only adds/removes pure-trust signatures)
 cc-zellij-fan.sh             # worktree fan-out (zellij fallback channel)
-cc-notify.sh                 # CC notification hook (tmux-era leftover, currently a silent no-op)
 claude-rules.md              # single source of the global CLAUDE.md worktree rules (install syncs it into the managed block)
 install.sh                   # one-command install/repair (idempotent/backs up; --dry-run / --cmux)
 config/cmux.json             # workflow cmux config (minimalMode + workspace/tab nav keys); applied via install.sh --cmux

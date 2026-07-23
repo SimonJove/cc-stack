@@ -129,9 +129,9 @@ say "▸ 4. Claude Code hooks (settings.json)"
 SET="$HOME/.claude/settings.json"; mkdir -p "$HOME/.claude"
 [ -f "$SET" ] || { [ -n "$DRY" ] || echo '{}' > "$SET"; say "  (created settings.json)"; }
 bak "$SET"
-CC_SET="$SET" CC_HOOK="$CCT/cc-worktree-cmux-hook.sh" CC_NOTIFY="$CCT/cc-notify.sh" CC_DRY="$DRY" python3 - <<'PY'
+CC_SET="$SET" CC_HOOK="$CCT/cc-worktree-cmux-hook.sh" CC_DRY="$DRY" python3 - <<'PY'
 import json,os,sys,tempfile
-p=os.environ["CC_SET"];hook=os.environ["CC_HOOK"];notify=os.environ["CC_NOTIFY"];dry=os.environ.get("CC_DRY","")
+p=os.environ["CC_SET"];hook=os.environ["CC_HOOK"];dry=os.environ.get("CC_DRY","")
 try: d=json.load(open(p,encoding="utf-8"))
 except Exception: d={}
 if not isinstance(d,dict): d={}
@@ -141,15 +141,37 @@ def has(ev,cmd):
         for h in (g.get("hooks") or []):
             if h.get("command")==cmd: return True
     return False
-ch=[]
-if not has("PostToolUse",hook): hk.setdefault("PostToolUse",[]).append({"matcher":"Bash|EnterWorktree","hooks":[{"type":"command","command":hook}]}); ch.append("PostToolUse")
+added=[]
+if not has("PostToolUse",hook): hk.setdefault("PostToolUse",[]).append({"matcher":"Bash|EnterWorktree","hooks":[{"type":"command","command":hook}]}); added.append("PostToolUse")
+# Migration: cc-notify.sh is gone. Strip any stale hook still pointing at it (Stop/SubagentStop/Notification,
+# which older installs registered). Only the cc-notify command is removed; every other hook is left untouched.
+removed=[]
 for ev in ("Stop","SubagentStop","Notification"):
-    if not has(ev,notify): hk.setdefault(ev,[]).append({"hooks":[{"type":"command","command":notify}]}); ch.append(ev)
-if not ch: print("  ✓ already in place"); sys.exit(0)
-if dry: print("  [dry-run] would add:",", ".join(ch)); sys.exit(0)
+    groups=hk.get(ev,[]) or []
+    if not groups: continue
+    new_groups=[]; changed=False
+    for g in groups:
+        hs=g.get("hooks") or []
+        keep=[h for h in hs if "cc-notify" not in (h.get("command","") or "")]
+        if len(keep)!=len(hs): changed=True
+        if keep: gg=dict(g); gg["hooks"]=keep; new_groups.append(gg)
+    if changed:
+        removed.append(ev)
+        if new_groups: hk[ev]=new_groups
+        else: hk.pop(ev,None)            # event emptied → drop the key, keep settings.json tidy
+if not added and not removed: print("  ✓ already in place (PostToolUse present, no stale cc-notify hooks)"); sys.exit(0)
+if dry:
+    msg=[]
+    if added: msg.append("would add: "+", ".join(added))
+    if removed: msg.append("would remove stale cc-notify hooks on: "+", ".join(removed))
+    print("  [dry-run] "+"; ".join(msg)); sys.exit(0)
 fd,tmp=tempfile.mkstemp(dir=os.path.dirname(p),prefix=".settings.cc.")
 with os.fdopen(fd,"w",encoding="utf-8") as f: json.dump(d,f,ensure_ascii=False,indent=2)
-os.replace(tmp,p); print("  ✓ added:",", ".join(ch))
+os.replace(tmp,p)
+msg=[]
+if added: msg.append("added: "+", ".join(added))
+if removed: msg.append("removed stale cc-notify hooks on: "+", ".join(removed))
+print("  ✓ "+"; ".join(msg))
 PY
 
 # ── 5. Global CLAUDE.md rules ──
