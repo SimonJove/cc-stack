@@ -152,11 +152,26 @@ gwt-rm <name> [--branch]       # remove worktree (+ clear task record + clear pr
 gwt-prune                      # compact the task list (drop dead records + keep newest per dir)
 gwt-clean                      # git worktree prune + show current state
 gwt-fan                        # zellij only: fan each worktree into a pane running claude
+gwt-provider <name>            # set AI provider for NEW sub-tasks: kimi|glm|anthropic (team mode either way; existing unchanged); no arg lists current + available
 gwt-help                       # command cheatsheet
 gwt-test                       # run the smoke test (self-check for regressions after editing cc-stack)
 ```
 
 - Worktree dir: `<project>/.claude/worktrees/<name>` when the project has `.claude`, otherwise `<project>/.worktrees/<name>` (the base dir is auto-added to `.gitignore`); branch is `feat/<name>`.
+
+---
+
+## Switching provider for new sub-tasks (limited fallback)
+
+When your main provider gets rate-limited mid-session, switch which provider cc-stack uses to start **new** sub-tasks. Already-running sub-tasks keep their launch-time provider (env is process-local), so nothing in flight is disturbed.
+
+```
+gwt-provider               # show current provider + available (e.g. glm, kimi, anthropic)
+gwt-provider kimi           # NEW sub-tasks now start on the kimi provider
+gwt-provider anthropic      # back to default
+```
+
+Every sub-task still launches in **team mode** (`cmux claude-teams`) regardless of provider — `gwt-provider` only changes which AI backend answers; kimi / glm / anthropic are identical apart from the provider. This just rewrites `~/.config/cc-stack/launch`; the main session and any already-open sub-task tabs are untouched. For a one-off session on another provider, open a cmux tab and run `cld <provider>` directly.
 
 ---
 
@@ -170,6 +185,7 @@ gwt-test                       # run the smoke test (self-check for regressions 
 | `CC_WT_COPY` | `.env .env.local .claude/settings.local.json` | Files copied from the main repo into a new worktree (space-separated, no spaces in paths). |
 | `CC_WT_SHARE` | `scratchpad/e2e` | Gitignored dir(s) shared across worktrees as **independent copies**: seeded into a new worktree on create, merged back into the main repo on `gwt-rm` (never overwrites main; clashes kept as `<name>.from-<branch>.<ext>`). Space-separated; **export** it to customize, exported-empty (`""`) disables. |
 | `CC_TASKS_FILE` | `~/.config/cc-stack/worktree-tasks.tsv` | Task list path (rarely changed). |
+| `CC_LAUNCH_FILE` | `~/.config/cc-stack/launch` | Written by `gwt-provider`; the provider name for NEW sub-tasks (`kimi`, `glm`, or `anthropic`/empty=default). Override path for tests. |
 
 ---
 

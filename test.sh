@@ -236,6 +236,22 @@ eq "adopt rejects the trunk"          "$arc" "1"
 rm -rf "$AR"
 
 echo ""
+echo "== 15. gwt-provider (provider switch for new sub-tasks) =="
+LF=$(mktemp -u); PD=$(mktemp -d); : > "$PD/kimi.sh"; : > "$PD/glm.sh"
+zprov(){ zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; CC_LAUNCH_FILE='$LF' CC_LAUNCH_PROVDIR='$PD' gwt-provider $1" 2>/dev/null; }
+eq "gwt-provider default anthropic" "$(zprov '' | awk '/^current/{print $3}')" "anthropic"
+zprov 'kimi' >/dev/null 2>&1;       eq "gwt-provider kimi writes file" "$(cat "$LF")" "kimi"
+zprov 'glm' >/dev/null 2>&1;        eq "gwt-provider glm writes file" "$(cat "$LF")" "glm"
+zprov 'anthropic' >/dev/null 2>&1;  eq "gwt-provider anthropic writes file" "$(cat "$LF")" "anthropic"
+zprov 'default' >/dev/null 2>&1;    eq "gwt-provider default=anthropic" "$(cat "$LF")" "anthropic"
+zprov 'nope' >/dev/null 2>&1;       eq "gwt-provider rejects unknown" "$?" "1"
+zprov '../x' >/dev/null 2>&1;       eq "gwt-provider rejects traversal" "$?" "1"
+rm -f "$LF"; rm -rf "$PD"
+# surface maps provider name → launch command (default ccteam; other → cld <name>)
+grep -q 'CC_LAUNCH_FILE' "$CC/cc-cmux-surface-claude.sh" && ok "surface reads provider config" || no "surface reads provider config" missing present
+grep -q 'cld \$_provider' "$CC/cc-cmux-surface-claude.sh" && ok "surface maps provider→cld" || no "surface maps provider→cld" missing present
+
+echo ""
 echo "== syntax =="
 for s in "$CC"/*.sh; do bash -n "$s" && : || { echo "  ✗ syntax $s"; fail=$((fail+1)); }; done
 zsh -n "$CC/worktree.zsh" && ok "worktree.zsh syntax" || { no "worktree.zsh syntax" x x; }

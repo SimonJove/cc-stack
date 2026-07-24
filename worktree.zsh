@@ -377,6 +377,7 @@ cc-stack · worktree sub-task commands
   gwt-prune                              compact the task list (drop dead records + keep newest per dir)
   gwt-clean                              git worktree prune + show current state
   gwt-fan                                (zellij only) fan each worktree into its own pane running claude
+  gwt-provider <name>                    set which AI provider starts NEW sub-tasks: gwt-provider kimi|glm|anthropic (existing sub-tasks unchanged); no arg shows current + available
 Note: telling the main Claude to "open a worktree / spin off a sub-task" auto-triggers the hook to open a parallel tab;
       sub-tasks default to plan mode (plan first, then edit); commit/merge/cleanup all require human authorization.
 EOF
@@ -427,4 +428,39 @@ gwt-fan() {
     echo "gwt-fan is only for the zellij fallback channel. Locally use ccteam (cmux native teams, better notifications)."
     return 1
   fi
+}
+
+# gwt-provider [kimi|glm|anthropic|default] — choose which AI provider starts NEW worktree sub-tasks.
+#   Provider env is process-local, so this only affects sub-tasks spawned AFTER the change; already-running
+#   sub-tasks keep whatever they launched with. No arg → show current + available providers.
+#     <provider>   start new sub-tasks on that provider (must exist as $provdir/<provider>.sh)
+#     anthropic    default — cmux claude-teams on the official/current-env provider
+#     default      alias for anthropic
+_gwt_provider_file() { echo "${CC_LAUNCH_FILE:-$HOME/.config/cc-stack/launch}" }
+gwt-provider() {
+  emulate -L zsh
+  local f provdir cur
+  f="$(_gwt_provider_file)"
+  provdir="${CC_LAUNCH_PROVDIR:-$HOME/.config/claude/llm-provider}"
+  cur="$(cat "$f" 2>/dev/null)"; cur="${cur:-anthropic}"
+  local -a provs=()
+  local p
+  if [[ -d "$provdir" ]]; then for p in "$provdir"/*.sh(N); do provs+=("${${p:t}:r}"); done; fi
+  if (( $# == 0 )); then
+    echo "current provider: $cur"
+    (( ${#provs[@]} )) && echo "available:        ${provs[*]} anthropic(default)"
+    echo "usage: gwt-provider <provider>   (e.g. kimi, glm, anthropic)"
+    return 0
+  fi
+  local provider="$1"
+  if [[ "$provider" == *"/"* || "$provider" == *".."* ]]; then
+    echo "✗ invalid provider name: $provider"; return 1; fi
+  if [[ "$provider" == "anthropic" || "$provider" == "default" ]]; then
+    printf 'anthropic\n' > "$f"
+    echo "✔ new sub-tasks will use provider: anthropic (default)"
+    return 0; fi
+  if [[ ! -f "$provdir/$provider.sh" ]]; then
+    echo "✗ no such provider: $provider; available: ${provs[*]:-(none)} anthropic(default)"; return 1; fi
+  printf '%s\n' "$provider" > "$f"
+  echo "✔ new sub-tasks will use provider: $provider (existing sub-tasks unchanged)"
 }

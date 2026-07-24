@@ -1,6 +1,7 @@
 # runtime-generated
 worktree-tasks.tsv
 cc-failures.log
+launch
 # backups
 *.bak.*
 .DS_Store

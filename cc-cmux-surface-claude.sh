@@ -98,18 +98,28 @@ if [ -n "$prompt" ]; then
   [ -n "$caller_surface" ] && full="$full (5) To report back / ask the main task: cmux send --surface $caller_surface \"message\" then cmux send-key --surface $caller_surface Enter."
 fi
 
-# Start the team-ready claude (ccteam). Key point: don't type the prompt straight into the terminal (a very long line gets shredded,
-# and newlines are treated as Enter). Instead write it to a temp file and type a short command ccteam "$(cat file)" — the shell reads
+# Start the sub-task claude. Key point: don't type the prompt straight into the terminal (a very long line gets shredded,
+# and newlines are treated as Enter). Instead write it to a temp file and type a short command "$(cat file)" — the shell reads
 # the file and passes the whole content (newlines and all) to claude as a single argument.
 # --permission-mode plan: the sub-task presents a plan and waits at the approval gate before editing (override via CC_WT_PERMISSION_MODE).
+# Provider for NEW sub-tasks: `gwt-provider` writes a provider name to $CC_LAUNCH_FILE (default anthropic).
+# anthropic/default → cmux claude-teams on the official/current-env provider; any other name → `cld <name>`,
+# which sources ~/.config/claude/llm-provider/<name>.sh in the new tab (provider env is process-local, so
+# existing sub-tasks keep their launch-time provider). Unknown/empty → safe default, never breaks the launch.
 pm="${CC_WT_PERMISSION_MODE:-plan}"
+_provider="$(cat "${CC_LAUNCH_FILE:-$HOME/.config/cc-stack/launch}" 2>/dev/null)"
+case "$_provider" in
+  ""|anthropic|default) launch="ccteam" ;;
+  */*|*..*)             launch="ccteam" ;;     # path-traversal guard → safe default
+  *)                    launch="cld $_provider" ;;
+esac
 pf=""
 if [ -n "$full" ]; then
   pf="${TMPDIR:-/tmp}/cc-wt-prompt.$$.txt"
   printf '%s' "$full" > "$pf"
-  cmux send --surface "$ref" "ccteam --permission-mode $pm \"\$(cat '$pf')\"" >/dev/null 2>&1
+  cmux send --surface "$ref" "$launch --permission-mode $pm \"\$(cat '$pf')\"" >/dev/null 2>&1
 else
-  cmux send --surface "$ref" "ccteam --permission-mode $pm" >/dev/null 2>&1
+  cmux send --surface "$ref" "$launch --permission-mode $pm" >/dev/null 2>&1
 fi
 cmux send-key --surface "$ref" Enter >/dev/null 2>&1
 
