@@ -9,3 +9,6 @@ launch
 # worktrees + local settings
 /.claude/worktrees/
 /.claude/settings.local.json
+# transient design docs (local only)
+/docs/plans/
+/docs/specs/
