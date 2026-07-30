@@ -3,7 +3,7 @@
 #            optionally with an initial prompt. Opens in background, doesn't steal focus. Not in cmux (remote/Zellij/not installed) = safe no-op.
 # Called automatically by cc-worktree-cmux-hook.sh, and reused by cc-worktree-claude.sh (gwt-claude).
 # Usage: cc-cmux-surface-claude.sh <path> [prompt]
-# Related env: CC_WT_PERMISSION_MODE (default plan), CC_WT_PRETRUST (default 1), CC_WT_COPY (files to copy into the worktree)
+# Related env: CC_WT_PERMISSION_MODE (default auto; set plan for a plan-first sub-task), CC_WT_PRETRUST (default 1), CC_WT_COPY (files to copy into the worktree)
 set -u
 
 path="${1:-}"; prompt="${2:-}"
@@ -90,23 +90,40 @@ for _ in $(seq 1 40); do
 done
 [ -n "$ready" ] || echo "⚠ shell-ready probe timed out, sending anyway (may need one manual Enter)" >&2
 
-# Assemble the final prompt: user prompt (multi-line preserved) + working agreement + backchannel note
+# Permission mode for the sub-task claude. Default `auto` — it investigates and then implements without an
+# approval round-trip, the same mode the main session runs in; `plan` was the old default and cost a human
+# round-trip on every single dispatch.
+# Per-dispatch override: CC_WT_PERMISSION_MODE=plan (env on the gwt-claude call, or as a prefix token on the
+# `git worktree add` command line — the hook parses it out of the command text and passes it through here).
+# Whitelisted because the value is interpolated into the launch command below; anything else falls back to auto.
+pm="${CC_WT_PERMISSION_MODE:-auto}"
+case "$pm" in
+  plan|auto|acceptEdits|bypassPermissions|manual|dontAsk) : ;;
+  *) pm="auto" ;;
+esac
+
+# Assemble the final prompt: user prompt (multi-line preserved) + working agreement + backchannel note.
+# Clause (1) MUST track $pm — telling an auto-mode sub-task it is "in plan mode" makes it plan anyway.
+if [ "$pm" = "plan" ]; then
+  way1="(1) You are in plan mode: present a plan first and wait for human approval before changing code; don't start editing right away."
+else
+  way1="(1) You are NOT in plan mode — no plan-approval round-trip. Investigate first (read the code and the relevant docs until the logic is actually clear), then implement without waiting for me; do not start typing code off a guess. Do still stop and ask before a structural or destructive decision (schema/migration, cross-module refactor, deleting or rewriting existing behaviour, anything outside this brief)."
+fi
 full="$prompt"
 if [ -n "$prompt" ]; then
   full="$full
-——[Working agreement] (1) You are in plan mode: present a plan first and wait for human approval before changing code; don't start editing right away. (2) Follow this project's own CLAUDE.md and .claude config (harness) throughout; don't drift toward your own defaults. (3) After making changes, commit / rebase / merge / push / removing the worktree or branch ALL require human authorization — even if the finishing-a-development-branch skill prompts you, just stop at 'keep the branch'. (4) When you finish implementing and have reported back, run \`gwt-done\` to mark this branch ready; your merge target is already recorded, so you never choose where to merge, and you never merge without my authorization."
+——[Working agreement] $way1 (2) Follow this project's own CLAUDE.md and .claude config (harness) throughout; don't drift toward your own defaults. (3) After making changes, commit / rebase / merge / push / removing the worktree or branch ALL require human authorization — even if the finishing-a-development-branch skill prompts you, just stop at 'keep the branch'. (4) When you finish implementing and have reported back, run \`gwt-done\` to mark this branch ready; your merge target is already recorded, so you never choose where to merge, and you never merge without my authorization."
   [ -n "$caller_surface" ] && full="$full (5) To report back / ask the main task: cmux send --surface $caller_surface \"message\" then cmux send-key --surface $caller_surface Enter."
 fi
 
 # Start the sub-task claude. Key point: don't type the prompt straight into the terminal (a very long line gets shredded,
 # and newlines are treated as Enter). Instead write it to a temp file and type a short command "$(cat file)" — the shell reads
 # the file and passes the whole content (newlines and all) to claude as a single argument.
-# --permission-mode plan: the sub-task presents a plan and waits at the approval gate before editing (override via CC_WT_PERMISSION_MODE).
+# --permission-mode $pm: resolved above (default auto, CC_WT_PERMISSION_MODE=plan for the plan-first gate).
 # Provider for NEW sub-tasks: `gwt-provider` writes a provider name to $CC_LAUNCH_FILE (default anthropic).
 # anthropic/default → cmux claude-teams on the official/current-env provider; any other name → `cld <name>`,
 # which sources ~/.config/claude/llm-provider/<name>.sh in the new tab (provider env is process-local, so
 # existing sub-tasks keep their launch-time provider). Unknown/empty → safe default, never breaks the launch.
-pm="${CC_WT_PERMISSION_MODE:-plan}"
 _provider="$(cat "${CC_LAUNCH_FILE:-$HOME/.config/cc-stack/launch}" 2>/dev/null)"
 case "$_provider" in
   ""|anthropic|default) launch="ccteam" ;;

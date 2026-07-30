@@ -18,11 +18,11 @@ Effect (handled automatically by the PostToolUse hook in `~/.config/cc-stack`): 
 - Before creating a worktree, if `.claude/worktrees/` isn't ignored by `.gitignore`, add `/.claude/worktrees/` to the project root `.gitignore` (so worktree contents don't pollute git status).
 - After spawning, use `gwt-status` to see what all the sub-task tabs are doing (status/branch/dir/task).
 
-# How worktree sub-tasks work — plan first, respect the harness, don't land changes (all need my authorization)
+# How worktree sub-tasks work — investigate before editing, respect the harness, don't land changes (all need my authorization)
 
 Whether spawned automatically or started manually via `gwt-claude`, a worktree sub-task claude must follow:
 
-**1. Plan first, then edit (plan-first).** Sub-tasks start with `--permission-mode plan` by default: present a plan first and **wait for my approval before touching code**; don't start editing right away. This lets me vet the approach first and raise code quality.
+**1. Investigate, then edit — no approval gate.** Sub-tasks start with `--permission-mode auto` by default: read the code and the relevant docs until the logic is actually clear, then **implement without waiting for my approval**. Don't type code off a guess, and still stop to ask before a structural or destructive decision (schema/migration, cross-module refactor, rewriting or deleting existing behaviour, anything outside the brief). A dispatch that genuinely needs the old approval gate carries `CC_WT_PERMISSION_MODE=plan` on the `git worktree add` line — **only then** present a plan first and wait for me.
 
 **2. Follow the current project's own harness config, don't go rogue.** Work according to the **project's** `CLAUDE.md` and `.claude/` (settings, hooks, commands) where the sub-task lives; don't drift toward your own default preferences.
 

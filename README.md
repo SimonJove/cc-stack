@@ -85,13 +85,13 @@ CC_WT_PROMPT='the full first instruction for the task (may be multi-line)' git w
 2. opens a **new tab in the current cmux workspace** (background, no focus steal), cwd = the worktree;
 3. **copies** the main repo's `.env` etc. (`$CC_WT_COPY`) into the worktree;
 4. **pre-trusts** the directory (skips claude's "Do you trust this folder?" prompt);
-5. starts a **`ccteam` (team-ready claude)** in the new tab with **`--permission-mode plan`**;
+5. starts a **`ccteam` (team-ready claude)** in the new tab with **`--permission-mode auto`** (prefix `CC_WT_PERMISSION_MODE=plan` on the `git worktree add` to get the plan-first gate instead);
 6. sends `CC_WT_PROMPT` as the **first message** (via a temp file, so any length / multi-line works);
 7. **registers** the sub-task into the list (queryable via `gwt-status`).
 
 ### Sub-task working rules (enforced by CLAUDE.md + the prompt, both)
 
-- **Plan first**: in plan mode, the sub-task presents a plan and **waits for your approval** before editing;
+- **Investigate, then edit**: in auto mode (the default) the sub-task researches first and then implements with **no approval round-trip** — structural/destructive decisions still come back to you; `CC_WT_PERMISSION_MODE=plan` restores the old "present a plan and wait" gate;
 - **Respect the project harness**: works per the **sub-task's own project** `CLAUDE.md`/`.claude`, no going rogue;
 - **Don't land changes**: `commit` / `rebase` / `merge` / `push` / remove worktree / delete branch **all require your authorization**, defaulting to "keep the branch";
 - **Backchannel**: the sub-task knows how to `cmux send` a report back to the main task.
@@ -180,7 +180,7 @@ Every sub-task still launches in **team mode** (`cmux claude-teams`) regardless 
 | Variable | Default | Purpose |
 |---|---|---|
 | `CC_WT_PROMPT` | (none) | The **first message** for the sub-task when creating a worktree; multi-line supported. Without it, an idle ccteam starts. |
-| `CC_WT_PERMISSION_MODE` | `plan` | The sub-task claude's `--permission-mode`. Set `default`/`acceptEdits` to skip planning and edit directly. |
+| `CC_WT_PERMISSION_MODE` | `auto` | The sub-task claude's `--permission-mode`. Set `plan` for the plan-first approval gate. Also accepted as a **prefix token on the `git worktree add` line** (the hook parses it out of the command text, like `CC_WT_PROMPT` — an env prefix alone never reaches the hook process). Whitelist: `plan` `auto` `acceptEdits` `bypassPermissions` `manual` `dontAsk`; anything else falls back to `auto`. |
 | `CC_WT_PRETRUST` | `1` | Whether to pre-trust the worktree dir (skip the trust prompt). Set `0` to disable (falls back to screen-scrape confirmation). |
 | `CC_WT_COPY` | `.env .env.local .claude/settings.local.json` | Files copied from the main repo into a new worktree (space-separated, no spaces in paths). |
 | `CC_WT_SHARE` | `scratchpad/e2e` | Gitignored dir(s) shared across worktrees as **independent copies**: seeded into a new worktree on create, merged back into the main repo on `gwt-rm` (never overwrites main; clashes kept as `<name>.from-<branch>.<ext>`). Space-separated; **export** it to customize, exported-empty (`""`) disables. |
@@ -200,7 +200,7 @@ cc-worktree-cmux-hook.sh        PostToolUse(Bash) hook: parse the command for th
   ▼
 cc-cmux-surface-claude.sh  ◀────── single source of truth ──────  cc-worktree-claude.sh (gwt-claude: builds worktree then exec-delegates)
   │  ① ping/new-surface short retry (rides out cmux hiccups)  ② copy .env  ③ pre-trust (cc-trust.sh)
-  │  ④ open tab  ⑤ probe shell-ready  ⑥ start ccteam --permission-mode plan via temp file + send prompt
+  │  ④ open tab  ⑤ probe shell-ready  ⑥ start ccteam --permission-mode auto (or CC_WT_PERMISSION_MODE) via temp file + send prompt
   │  ⑦ screen-scrape trust fallback  ⑧ register (cc-tasks-log.sh)   failure → cc-failures.log + cmux notify
   ▼
 worktree-tasks.tsv  ──►  gwt-status (reads the list + judges liveness via cmux; auto-prunes deleted dirs)

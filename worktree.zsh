@@ -364,7 +364,7 @@ gwt-collect() {
 gwt-help() {
   cat <<'EOF'
 cc-stack · worktree sub-task commands
-  gwt-claude <name> "<initial-prompt>"   build worktree + new tab running claude (plan mode) + send prompt
+  gwt-claude <name> "<initial-prompt>"   build worktree + new tab running claude (auto mode) + send prompt
   gwt-new <name>                         build worktree and cd into it (opens an empty workspace, no claude)
   gwt-ls                                 git worktree list
   gwt-tree                               hierarchical board: branch tree, merge target, ready state, tab liveness
@@ -379,7 +379,8 @@ cc-stack · worktree sub-task commands
   gwt-fan                                (zellij only) fan each worktree into its own pane running claude
   gwt-provider <name>                    set which AI provider starts NEW sub-tasks: gwt-provider kimi|glm|anthropic (existing sub-tasks unchanged); no arg shows current + available
 Note: telling the main Claude to "open a worktree / spin off a sub-task" auto-triggers the hook to open a parallel tab;
-      sub-tasks default to plan mode (plan first, then edit); commit/merge/cleanup all require human authorization.
+      sub-tasks default to auto mode (investigate, then edit — no approval gate; prefix CC_WT_PERMISSION_MODE=plan to
+      force the old plan gate); commit/merge/cleanup all require human authorization.
 EOF
 }
 

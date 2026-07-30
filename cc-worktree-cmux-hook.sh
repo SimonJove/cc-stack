@@ -9,6 +9,8 @@
 #     if it can't parse (e.g. a $VAR shell variable that wasn't expanded), falls back to "most-recent mtime".
 #   - Initial-prompt convention: prefix the command with CC_WT_PROMPT='task description', e.g.:
 #       CC_WT_PROMPT='refactor auth token refresh' git worktree add .claude/worktrees/oauth -b feat/oauth
+#   - Sub-tasks start in `auto` mode. To pin ONE dispatch to the plan-first gate, add the prefix
+#     CC_WT_PERMISSION_MODE=plan (parsed out of the command text, like CC_WT_PROMPT).
 #   - cmux availability via `cmux ping` (not CMUX_SOCKET, which is often empty in CC's Bash env).
 #   - Synchronous launch: CC reaps backgrounded children when the hook returns (tested: `&`/nohup/setsid all fail —
 #     setsid detaches the session and then cmux gives Broken pipe), so it must be synchronous; the cost is this tool
@@ -121,21 +123,36 @@ if chosen is None:
 if time.time() - os.stat(chosen).st_mtime > 120:
     sys.exit(0)
 
-# Extract the CC_WT_PROMPT value from the command (quote-aware); empty if absent
+# Extract the CC_WT_PROMPT / CC_WT_PERMISSION_MODE values from the command (quote-aware); empty if absent.
+# The env-prefix form only sets them inside the Bash tool shell — this hook is a separate process and would
+# never see them — so they are read out of the command TEXT, same as everything else here.
+# (No apostrophes in this heredoc: bash 3.2 mis-parses a single quote inside a heredoc nested in $( ).)
 prompt = ""
+mode = ""
 for tok in toks:
     if tok.startswith("CC_WT_PROMPT="):
         prompt = tok[len("CC_WT_PROMPT="):]
-        break
-sys.stdout.write(chosen + "\t" + prompt)
+    elif tok.startswith("CC_WT_PERMISSION_MODE="):
+        mode = tok[len("CC_WT_PERMISSION_MODE="):].strip()
+# mode goes in the middle: the prompt is free text and may itself contain tabs, so it must stay last
+sys.stdout.write(chosen + "\t" + mode + "\t" + prompt)
 PY
 )"
 
-# Split path and prompt (python always writes one TAB, so prompt is everything after it, possibly empty)
+# Split path / permission-mode / prompt (python always writes two TABs; prompt is everything after the second)
 newpath="${line%%$'\t'*}"
-prompt="${line#*$'\t'}"
-[ "$prompt" = "$line" ] && prompt=""    # fallback: in case there was no TAB
+rest="${line#*$'\t'}"
+[ "$rest" = "$line" ] && rest=""                    # no TAB at all → nothing but the path
+if [ "$rest" = "${rest#*$'\t'}" ]; then
+  mode=""; prompt="$rest"                           # only one TAB → treat the remainder as the prompt
+else
+  mode="${rest%%$'\t'*}"; prompt="${rest#*$'\t'}"
+fi
 [ -n "$newpath" ] || exit 0
+
+# Per-dispatch permission mode: CC_WT_PERMISSION_MODE=plan on the command line pins THIS sub-task to
+# plan-first (default is auto). cc-cmux-surface-claude.sh whitelists the value.
+[ -n "$mode" ] && export CC_WT_PERMISSION_MODE="$mode"
 
 # Synchronously open surface + start ccteam (+send prompt). Must be synchronous: see the header notes.
 # (Shared-corpus seeding [CC_WT_SHARE] happens inside cc-cmux-surface-claude.sh — the single point
