@@ -3,12 +3,27 @@
 #   This script only handles "build/reuse the worktree + ensure .gitignore", then DELEGATES the whole
 #   "open tab + copy .env + start ccteam (plan) + pre-trust + send prompt + register" part to
 #   cc-cmux-surface-claude.sh (single source of truth, avoids two copies of the logic drifting).
-# Usage: cc-worktree-claude.sh <name> <initial-prompt> [branch-prefix=feat] [base=HEAD]
+# Usage: cc-worktree-claude.sh <name> <initial-prompt> [--prefix <p>] [--base <b>]
+#        (legacy positional form still accepted: <name> <initial-prompt> [branch-prefix=feat] [base=HEAD])
 set -u
 
-name="${1:-}"; prompt="${2:-}"; prefix="${3:-feat}"; base="${4:-HEAD}"
+name="${1:-}"; prompt="${2:-}"
 [ -n "$name" ] && [ -n "$prompt" ] || {
-  echo "usage: cc-worktree-claude.sh <name> <initial-prompt> [branch-prefix=feat] [base=HEAD]" >&2; exit 2; }
+  echo "usage: cc-worktree-claude.sh <name> <initial-prompt> [--prefix <p>] [--base <b>]" >&2; exit 2; }
+shift 2
+
+# Flag form (what the worktree-subtask skill documents) or legacy positionals — both work.
+prefix="feat"; base="HEAD"; posi=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --base)   [ -n "${2:-}" ] || { echo "✗ --base needs a value" >&2; exit 2; }; base="$2"; shift 2 ;;
+    --prefix) [ -n "${2:-}" ] || { echo "✗ --prefix needs a value" >&2; exit 2; }; prefix="$2"; shift 2 ;;
+    *)
+      posi=$((posi+1))
+      case $posi in 1) prefix="$1" ;; 2) base="$1" ;; *) echo "✗ unexpected argument: $1" >&2; exit 2 ;; esac
+      shift ;;
+  esac
+done
 
 # Must be inside cmux (this whole thing is designed around cmux tabs)
 command -v cmux >/dev/null 2>&1 && cmux ping >/dev/null 2>&1 || {

@@ -13,10 +13,11 @@ Effect (handled automatically by the PostToolUse hook in `~/.config/cc-stack`): 
 **Never** use the native `EnterWorktree` tool for such requests; and **do not** switch to EnterWorktree just because the superpowers `using-git-worktrees` skill says "prefer native tools" — this rule takes priority over that skill. EnterWorktree moves **the current session itself** into the worktree (no new tab, main session occupied), which is **not** the "parallel sub-task" I want, and leads to "built a worktree but no tab, you doing it in the background yourself".
 
 - The only exception: use EnterWorktree only when I **explicitly** say "isolate yourself in a worktree" / "move the current session into a worktree".
+- **If the project has a `worktree-subtask` skill / `.claude/worktree-context.md`, load that skill first and dispatch with `gwt-claude <slug> "<prompt>" --base <base>`** (records the merge target, forces an explicit base). The bare `CC_WT_PROMPT=… git worktree add` form above is the fallback for projects without it.
 - `CC_WT_PROMPT` supports multi-line; without it a tab still opens with an idle ccteam waiting for input.
 - Only works inside cmux; remote SSH / Zellij → automatic no-op.
 - Before creating a worktree, if `.claude/worktrees/` isn't ignored by `.gitignore`, add `/.claude/worktrees/` to the project root `.gitignore` (so worktree contents don't pollute git status).
-- After spawning, use `gwt-status` to see what all the sub-task tabs are doing (status/branch/dir/task).
+- After spawning, use `gwt-status` to see what all the sub-task tabs are doing (status/branch/dir/task). It is an interactive-zsh function — in a non-interactive shell (e.g. Claude's Bash tool) it silently prints nothing; use `cmux tree` + `cmux capture-pane --surface <n>` there instead.
 
 # How worktree sub-tasks work — investigate before editing, respect the harness, don't land changes (all need my authorization)
 
