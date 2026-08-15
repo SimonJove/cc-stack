@@ -105,6 +105,30 @@ CC_WT_PROMPT='the full first instruction for the task (may be multi-line)' git w
 
 > Not inside cmux (remote SSH) → everything is a **safe no-op**.
 
+### The task board: `gwt-status`
+
+`gwt-status` renders the sub-task board — one row per registered worktree sub-task:
+
+| Column | Meaning |
+|---|---|
+| `TAB` | cmux surface liveness: `✔live` / `⌫closed` (ref gone within the same cmux session) / `?old-session` (no registered ref alive → cmux probably restarted) / `?` (cmux unreachable) |
+| `BRANCH` | the sub-task's branch |
+| `PARENT` | its recorded merge target (`branch.<b>.ccMergeInto`; falls back to the parent branch recorded at dispatch once that config is gone, e.g. branch deleted after merge) |
+| `STATUS` | agent state from the hook sidecar (table below) |
+| `DIR` / `TASK` | the worktree dir and the dispatch prompt summary |
+
+Row rules: the **newest record per dir wins**; rows whose dir no longer exists are **pruned on read**;
+and a **repo filter** shows only rows under the current repo's git root — both sides canonicalized
+with `pwd -P`, so macOS's `/var/...` ↔ `/private/var/...` forms never hide a row. `--all` disables
+the filter; outside any repo everything shows.
+
+**One board implementation, any shell.** `gwt-status` is THE board command (docs, rules and tests
+reference it); under the hood it is a thin wrapper over `cc-board.sh` (bash). Claude's
+non-interactive Bash tool cannot run zsh functions, so it calls the implementation entry directly:
+`bash ~/.config/cc-stack/cc-board.sh [--all]` (humans keep using `gwt-status`). When `gwt-merge`
+lands a branch, its rows move out of the live board into `worktree-tasks-archive.tsv` (with a
+merged-at timestamp) — `gwt-log` renders that archive with the same columns and repo filter.
+
 ### Sub-task agent status: working / idle / blocked
 
 `gwt-status` shows a **STATUS** column per sub-task. It is driven by Claude Code **hooks**, not by the
@@ -167,7 +191,10 @@ gwt-adopt <branch> [--into <parent>] [--no-worktree]  # enroll an EXISTING branc
                                #   by default, give it a worktree so an agent can start on it. Does not cd or
                                #   steal focus, so an orchestrating claude can fold hand-made branches in.
 gwt-ls                         # git worktree list
-gwt-status                     # board: tab (✔live/⌫closed/?old-session) + branch + surface + dir + agent STATUS (working/idle/blocked + age) + task (auto-cleans deleted dirs)
+gwt-status                     # THE board command: TAB liveness + BRANCH + PARENT (merge target) + agent STATUS (working/idle/blocked + age)
+                               #   + DIR + TASK; current repo only (--all = every repo); auto-cleans deleted dirs.
+                               #   Any-shell implementation entry: bash ~/.config/cc-stack/cc-board.sh [--all]
+gwt-log                        # the merged-task archive with the same columns/filter (rows moved there by gwt-merge)
 gwt-rm <name> [--branch]       # remove worktree (+ clear task record + clear pre-trust; optionally the branch)
 gwt-prune                      # compact the task list (drop dead records + keep newest per dir)
 gwt-clean                      # git worktree prune + show current state
@@ -204,7 +231,8 @@ Every sub-task still launches in **team mode** (`cmux claude-teams`) regardless 
 | `CC_WT_COPY` | `.env .env.local .claude/settings.local.json` | Files copied from the main repo into a new worktree (space-separated, no spaces in paths). |
 | `CC_WT_SHARE` | `scratchpad/e2e` | Gitignored dir(s) shared across worktrees as **independent copies**: seeded into a new worktree on create, merged back into the main repo on `gwt-rm` (never overwrites main; clashes kept as `<name>.from-<branch>.<ext>`). Space-separated; **export** it to customize, exported-empty (`""`) disables. |
 | `CC_TASKS_FILE` | `~/.config/cc-stack/worktree-tasks.tsv` | Task list path (rarely changed). |
-| `CC_STATUS_FILE` | `~/.config/cc-stack/worktree-status.tsv` | Agent-state sidecar written by `cc-status-hook.sh`, read by `gwt-status`'s STATUS column (override for tests). |
+| `CC_STATUS_FILE` | `~/.config/cc-stack/worktree-status.tsv` | Agent-state sidecar written by `cc-status-hook.sh`, read by the board's STATUS column (override for tests). |
+| `CC_ARCHIVE_FILE` | `~/.config/cc-stack/worktree-tasks-archive.tsv` | Merged-task archive written on `gwt-merge`, rendered by `gwt-log` / `cc-board.sh --archive` (override for tests). |
 | `CC_LAUNCH_FILE` | `~/.config/cc-stack/launch` | Written by `gwt-provider`; the provider name for NEW sub-tasks (`kimi`, `glm`, or `anthropic`/empty=default). Override path for tests. |
 
 ---
@@ -223,17 +251,21 @@ cc-cmux-surface-claude.sh  ◀────── single source of truth ──�
   │  ④ open tab  ⑤ probe shell-ready  ⑥ start ccteam --permission-mode auto (or CC_WT_PERMISSION_MODE) via temp file + send prompt
   │  ⑦ screen-scrape trust fallback  ⑧ register (cc-tasks-log.sh)   failure → cc-failures.log + cmux notify
   ▼
-worktree-tasks.tsv  ──►  gwt-status (reads the list + judges liveness via cmux; auto-prunes deleted dirs)
+worktree-tasks.tsv  ──►  cc-board.sh (bash; gwt-status wraps it): joins the sidecar, judges tab liveness
+  │                       via cmux, applies the repo filter, auto-prunes deleted dirs
+  ▼
+gwt-merge (on do-merge success) ──► worktree-tasks-archive.tsv (+merged-at) ──► gwt-log
 
 each sub-task claude's own lifecycle events ──►
 cc-status-hook.sh             UserPromptSubmit / Stop / permission-Notification hooks (registered globally,
   │                           but only board dirs ever match): dir + state + ts under a mkdir lock
   ▼
-worktree-status.tsv  ──►  gwt-status STATUS column: working(23m) / idle(2h) / blocked(5m) / -
+worktree-status.tsv  ──►  the board's STATUS column: working(23m) / idle(2h) / blocked(5m) / -
 ```
 
 **Key design choices:**
 - **Single source of truth**: the whole tab-opening logic lives only in `cc-cmux-surface-claude.sh`; both the hook and `gwt-claude` call it, so the logic can't drift into two copies.
+- **One board implementation**: all board rendering lives in `cc-board.sh` (plain bash, so it runs from any shell — Claude's non-interactive Bash included); `gwt-status` / `gwt-log` are thin wrappers over it.
 - **Prompt via file**: `ccteam "$(cat tempfile)"` — the command is short (a very long line would be shredded), and the shell passes the whole file (newlines and all) to claude as a single argument (multi-line preserved).
 - **Reliability**: short retries during cmux hiccups; a hard failure leaves `cc-failures.log` (surfaced by `gwt-status`).
 - **Reliable status**: `gwt-status` judges tab liveness against cmux's live surface list; after a cmux restart, stale refs show `?old-session` rather than falsely "closed".
@@ -266,6 +298,7 @@ cc-cmux-surface-claude.sh    # [single source of truth] open tab + copy .env + p
 cc-worktree-claude.sh        # gwt-claude: build worktree + ensure .gitignore, delegates the surface part above
 cc-cmux-workspace.sh         # used by gwt-new: open an empty workspace for a dir (no-op when not in cmux)
 cc-tasks-log.sh              # single task-registration entry point (keeps TSV format consistent)
+cc-board.sh                  # [the board] renders gwt-status/gwt-log from any shell (bash): tasks+status join, repo filter, tab liveness, prune-on-read
 cc-status-hook.sh            # UserPromptSubmit/Stop/Notification hook: sub-task agent state (working/idle/blocked) → worktree-status.tsv
 cc-trust.sh                  # pre-authorize/revoke trust for a dir (edits ~/.claude.json, atomic write, only adds/removes pure-trust signatures)
 claude-rules.md              # single source of the global CLAUDE.md worktree rules (install syncs it into the managed block)
@@ -273,6 +306,7 @@ install.sh                   # one-command install/repair (idempotent/backs up; 
 config/cmux.json             # workflow cmux config (minimalMode + workspace/tab nav keys); applied via install.sh --cmux
 test.sh                      # smoke test (gwt-test calls it)
 worktree-tasks.tsv           # task registration list (auto-generated)
+worktree-tasks-archive.tsv   # merged sub-task rows, moved on gwt-merge (auto-generated; rendered by gwt-log)
 worktree-status.tsv          # per-sub-task agent state, written by cc-status-hook.sh (auto-generated)
 cc-failures.log              # records of tabs that failed to open (auto-generated)
 README.md                    # this file

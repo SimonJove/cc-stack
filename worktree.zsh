@@ -14,6 +14,11 @@
 #   otherwise use the default (which lives in cc-worktree-shared.sh).
 : ${CC_WT_SHARE="scratchpad/e2e"}
 
+# Dir this file was sourced from (the install dir, or a checkout/worktree when a worktree
+# tests itself): sibling scripts like cc-board.sh resolve from here first, falling back to
+# ~/.config/cc-stack, so gwt-status/gwt-log always find a cc-board.sh.
+_gwt_src_dir="${${(%):-%x}:A:h}"
+
 # Main repo root: returns the main repo root whether you're in the main repo or in some worktree
 _gwt_root() {
   local g; g="$(git rev-parse --git-common-dir 2>/dev/null)" || return 1
@@ -67,10 +72,10 @@ _gwt_tasks_rewrite() {
   local keep_fn="$1" tmp="$f.tmp.$$" lock="$f.lock" got= i
   # Share one mkdir lock with cc-tasks-log.sh's append, to avoid losing a concurrent append during read→mv
   for i in {1..60}; do mkdir "$lock" 2>/dev/null && { got=1; break }; sleep 0.05; done
-  local ts branch ref dir caller task
+  local ts branch ref dir caller task parent
   : > "$tmp"
-  while IFS=$'\t' read -r ts branch ref dir caller task; do
-    "$keep_fn" "$dir" && printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$ts" "$branch" "$ref" "$dir" "$caller" "$task" >> "$tmp"
+  while IFS=$'\t' read -r ts branch ref dir caller task parent; do
+    "$keep_fn" "$dir" && printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$ts" "$branch" "$ref" "$dir" "$caller" "$task" "$parent" >> "$tmp"
   done < "$f"
   mv "$tmp" "$f"
   [[ -s "$f" ]] || rm -f "$f"
@@ -91,6 +96,42 @@ _gwt_keep_not_target() { [[ "$1" != "$_gwt_drop_target" ]] }
 # Drop records whose dir no longer exists (used by gwt-status): keep lines whose dir still exists (even if the tab is closed)
 _gwt_tasks_prune_dead() { _gwt_tasks_rewrite '_gwt_keep_dir_exists' }
 _gwt_keep_dir_exists() { [[ -n "$1" && -d "$1" ]] }
+
+# ── Merged-task archive (worktree-tasks-archive.tsv) ───────────────────────────
+# Rows move here when their branch merges: same 7 fields plus an appended 8th merged-at unix
+# ts. Rendered by gwt-log (cc-board.sh --archive) with the board's columns and repo filter.
+_gwt_archive_file() { echo "${CC_ARCHIVE_FILE:-$HOME/.config/cc-stack/worktree-tasks-archive.tsv}" }
+
+# _gwt_archive_branch <branch> — under the tasks lock, move ALL rows whose branch matches
+# into the archive (appending merged-at) and drop their status sidecar rows. Called by
+# gwt-merge after a successful merge (or a benign skipped-already-merged), so the board stops
+# showing merged work while gwt-log keeps the history.
+_gwt_archive_branch() {
+  emulate -L zsh
+  local branch="$1"; [[ -n "$branch" ]] || return 0
+  local f; f="$(_gwt_tasks_file)"; [[ -f "$f" ]] || return 0
+  local arch; arch="$(_gwt_archive_file)"
+  local lock="$f.lock" got= i tmp="$f.tmp.$$" now ts bref ref dir caller task parent
+  local -a moved=()
+  for i in {1..60}; do mkdir "$lock" 2>/dev/null && { got=1; break }; sleep 0.05; done
+  now="$(date +%s)"
+  : > "$tmp"
+  while IFS=$'\t' read -r ts bref ref dir caller task parent; do
+    if [[ "$bref" == "$branch" ]]; then
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$ts" "$bref" "$ref" "$dir" "$caller" "$task" "$parent" "$now" >> "$arch"
+      [[ -n "$dir" ]] && moved+=("$dir")
+    else
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$ts" "$bref" "$ref" "$dir" "$caller" "$task" "$parent" >> "$tmp"
+    fi
+  done < "$f"
+  mv "$tmp" "$f"
+  [[ -s "$f" ]] || rm -f "$f"
+  [[ -n "$got" ]] && rmdir "$lock" 2>/dev/null
+  local d
+  for d in $moved; do _gwt_status_drop_dir "$d"; done
+  (( ${#moved} )) && echo "  ↳ archived ${#moved} record(s) for $branch (see gwt-log)"
+  return 0
+}
 
 # ── Agent-state sidecar (worktree-status.tsv, written by cc-status-hook.sh) ───
 # dir \t state \t unix-ts, one row per dir. States: working / idle / blocked — never "ready":
@@ -113,21 +154,6 @@ _gwt_status_rewrite() {
   [[ -s "$f" ]] || rm -f "$f"
   [[ -n "$got" ]] && rmdir "$lock" 2>/dev/null
   return 0
-}
-
-# Human age for a unix ts: 23m / 2h / 5d (gwt-status STATUS column suffix); "?" on a malformed ts
-_gwt_status_age() {
-  emulate -L zsh
-  local ts="$1"
-  [[ "$ts" == <-> ]] || { echo "?"; return 0 }
-  # two statements, NOT one `local now=… age=$(( now - ts ))`: a single local expands all its words
-  # before assigning, so `now` would still be unset inside the arithmetic (same typeset gotcha as _gwt_tree_render)
-  local now=${EPOCHSECONDS:-$(date +%s)}
-  local age=$(( now - ts ))
-  (( age < 0 )) && age=0
-  if (( age < 3600 )); then echo "$(( age / 60 ))m"
-  elif (( age < 86400 )); then echo "$(( age / 3600 ))h"
-  else echo "$(( age / 86400 ))d"; fi
 }
 
 # Drop the state row for a removed dir (gwt-rm) — keep rows whose dir differs
@@ -205,67 +231,35 @@ gwt-adopt() {
 # gwt-ls — list all worktrees
 gwt-ls() { git worktree list }
 
-# gwt-status — list registered worktree sub-tasks: tab liveness, branch/surface/dir, agent state, what it's doing
+# gwt-status — THE board command: list registered worktree sub-tasks. Thin wrapper that runs
+#   cc-board.sh in bash so the SAME implementation works from any shell (Claude's non-interactive
+#   Bash included — the old zsh-only render silently printed nothing there). Args are forwarded
+#   (--all: rows from every repo, not just the current one).
 #   data source 1: $CC_TASKS_FILE, appended by cc-cmux-surface-claude.sh whenever it opens a tab
-#     fields: time \t branch \t surface \t dir \t caller-tab \t task-summary
+#     fields: time \t branch \t surface \t dir \t caller-tab \t task-summary \t parent-branch
 #   data source 2: $CC_STATUS_FILE sidecar (dir \t state \t unix-ts), written by cc-status-hook.sh on
 #     UserPromptSubmit/Stop/permission-Notification → STATUS column, joined on dir. idle = not-running,
 #     NOT done — "ready" still comes only from gwt-done + a clean tree (gwt-tree), never from here.
+#   Output contract (unchanged since the zsh original): header has TAB before STATUS; STATUS
+#   cells working(23m)/idle(2h)/blocked(5m), "-" when the hook never fired.
+# cc-board.sh sits next to this file when a worktree tests itself, else in the install dir.
+_gwt_board_script() {
+  local d="${_gwt_src_dir:-}"
+  [[ -n "$d" && -f "$d/cc-board.sh" ]] && { echo "$d/cc-board.sh"; return 0 }
+  echo "$HOME/.config/cc-stack/cc-board.sh"
+}
 gwt-status() {
   emulate -L zsh
-  local f; f="$(_gwt_tasks_file)"
-  _gwt_tasks_prune_dead          # auto-clean: records whose dir was deleted (keep ones that are merely tab-closed)
-  [[ -f "$f" ]] || { echo "no registered worktree tasks"; return 0 }
-  # Live surface list (to tell if a tab still exists); if we can't reach cmux, don't judge tab state
-  local live=""
-  if command -v cmux >/dev/null 2>&1 && cmux ping >/dev/null 2>&1; then
-    live="$(cmux list-pane-surfaces 2>/dev/null)"
-  fi
-  # (C) surface refs are session-scoped; after a cmux restart they all become stale. First check "is any registered ref still alive":
-  #     yes → same cmux session as when registered, so a missing ref means genuinely closed; no → likely restarted, refs stale rather than tabs closed.
-  local some_live="" r
-  if [[ -n "$live" ]]; then
-    while IFS=$'\t' read -r _ _ r _ _ _; do
-      [[ -n "$r" ]] && grep -qF "$r" <<<"$live" && { some_live=1; break }
-    done < "$f"
-  fi
-  # Agent-state sidecar loaded once (dir → state, ts); joined per row below
-  local sf sd ss sr cell
-  typeset -A sstate stag
-  sstate=(); stag=()
-  sf="$(_gwt_status_file)"
-  if [[ -r "$sf" ]]; then
-    while IFS=$'\t' read -r sd ss sr; do
-      [[ -n "$sd" ]] && { sstate[$sd]="$ss"; stag[$sd]="$sr"; }
-    done < "$sf"
-  fi
-  typeset -A seen
-  local -a rows
-  local ts branch ref dir caller task tab
-  # Read in reverse: the first time a dir appears is its newest record (after prune all dirs exist)
-  while IFS=$'\t' read -r ts branch ref dir caller task; do
-    [[ -n "$dir" ]] || continue
-    [[ -n "${seen[$dir]:-}" ]] && continue
-    seen[$dir]=1
-    if [[ -z "$live" ]]; then          tab="?no-cmux"    # can't reach cmux, can't tell
-    elif grep -qF "$ref" <<<"$live"; then tab="✔live"
-    elif [[ -z "$some_live" ]]; then    tab="?old-session"  # no ref alive at all → likely a cmux restart, refs stale
-    else                                 tab="⌫closed"     # this ref is gone within the same session → the tab really closed
-    fi
-    cell="-"                                               # no sidecar row → the hook never fired for this sub-task
-    [[ -n "${sstate[$dir]:-}" ]] && cell="${sstate[$dir]}($(_gwt_status_age "${stag[$dir]:-}"))"
-    rows+=("$tab|${branch:-?}|${ref:-?}|$dir|$cell|$task")
-  done < <(tail -r "$f")
-  (( ${#rows} )) || { echo "no records"; return 0 }
-  { echo "TAB|BRANCH|SURFACE|DIR|STATUS|TASK"; printf '%s\n' "${rows[@]}"; } | column -t -s '|'
-  [[ -n "$live" && -z "$some_live" ]] && echo "(note: all registered surface refs are stale — cmux was probably restarted → status shows '?old-session'; dirs still exist, cleanup unaffected)"
-  # Failure breadcrumb: if there were "built a worktree but no tab" failures in the last 24h, warn
-  local flog="$HOME/.config/cc-stack/cc-failures.log"
-  if [[ -f "$flog" ]]; then
-    local recent; recent=$(awk -v cut="$(date -v-1d '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo 0)" '$0 >= "["cut' "$flog" 2>/dev/null | tail -3)
-    [[ -n "$recent" ]] && { echo "⚠ recent worktrees that failed to open a tab (fix with gwt-claude):"; echo "$recent" | sed 's/^/   /'; }
-  fi
-  return 0
+  bash "$(_gwt_board_script)" "$@"
+  return $?
+}
+
+# gwt-log — render the merged-task archive (worktree-tasks-archive.tsv): same columns and repo
+#   filter as gwt-status, fed by the rows gwt-merge moved out of the live board on merge.
+gwt-log() {
+  emulate -L zsh
+  bash "$(_gwt_board_script)" --archive "$@"
+  return $?
 }
 
 # gwt-prune — compact the task list: drop dead-dir records + keep only the newest per dir
@@ -275,12 +269,12 @@ gwt-prune() {
   local f; f="$(_gwt_tasks_file)"; [[ -f "$f" ]] || { echo "list is empty"; return 0 }
   _gwt_tasks_prune_dead
   [[ -f "$f" ]] || { echo "✔ emptied (no live records)"; return 0 }
-  typeset -A seen; local tmp="$f.tmp.$$" ts branch ref dir caller task
+  typeset -A seen; local tmp="$f.tmp.$$" ts branch ref dir caller task parent
   : > "$tmp"
-  while IFS=$'\t' read -r ts branch ref dir caller task; do
+  while IFS=$'\t' read -r ts branch ref dir caller task parent; do
     [[ -n "$dir" && -z "${seen[$dir]:-}" ]] || continue
     seen[$dir]=1
-    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$ts" "$branch" "$ref" "$dir" "$caller" "$task"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$ts" "$branch" "$ref" "$dir" "$caller" "$task" "$parent"
   done < <(tail -r "$f") | tail -r > "$tmp"
   mv "$tmp" "$f"; [[ -s "$f" ]] || rm -f "$f"
   echo "✔ task list compacted"
@@ -331,8 +325,8 @@ gwt-tree() {
   command -v cmux >/dev/null 2>&1 && cmux ping >/dev/null 2>&1 && _gt_live="$(cmux list-pane-surfaces 2>/dev/null)"
   local f; f="$(_gwt_tasks_file)"
   if [[ -f "$f" ]]; then
-    local ts br rf dir cl tk
-    while IFS=$'\t' read -r ts br rf dir cl tk; do [[ -n "$br" ]] && _gt_ref[$br]="$rf"; done < "$f"
+    local ts br rf dir cl tk pt
+    while IFS=$'\t' read -r ts br rf dir cl tk pt; do [[ -n "$br" ]] && _gt_ref[$br]="$rf"; done < "$f"
   fi
   local branch parent ahead dirty dn
   while IFS=$'\t' read -r branch parent ahead dirty dn; do
@@ -400,7 +394,10 @@ gwt-merge() {
   [[ "$ok" == y || "$ok" == Y ]] || { echo "aborted."; return 1 }
   ~/.config/cc-stack/cc-merge.sh do-merge "$root" "$child" "$strategy" "$target"
   local mrc=$?
-  (( mrc == 0 )) && echo "  (cleanup when ready: gwt-rm ${child#feat/} --branch)"
+  if (( mrc == 0 )); then
+    _gwt_archive_branch "$child"     # merged (or skipped-already-merged) → off the live board, into gwt-log
+    echo "  (cleanup when ready: gwt-rm ${child#feat/} --branch)"
+  fi
   return $mrc
 }
 
@@ -436,7 +433,9 @@ cc-stack · worktree sub-task commands
   gwt-merge <name> [--squash|--no-ff|--rebase] [--into <b>] [--force]
                                          GATED merge into its recorded parent (asks strategy [default: squash] + confirms first)
   gwt-collect <parent>                   run one gated gwt-merge per ready child of <parent>
-  gwt-status                             list sub-tasks: tab/branch/surface/dir + agent state (working/idle/blocked + age) + task (auto-cleans deleted dirs)
+  gwt-status                             board: TAB liveness + branch + parent + agent state (working/idle/blocked + age) + dir + task
+                                         current repo only; --all shows every repo (works from any shell — it wraps cc-board.sh)
+  gwt-log                                the merged-task archive, same columns/filter (rows moved there by gwt-merge)
   gwt-rm <name> [--branch]               remove worktree (+ clear task record + pre-trust; optionally the branch)
   gwt-prune                              compact the task list (drop dead records + keep newest per dir)
   gwt-clean                              git worktree prune + show current state

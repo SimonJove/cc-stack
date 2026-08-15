@@ -91,7 +91,7 @@ if [ -n "$SRC" ] && [ "$SRC" != "$DEST" ]; then
   else
     mkdir -p "$DEST"
     ( cd "$SRC" && find . -type f ! -path './.git/*' ! -name '*.bak.*' \
-        ! -name 'worktree-tasks.tsv' ! -name 'worktree-status.tsv' ! -name 'cc-failures.log' ! -name '.DS_Store' -print0 ) \
+        ! -name 'worktree-tasks.tsv' ! -name 'worktree-tasks-archive.tsv' ! -name 'worktree-status.tsv' ! -name 'cc-failures.log' ! -name '.DS_Store' -print0 ) \
       | while IFS= read -r -d '' f; do mkdir -p "$DEST/$(dirname "$f")"; cp -p "$SRC/$f" "$DEST/$f"; done
     say "  ✓ installed"
   fi

@@ -14,7 +14,7 @@ The PostToolUse hook in `~/.config/cc-stack` then opens a new tab in the current
 - Never dispatch while the primary checkout sits on the trunk (`main`/`master`): create a campaign branch first (confirm the name with me) and make it every child's base and merge target — otherwise merges drip onto the trunk one at a time, and a trunk branch-guard hook can block the parent session for the rest of the campaign.
 - If `/.claude/worktrees/` isn't ignored yet, add it to the project root `.gitignore` first (worktree contents must not pollute git status).
 - cmux-only; over remote SSH everything is an automatic no-op.
-- Monitor sub-task tabs with `gwt-status` (interactive-zsh only — in Claude's non-interactive Bash it silently prints nothing; use `cmux tree` + `cmux capture-pane --surface <n>` there instead).
+- Monitor sub-tasks from any shell (Claude's non-interactive Bash included) by running `bash ~/.config/cc-stack/cc-board.sh` (`--all` for every repo; humans keep using `gwt-status`).
 
 ## Conduct (sub-task session — hook-spawned or gwt-claude)
 

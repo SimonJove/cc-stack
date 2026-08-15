@@ -159,7 +159,11 @@ done
 [ -n "$pf" ] && rm -f "$pf" 2>/dev/null
 
 # ── Register into the task list (so gwt-status can show "which worktree is doing what") ──
-"$HOME/.config/cc-stack/cc-tasks-log.sh" "$abspath" "$ref" "${caller_surface:-}" "$prompt"
+# 5th arg = parent branch (the caller's branch at dispatch — CC_CALLER_CWD on the hook path,
+# PWD on the gwt-claude path; empty when detached / not a repo): feeds the board's PARENT
+# column and outlives the branch.<b>.ccMergeInto git config.
+"$HOME/.config/cc-stack/cc-tasks-log.sh" "$abspath" "$ref" "${caller_surface:-}" "$prompt" \
+  "$(git -C "${CC_CALLER_CWD:-$PWD}" symbolic-ref --short HEAD 2>/dev/null)"
 
 echo "✔ new tab : $ref  cwd=$abspath  $([ -n "$prompt" ] && echo '(initial prompt sent)' || echo '(idle ccteam)')"
 [ -n "$caller_surface" ] && echo "✔ backchannel: the new claude can report back via cmux send --surface $caller_surface"

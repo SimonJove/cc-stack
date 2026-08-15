@@ -35,8 +35,9 @@ rm -rf "$R1" "$R2" /tmp/cctest-ep.py
 
 echo "== 2. cc-tasks-log + prune/drop =="
 export CC_TASKS_FILE=$(mktemp -u)
-"$CC/cc-tasks-log.sh" "/tmp/nodir_A" "surface:1" "surface:9" "task	with tab|pipe"
-eq "writes 6 fields"        "$(awk -F'\t' 'NR==1{print NF}' "$CC_TASKS_FILE")" "6"
+"$CC/cc-tasks-log.sh" "/tmp/nodir_A" "surface:1" "surface:9" "task	with tab|pipe" "feat/par"
+eq "writes 7 fields"        "$(awk -F'\t' 'NR==1{print NF}' "$CC_TASKS_FILE")" "7"
+eq "7th field is parent"    "$(awk -F'\t' 'NR==1{print $7}' "$CC_TASKS_FILE")" "feat/par"
 eq "task sanitized (no tab)" "$(awk -F'\t' 'NR==1{print ($6 ~ /\t/)?"bad":"ok"}' "$CC_TASKS_FILE")" "ok"
 rm -f "$CC_TASKS_FILE"; unset CC_TASKS_FILE
 
@@ -67,13 +68,14 @@ eq "non-board dir writes no row" "$(grep -cF "$NB" "$CC_STATUS_FILE")" "0"
 hs "not json" "malformed stdin"
 hs "" "empty stdin"
 # gwt-status rendering against a fabricated tasks+status pair: working/idle/blocked with age, dash when no row
+# (--all: cc-board.sh filters rows to the caller's repo by default; the fabricated dirs live outside it)
 RD2="$(cn "$(mktemp -d)")"; RD3="$(cn "$(mktemp -d)")"
 printf '2026-01-01 00:00:00\tfeat/Q\tsurface:4\t%s\tsurface:1\tno status row\n' "$RD"  >> "$CC_TASKS_FILE"
 printf '2026-01-01 00:00:00\tfeat/R\tsurface:5\t%s\tsurface:1\trender R\n' "$RD2" >> "$CC_TASKS_FILE"
 printf '2026-01-01 00:00:00\tfeat/S\tsurface:6\t%s\tsurface:1\trender S\n' "$RD3" >> "$CC_TASKS_FILE"
 now=$(date +%s)
 printf '%s\tworking\t%s\n%s\tidle\t%s\n%s\tblocked\t%s\n' "$RD" $((now-23*60)) "$RD2" $((now-2*3600)) "$RD3" $((now-5*60)) > "$CC_STATUS_FILE"
-ROUT="$(CC_TASKS_FILE="$CC_TASKS_FILE" CC_STATUS_FILE="$CC_STATUS_FILE" zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; gwt-status" 2>/dev/null)"
+ROUT="$(CC_TASKS_FILE="$CC_TASKS_FILE" CC_STATUS_FILE="$CC_STATUS_FILE" zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; gwt-status --all" 2>/dev/null)"
 eq "render working(23m)"  "$(echo "$ROUT" | grep -c 'working(23m)')" "1"
 eq "render idle(2h)"      "$(echo "$ROUT" | grep -c 'idle(2h)')" "1"
 eq "render blocked(5m)"   "$(echo "$ROUT" | grep -c 'blocked(5m)')" "1"
@@ -103,6 +105,106 @@ eq "install registers Notification"      "$(sn Notification)" "1"
 HOME="$IH" bash "$CC/install.sh" --yes --dir "$IH/cc" >/dev/null 2>&1
 eq "re-install adds no duplicate" "$(sn UserPromptSubmit)+$(sn Stop)+$(sn Notification)" "1+1+1"
 rm -rf "$IH" "$RR" "$SB" "$NB" "$RD" "$RD2"; rm -f "$CC_TASKS_FILE" "$CC_STATUS_FILE"; unset CC_TASKS_FILE CC_STATUS_FILE
+
+echo ""
+echo "== 2c. cc-board: the board from ANY shell (bash-direct, no zsh) =="
+cn(){ CDPATH= cd -- "$1" >/dev/null 2>&1 && pwd -P; }
+# fixture repo: two worktree branches with recorded merge parents (+ an unrelated dir as a foreign row)
+BRD=$(mktemp -d); ( cd "$BRD"; git init -q; git config user.email t@t; git config user.name t
+  git commit -q --allow-empty -m i; git branch -M main
+  git worktree add -q wtW -b feat/W >/dev/null
+  git worktree add -q wtW1 -b feat/W1 feat/W >/dev/null )
+"$CC/cc-merge.sh" set-parent "$BRD" feat/W main
+"$CC/cc-merge.sh" set-parent "$BRD" feat/W1 feat/W
+BW="$(cn "$BRD/wtW")"; BW1="$(cn "$BRD/wtW1")"; OTH="$(cn "$(mktemp -d)")"; NORD="$(mktemp -d)"   # OTH: other repo row  NORD: not a repo
+export CC_TASKS_FILE=$(mktemp -u) CC_STATUS_FILE=$(mktemp -u) CC_ARCHIVE_FILE=$(mktemp -u)
+now=$(date +%s)
+printf '2026-01-01 00:00:01\tfeat/W\tsurface:31\t%s\tsurface:1\tboard task W (older)\tmain\n' "$BW"  > "$CC_TASKS_FILE"
+printf '2026-01-01 00:00:02\tfeat/W\tsurface:32\t%s\tsurface:1\tboard task W\tmain\n' "$BW" >> "$CC_TASKS_FILE"
+printf '2026-01-01 00:00:03\tfeat/W1\tsurface:33\t%s\tsurface:1\tboard task W1\tfeat/W\n' "$BW1" >> "$CC_TASKS_FILE"
+printf '2026-01-01 00:00:04\tfeat/X\tsurface:34\t%s\tsurface:1\ttask in another repo\tmain\n' "$OTH" >> "$CC_TASKS_FILE"
+printf '%s\tworking\t%s\n%s\tidle\tabc\n' "$BW" $((now-23*60)) "$BW1" > "$CC_STATUS_FILE"
+brd(){ ( cd "$1" && bash "$CC/cc-board.sh" ${2:-} ) 2>/dev/null; }            # bash-DIRECT invocation, never via zsh
+rowof(){ echo "$1" | awk -v d="$2" '$5==d'; }                                 # board row by DIR column
+taskof(){ rowof "$1" "$2" | awk '{$1=$2=$3=$4=$5=""; sub(/^ +/,""); print}'; } # TASK cell = fields after DIR
+BO="$(brd "$BRD")"
+eq "board header columns"          "$(echo "$BO" | head -1 | tr -s ' ')" "TAB BRANCH PARENT STATUS DIR TASK"
+eq "header TAB before STATUS"      "$(echo "$BO" | head -1 | grep -c 'TAB.*STATUS')" "1"
+eq "newest row per dir wins"       "$(echo "$BO" | grep -c 'board task W (older)')" "0"
+eq "W row TASK cell"               "$(taskof "$BO" "$BW")" "board task W"
+eq "W1 row TASK cell"              "$(taskof "$BO" "$BW1")" "board task W1"
+eq "PARENT from git config"        "$(rowof "$BO" "$BW"  | awk '{print $3}')" "main"
+eq "PARENT feat/W1 from config"    "$(rowof "$BO" "$BW1" | awk '{print $3}')" "feat/W"
+eq "STATUS join working(23m)"      "$(rowof "$BO" "$BW"  | awk '{print $4}')" "working(23m)"
+eq "malformed ts renders ?"        "$(rowof "$BO" "$BW1" | awk '{print $4}')" "idle(?)"
+eq "repo filter hides other repo"  "$(echo "$BO" | grep -c 'task in another repo')" "0"
+# PARENT falls back to the 7th TSV field once the git config is gone (branch deleted after merge)
+git -C "$BRD" config --unset branch.feat/W1.ccMergeInto
+BO2="$(brd "$BRD")"
+eq "PARENT falls back to 7th field" "$(rowof "$BO2" "$BW1" | awk '{print $3}')" "feat/W"
+# --all disables the filter (and a missing sidecar row still renders a dash STATUS)
+BALL="$(brd "$BRD" --all)"
+eq "--all shows other repo"        "$(echo "$BALL" | grep -c 'task in another repo')" "1"
+eq "dash when no status row"       "$(rowof "$BALL" "$OTH" | awk '{print $4}')" "-"
+# outside any repo → no filter
+BNR="$( ( cd "$NORD" && bash "$CC/cc-board.sh") 2>/dev/null )"
+eq "outside repo shows all"        "$(echo "$BNR" | grep -c 'task in another repo')" "1"
+# canonicalization trap: a row stored with the LOGICAL dir (/var/...) must still match the PHYSICAL
+# git root (/private/var/...) — both sides get pwd -P before the prefix compare
+awk -F'\t' -v OFS='\t' -v p="$BRD" '$2=="feat/W1"{$4=p "/wtW1"} {print}' "$CC_TASKS_FILE" > "$CC_TASKS_FILE.cx" && mv "$CC_TASKS_FILE.cx" "$CC_TASKS_FILE"
+eq "logical row dir still shows"   "$(brd "$BRD" | grep -c 'board task W1')" "1"
+# prune-on-read: dead-dir rows are dropped from the tasks file by the render itself (mkdir-lock rewrite)
+printf '2026-01-01 00:00:05\tfeat/G\tsurface:35\t%s\tsurface:1\tdead dir row\tmain\n' "$BRD/gone" >> "$CC_TASKS_FILE"
+brd "$BRD" >/dev/null
+eq "prune drops dead-dir row"      "$(grep -c 'dead dir row' "$CC_TASKS_FILE")" "0"
+eq "prune keeps live rows"         "$(wc -l < "$CC_TASKS_FILE" | tr -d ' ')" "4"
+DF=$(mktemp -u); printf '2026-01-01 00:00:05\tfeat/G\tsurface:35\t%s\tsurface:1\tdead dir row\tmain\n' "/tmp/cc-board-gone-$$" > "$DF"
+eq "all-dead message"              "$(CC_TASKS_FILE="$DF" CC_STATUS_FILE=/dev/null bash "$CC/cc-board.sh" 2>/dev/null)" "no registered worktree tasks"
+eq "all-dead removes file"         "$([ -f "$DF" ] && echo yes || echo no)" "no"
+# _gwt_archive_branch: move ALL rows of a branch to the archive (+ drop their status rows), keep others
+TF=$(mktemp -u); SF=$(mktemp -u); AF=$(mktemp -u)
+export CC_TASKS_FILE="$TF" CC_STATUS_FILE="$SF" CC_ARCHIVE_FILE="$AF"
+printf '2026-01-01 00:00:01\tfeat/W\tsurface:41\t%s\tsurface:1\tarch task W1\tmain\n' "$BW"  > "$TF"
+printf '2026-01-01 00:00:02\tfeat/W\tsurface:42\t%s\tsurface:1\tarch task W2\tmain\n' "$BRD" >> "$TF"
+printf '2026-01-01 00:00:03\tfeat/W1\tsurface:43\t%s\tsurface:1\tarch task W1b\tfeat/W\n' "$BW1" >> "$TF"
+printf '%s\tidle\t%s\n' "$BW" "$now" > "$SF"; printf '%s\tidle\t%s\n' "$BRD" "$now" >> "$SF"; printf '%s\tidle\t%s\n' "$BW1" "$now" >> "$SF"
+zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; CC_TASKS_FILE='$TF' CC_STATUS_FILE='$SF' CC_ARCHIVE_FILE='$AF' _gwt_archive_branch feat/W" >/dev/null 2>&1
+eq "archive moves ALL branch rows"   "$(awk -F'\t' '$2=="feat/W"' "$TF" | wc -l | tr -d ' ')" "0"
+eq "other branch stays"              "$(awk -F'\t' '$2=="feat/W1"' "$TF" | wc -l | tr -d ' ')" "1"
+eq "archive gained both rows"        "$(awk -F'\t' '$2=="feat/W"' "$AF" | wc -l | tr -d ' ')" "2"
+eq "archive rows have 8 fields"      "$(awk -F'\t' 'NR==1{print NF}' "$AF")" "8"
+eq "merged-at is a unix ts"          "$(awk -F'\t' '$2=="feat/W"{print ($8 ~ /^[0-9]+$/)?"ok":"no"}' "$AF" | sort -u)" "ok"
+eq "moved status rows dropped"       "$(awk -F'\t' -v a="$BW" -v b="$BRD" '$1==a||$1==b{c++} END{print c+0}' "$SF")" "0"
+eq "other status row kept"           "$(awk -F'\t' -v d="$BW1" '$1==d{c++} END{print c+0}' "$SF")" "1"
+# gwt-merge archives on success (and on skipped-already-merged, same rc 0 path)
+"$CC/cc-merge.sh" set-parent "$BRD" feat/W1 feat/W
+"$CC/cc-merge.sh" done "$BRD" feat/W1 true
+( cd "$BRD/wtW1" && git commit -q --allow-empty -m w1 )
+printf '\ny\n' | zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; cd '$BRD'; CC_TASKS_FILE='$TF' CC_STATUS_FILE='$SF' CC_ARCHIVE_FILE='$AF' gwt-merge feat/W1" >/dev/null 2>&1; gmrc=$?
+eq "gwt-merge exit 0"                "$gmrc" "0"
+eq "merge archives branch rows"      "$(awk -F'\t' '$2=="feat/W1"' "$TF" 2>/dev/null | wc -l | tr -d ' ')" "0"
+eq "merge appends to archive"        "$(awk -F'\t' '$2=="feat/W1"' "$AF" | wc -l | tr -d ' ')" "1"
+# gwt-log renders the archive: same columns, same repo filter
+printf '2026-01-01 00:00:09\tfeat/Y\tsurface:44\t%s\tsurface:1\tarch other repo\tmain\n' "$OTH" >> "$AF"
+LO="$(brd "$BRD" --archive)"
+eq "gwt-log header"                  "$(echo "$LO" | head -1 | tr -s ' ')" "TAB BRANCH PARENT STATUS DIR TASK"
+eq "gwt-log shows archive"           "$(echo "$LO" | grep -c 'arch task W2')" "1"
+eq "gwt-log PARENT not shifted"      "$(rowof "$LO" "$BW" | awk '{print $3}')" "main"
+eq "gwt-log repo filter"             "$(echo "$LO" | grep -c 'arch other repo')" "0"
+eq "gwt-log --all"                   "$(brd "$BRD" "--archive --all" | grep -c 'arch other repo')" "1"
+LOW="$( ( cd "$BRD" && zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; gwt-log") 2>/dev/null )"
+eq "gwt-log wrapper renders"         "$(echo "$LOW" | grep -c 'arch task W2')" "1"
+# gwt-status wrapper: forwards to bash cc-board.sh, filter + STATUS join intact end-to-end
+printf '2026-01-01 00:00:06\tfeat/W\tsurface:45\t%s\tsurface:1\twrap task W\tmain\n' "$BW"  > "$CC_TASKS_FILE"
+printf '2026-01-01 00:00:07\tfeat/X\tsurface:46\t%s\tsurface:1\twrap other\tmain\n' "$OTH" >> "$CC_TASKS_FILE"
+printf '%s\tworking\t%s\n' "$BW" $((now-23*60)) > "$CC_STATUS_FILE"
+SW="$( ( cd "$BRD" && zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; gwt-status") 2>/dev/null )"
+eq "gwt-status wrapper renders"      "$(echo "$SW" | grep -c 'wrap task W')" "1"
+eq "wrapper STATUS join"             "$(echo "$SW" | grep -c 'working(23m)')" "1"
+eq "wrapper applies repo filter"     "$(echo "$SW" | grep -c 'wrap other')" "0"
+SWA="$( ( cd "$BRD" && zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; gwt-status --all") 2>/dev/null )"
+eq "wrapper forwards --all"          "$(echo "$SWA" | grep -c 'wrap other')" "1"
+rm -rf "$BRD" "$OTH" "$NORD"; rm -f "$CC_TASKS_FILE" "$CC_STATUS_FILE" "$CC_ARCHIVE_FILE" "$TF" "$SF" "$AF" "$DF"; unset CC_TASKS_FILE CC_STATUS_FILE CC_ARCHIVE_FILE
 
 echo "== 3. cc-trust add/remove (isolated json) =="
 TJ=$(mktemp); echo '{"projects":{}}' > "$TJ"
@@ -331,7 +433,7 @@ zsh -n "$CC/worktree.zsh" && ok "worktree.zsh syntax" || { no "worktree.zsh synt
 
 echo ""
 echo "== 10. zsh commands present =="
-for fn in gwt-tree gwt-done gwt-undone gwt-merge gwt-collect gwt-adopt; do
+for fn in gwt-tree gwt-done gwt-undone gwt-merge gwt-collect gwt-adopt gwt-log; do
   grep -q "^$fn()" "$CC/worktree.zsh" && ok "$fn defined" || no "$fn defined" missing present
 done
 
@@ -340,6 +442,8 @@ grep -q "gwt-merge" "$CC/worktree.zsh" && grep -q "gwt-merge" "$CC/README.md" \
   && ok "gwt-merge documented" || no "gwt-merge documented" missing present
 grep -q "gwt-done" "$CC/README.md" && ok "gwt-done documented" || no "gwt-done documented" missing present
 grep -q "gwt-adopt" "$CC/README.md" && ok "gwt-adopt documented" || no "gwt-adopt documented" missing present
+grep -q "gwt-log" "$CC/README.md" && ok "gwt-log documented" || no "gwt-log documented" missing present
+grep -q "cc-board.sh" "$CC/README.md" && ok "cc-board.sh documented" || no "cc-board.sh documented" missing present
 
 echo ""
 echo "result: $pass passed, $fail failed"
