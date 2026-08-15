@@ -62,16 +62,10 @@ cmd_tree() {          # <repo> → TSV: branch \t parent \t ahead \t dirty \t do
 }
 
 cmd_preflight() {     # <repo> <child> [<target>] → prints checks; exit 1 if any not ok
-  local repo="$1" child="$2" target="${3:-}" rc=0 cdir=""
+  local repo="$1" child="$2" target="${3:-}" rc=0
   [ -n "$target" ] || target="$(cmd_get_parent "$repo" "$child")"
   # locate child worktree dir for the dirty check
-  local br="" dir=""
-  while IFS= read -r line; do
-    case "$line" in
-      "worktree "*) dir="${line#worktree }" ;;
-      "branch refs/heads/"*) [ "${line#branch refs/heads/}" = "$child" ] && cdir="$dir" ;;
-    esac
-  done < <(git -C "$repo" worktree list --porcelain)
+  local cdir; cdir="$(_cm_worktree_of "$repo" "$child")"
   # clean
   if [ -n "$cdir" ] && [ -n "$(git -C "$cdir" status --porcelain 2>/dev/null)" ]; then
     echo "check: clean WARN"; rc=1; else echo "check: clean ok"; fi
