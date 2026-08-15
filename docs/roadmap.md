@@ -25,14 +25,28 @@ cc-* 脚本 10→6 收拢重构(install 自动迁移)、审计修复 P1-P4、hoo
 4. **硬不变量:恢复必须用板上记录的原样 canonical 路径启动,不许重新解析**——claude 按路径字符串索引项目身份/trust/CLAUDE.md,`/Users` vs `/private` 差一个前缀就是另一个项目(已实证)。cc-dispatch.sh surface 的 `--working-directory <记录的dir>` 原样复用;
 5. 无会话可恢复时降级为 idle ccteam,失败可见。
 
-## 2b. #7 · backchannel 输入框撞车 — 设计方向 2026-08-15
+## 2b. #7 · 输入框撞车 — 设计定稿 2026-08-15(cc-send 方案,用户拍板)
 
-**问题**:子任务汇报走 `cmux send` 直插父会话输入框,与用户正在输入的内容相撞(截断/冲突)。`cmux send` 无队列/安全模式,"检测对方在打字"从 shell 做不到。
-**方案(inbox 通道,绕开输入框):**
-- 子任务汇报改写 inbox 文件(按父会话 cwd 键控,重启安全)+ `cmux notify` 桌面提醒(即时可见);
-- 父会话的 UserPromptSubmit hook(cc-hooks.sh 已挂)读取自己 cwd 的 inbox,有积压则作为 additionalContext 注入上下文后清空;
-- 语义:零撞车、重启安全;注入时机=用户下次发消息(对 campaign 场景通常无损,真需即时可保留显式 urgent 直发选项);
-- 实施时注意:cc-hooks.sh status 的"零 stdout"硬规则要改成"仅在有积压时输出",且注入内容要有清晰分隔标记。
+**问题(双向)**:子→父汇报、父→子指令都走 `cmux send` 直插对方输入框,与用户正在组织的文本相撞(截断/冲突)。cmux 无队列/安全模式,无输入锁原语(已研究:命令面/二进制/shim 均无)。
+
+**方案:一个安全发送原语,取代所有裸 cmux send(双向对称)**
+
+```
+cc-send <surface> "<text>"
+  loop:
+    读输入行(read-screen 解析 ❯ 行)
+    空   → 立即 cmux send + Enter,完成          ← 无人输入:抢占,毫秒级送达
+    有字 → 用户正在输入 → sleep 0.5 重试         ← 用户优先;其提交后行清空,下一轮抢占
+  超时(60s,用户打了半句走开)→ cmux notify 桌面提醒 + 继续等(不丢不撞)
+  read-screen 失败 → fail-open 退回裸 send(永不劣于现状)
+```
+
+**已否决的中间方案(v2)**:inbox 文件 + UserPromptSubmit 注入 + Stop-hook 补投——机器多,且 additionalContext 包装有隐性 token 成本。用户简化后全部砍掉。
+
+**语义**:撞车只可能发生在"发送瞬间输入框有字";检查-为空-即发把竞窗压到毫秒级(cmux 若将来出锁 API 可归零,可选提 feedback)。门卫零 token:检查/等待/通知均不经模型;消息本体成本与今天相同。
+
+**唯一技术点**:可靠检测"输入行有未提交文本"(read-screen 解析 claude TUI 的输入行,注意主题/布局变化;fail-open 兜底)。
+**token 账**:门卫 0,消息照旧,等待免费(墙钟非 token)。
 
 ## 3. ~~Feature D · gwt-review(验收 diff 一键看)~~ 已裁剪(2026-08-15)
 
