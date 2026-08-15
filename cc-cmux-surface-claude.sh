@@ -140,13 +140,17 @@ else
 fi
 cmux send-key --surface "$ref" Enter >/dev/null 2>&1
 
-# Fallback: in case pre-trust didn't take effect (concurrency / schema change), still screen-scrape to confirm "trust this folder"
+# Fallback: in case pre-trust didn't take effect (concurrency / schema change), still screen-scrape to confirm "trust this folder".
+# Early exit when the claude TUI is already up (its footer hint is visible) — pre-trust worked, no dialog is coming.
+# Without that second exit the loop idles its full 24×0.25s on EVERY dispatch (hook path is synchronous = main-session latency).
 for _ in $(seq 1 24); do
   scr="$(cmux read-screen --surface "$ref" --lines 30 2>/dev/null | tr 'A-Z' 'a-z')"
   case "$scr" in
     *trust*folder*|*trust*file*|*trust*director*|*"do you trust"*)
       cmux send-key --surface "$ref" Enter >/dev/null 2>&1   # highlighted default = "Yes, I trust"
       break ;;
+    *"esc to interrupt"*|*"? for shortcuts"*|*"ctrl+c to exit"*)
+      break ;;                                              # claude TUI is up → no trust dialog coming
   esac
   sleep 0.25
 done
