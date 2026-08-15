@@ -18,8 +18,17 @@ done
 
 # Note: use CMUX_PANEL_ID to detect "inside cmux". CMUX_SOCKET is often empty in cmux-spawned shells;
 # the old code used it and so always fell through to else → claude/cld never actually entered claude-teams.
+# --teammate-mode in-process: cmux claude-teams defaults teammate mode to `auto` (a CLI arg beats the
+# teammateMode setting in ~/.claude/settings.json), where NAMED teammates open split panes and their
+# completion event races pane teardown → the stuck inline task marker until Ctrl+C. Force in-process;
+# an explicit --teammate-mode on the command line still wins (last flag wins).
+_tm=1
+for _a in "$@"; do
+  case "$_a" in --teammate-mode|--teammate-mode=*) _tm=0 ;; esac
+done
 if [ -n "${CMUX_PANEL_ID:-}" ] && [ -z "${ZELLIJ:-}" ] && [ -z "${SSH_CONNECTION:-}" ]; then
-  exec cmux claude-teams "$@"     # inside cmux: team-ready launch
+  [ "$_tm" = 1 ] && set -- --teammate-mode in-process "$@"
+  exec cmux claude-teams "$@"     # inside cmux: team-ready launch, teammates stay in-process
 else
   exec claude "$@"                # remote / Zellij / non-cmux: native claude
 fi

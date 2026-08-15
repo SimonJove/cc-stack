@@ -25,7 +25,7 @@ Around that: a task board (`gwt-status`), lifecycle management (`gwt-*`), a one-
 
 | Channel | When | How |
 |------|--------|--------|
-| **Local main** | sitting at the mac mini | **cmux native teams** (`ccteam`) — teammate/subagent = native cmux pane, most accurate per-agent notifications |
+| **Local main** | sitting at the mac mini | **cmux native teams** (`ccteam` = `cmux claude-teams --teammate-mode in-process`) — teammates/subagents stay in-process: no split panes, no lost completion events; named-pane teammates still available per-launch by appending `--teammate-mode auto` (last flag wins) |
 | **Remote live view** | connecting back to the mini from another machine | **screen sharing + Tailscale** — you see the same still-running cmux, all sessions continue as-is |
 | **Lightweight terminal fallback** | low bandwidth / phone / pure terminal SSH | **SSH + Zellij** — attach the mini's persistent zellij session, survives disconnects |
 
@@ -132,9 +132,10 @@ tree **and** `gwt-done`; otherwise it warns and needs `--force`. Cleanup
 
 ### cmux native teams
 ```
-ccteam                 # = cmux claude-teams, launch team-enabled Claude Code
+ccteam                 # = cmux claude-teams --teammate-mode in-process, team-enabled Claude Code, teammates in-process
 ccteam --continue      # continue the last session
 ccteam --model sonnet  # pick a model
+ccteam --teammate-mode auto  # one-off: named teammates get their own split panes again (last flag wins)
 ```
 > Typing `claude`/`cld` inside cmux also auto-launches "team-ready"; subcommands (mcp/config), headless (`-p`), and remote auto-route to native claude. Force native temporarily: `command claude …` or `\claude …`.
 

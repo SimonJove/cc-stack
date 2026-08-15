@@ -1,6 +1,9 @@
 # cc-stack · aliases
-# Local main channel: cmux native teams — teammate/subagent = native cmux pane, most accurate per-agent notifications
-alias ccteam='cmux claude-teams'
+# Local main channel: cmux native teams launch, teammates forced in-process (no split panes):
+# cmux claude-teams defaults teammate mode to `auto` (named teammates → split pane; their completion
+# event races pane teardown → stuck inline task marker until Ctrl+C). Override per launch: append
+# --teammate-mode <mode> AFTER this alias (last flag wins).
+alias ccteam='cmux claude-teams --teammate-mode in-process'
 
 # By default, run claude (and cld) in cmux as "team-ready" (= cmux claude-teams) — teammates can be spawned mid-task.
 # Subcommands (mcp/config…), headless (-p), remote (SSH/Zellij) auto-route to native claude.
