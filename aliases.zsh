@@ -11,8 +11,8 @@ alias ccteam='cmux claude-teams --teammate-mode in-process'
 claude() { ~/.config/cc-stack/cc-claude "$@" }
 
 # Spin a task off into an independent sub-task: build worktree + new cmux tab running claude + send initial prompt
-# Usage: gwt-claude <name> "<initial-prompt>" [prefix=feat] [base=HEAD]
-alias gwt-claude='~/.config/cc-stack/cc-worktree-claude.sh'
+# Usage: gwt-claude <name> "<initial-prompt>" [--prefix <p>] [--base <b>]
+alias gwt-claude='~/.config/cc-stack/cc-dispatch.sh wt-claude'
 
 # cc-stack self-test: run the smoke test in one command (self-check for regressions after editing cc-stack)
 alias gwt-test='bash ~/.config/cc-stack/test.sh'

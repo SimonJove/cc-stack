@@ -12,7 +12,8 @@ no(){ echo "  ✗ $1  expected[$3] got[$2]"; fail=$((fail+1)); }
 eq(){ [ "$2" = "$3" ] && ok "$1" || no "$1" "$2" "$3"; }
 
 echo "== 1. hook parser =="
-awk "/<<'PY'/{f=1;next} /^PY\$/{f=0} f" "$CC/cc-worktree-cmux-hook.sh" > /tmp/cctest-ep.py
+# extract the worktree python (the ONLY <<'PY' heredoc in cc-hooks.sh)
+awk "/<<'PY'/{f=1;next} /^PY\$/{f=0} f" "$CC/cc-hooks.sh" > /tmp/cctest-ep.py
 run(){ CC_HOOK_INPUT="$1" python3 /tmp/cctest-ep.py 2>/dev/null; }
 pay(){ python3 -c "import json,sys;print(json.dumps({'tool_name':'Bash','cwd':sys.argv[1],'tool_input':{'command':sys.argv[2]}}))" "$1" "$2"; }
 R1=$(mktemp -d); ( cd "$R1"; git init -q; git config user.email t@t; git config user.name t; git commit -q --allow-empty -m i
@@ -23,6 +24,11 @@ eq "A parsed-path beats mtime" "$(run "$(pay "$R1" 'git worktree add wtC -b feat
 eq "A -b before path"          "$(run "$(pay "$R1" 'git worktree add -b feat/C wtC')" | cut -f1)" "$C"
 eq "CC_WT_PROMPT extraction"   "$(run "$(pay "$R1" "CC_WT_PROMPT='doX' git worktree add wtC")" | cut -f3)" "doX"
 eq "CC_WT_PERMISSION_MODE extraction" "$(run "$(pay "$R1" "CC_WT_PERMISSION_MODE=plan CC_WT_PROMPT='doX' git worktree add wtC")" | cut -f2)" "plan"
+# anti-double-tab skip must test only the REAL command: a brief that merely MENTIONS a script name
+# (inside the single-quoted CC_WT_PROMPT payload) still dispatches; a command that actually invokes
+# cc-dispatch.sh wt-claude opens its own tab, so the hook must not open a second one
+eq "brief naming scripts dispatches" "$(run "$(pay "$R1" "CC_WT_PROMPT='read cc-dispatch.sh cc-worktree-claude.sh cc-cmux-surface-claude.sh first' git worktree add wtC")" | cut -f1)" "$C"
+eq "dispatcher command skipped"     "$(run "$(pay "$R1" "CC_WT_PROMPT='seed corpus' cc-dispatch.sh wt-claude wtC && git worktree add wtC -b feat/C")" | cut -f1)" ""
 R2=$(mktemp -d); ( cd "$R2"; git init -q; git config user.email t@t; git config user.name t; git commit -q --allow-empty -m i; git worktree add -q wtX -b feat/X >/dev/null )
 X="$(cd "$R2/wtX" && pwd -P)"
 eq "B cross-repo -C"           "$(run "$(pay "$R1" "git -C $R2 worktree add wtX")" | cut -f1)" "$X"
@@ -33,23 +39,28 @@ D="$(cd "$R1/wtD" && pwd -P)"
 eq "\$VAR fallback (to mtime)"  "$(run "$(pay "$R1" 'git -C $root worktree add $root/wtNope')" | cut -f1)" "$D"
 rm -rf "$R1" "$R2" /tmp/cctest-ep.py
 
-echo "== 2. cc-tasks-log + prune/drop =="
+echo "== 2. cc-board.sh log (task registration) =="
 export CC_TASKS_FILE=$(mktemp -u)
-"$CC/cc-tasks-log.sh" "/tmp/nodir_A" "surface:1" "surface:9" "task	with tab|pipe" "feat/par"
+"$CC/cc-board.sh" log "/tmp/nodir_A" "surface:1" "surface:9" "task	with tab|pipe" "feat/par"
 eq "writes 7 fields"        "$(awk -F'\t' 'NR==1{print NF}' "$CC_TASKS_FILE")" "7"
 eq "7th field is parent"    "$(awk -F'\t' 'NR==1{print $7}' "$CC_TASKS_FILE")" "feat/par"
 eq "task sanitized (no tab)" "$(awk -F'\t' 'NR==1{print ($6 ~ /\t/)?"bad":"ok"}' "$CC_TASKS_FILE")" "ok"
-rm -f "$CC_TASKS_FILE"; unset CC_TASKS_FILE
+# round-trip: a logged row renders on the board (dir must exist — prune-on-read drops dead dirs;
+# --all so the repo filter can't hide the foreign row)
+RT=$(mktemp -d)
+"$CC/cc-board.sh" log "$RT" "surface:2" "surface:1" "round trip task" "feat/rt"
+eq "log→board round-trip" "$(CC_TASKS_FILE="$CC_TASKS_FILE" CC_STATUS_FILE=/dev/null bash "$CC/cc-board.sh" --all 2>/dev/null | grep -c 'round trip task')" "1"
+rm -rf "$RT"; rm -f "$CC_TASKS_FILE"; unset CC_TASKS_FILE
 
-echo "== 2b. cc-status-hook: agent-state sidecar =="
-# Board rows must hold pwd -P-canonical dirs — exactly what cc-tasks-log.sh writes in production
+echo "== 2b. cc-hooks.sh status: agent-state sidecar =="
+# Board rows must hold pwd -P-canonical dirs — exactly what cc-board.sh log writes in production
 # (mktemp hands back /var/... which pwd -P resolves to /private/var/... on macOS).
 cn(){ CDPATH= cd -- "$1" >/dev/null 2>&1 && pwd -P; }
 SB="$(cn "$(mktemp -d)")"; NB="$(cn "$(mktemp -d)")"; RD="$(cn "$(mktemp -d)")"   # SB: board dir  NB: not on the board  RD: render-only
 export CC_TASKS_FILE=$(mktemp -u) CC_STATUS_FILE=$(mktemp -u)
 printf '2026-01-01 00:00:00\tfeat/B\tsurface:2\t%s\tsurface:1\tdo B\n' "$SB" > "$CC_TASKS_FILE"
 hj(){ python3 -c 'import json,sys; print(json.dumps({"hook_event_name":sys.argv[1],"cwd":sys.argv[2],"message":sys.argv[3]}))' "$1" "$2" "$3"; }
-hr(){ printf '%s' "$1" | "$CC/cc-status-hook.sh" 2>&1; }                # hook runner: stdout+stderr together
+hr(){ printf '%s' "$1" | "$CC/cc-hooks.sh" status 2>&1; }               # hook runner: stdout+stderr together
 hs(){ local o rc; o="$(hr "$1")"; rc=$?; eq "$2 silent" "$o" ""; eq "$2 exit0" "$rc" "0"; }   # HARD RULES: prints nothing, exits 0 — every path
 hs "$(hj UserPromptSubmit "$SB" '')" "UPS board-dir"
 eq "UPS writes working"        "$(awk -F'\t' -v d="$SB" '$1==d{print $2}' "$CC_STATUS_FILE")" "working"
@@ -93,17 +104,35 @@ SW="$(cd "$RR/.claude/worktrees/wtS" && pwd -P)"
 printf '%s\tidle\t%s\n' "$SW" "$(date +%s)" >> "$CC_STATUS_FILE"
 CC_TASKS_FILE="$CC_TASKS_FILE" CC_STATUS_FILE="$CC_STATUS_FILE" zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; cd '$RR'; gwt-rm wtS" >/dev/null 2>&1
 eq "gwt-rm drops status row" "$(grep -cF "$SW" "$CC_STATUS_FILE" 2>/dev/null)" "0"
-# install.sh registers the three status-hook events, idempotently (re-run never duplicates)
+# install.sh registers the cc-hooks.sh subcommands idempotently and strips stale
+# registrations from pre-refactor installs (cc-notify + the two absorbed hook scripts)
 IH=$(mktemp -d)
 HOME="$IH" bash "$CC/install.sh" --yes --dir "$IH/cc" >/dev/null 2>&1
 sn(){ python3 -c 'import json,sys
 d=json.load(open(sys.argv[1]+"/.claude/settings.json"))
-print(sum(1 for g in d.get("hooks",{}).get(sys.argv[2],[]) or [] for h in (g.get("hooks") or []) if "cc-status-hook" in (h.get("command") or "")))' "$IH" "$1"; }
-eq "install registers UserPromptSubmit" "$(sn UserPromptSubmit)" "1"
-eq "install registers Stop"              "$(sn Stop)" "1"
-eq "install registers Notification"      "$(sn Notification)" "1"
+print(sum(1 for g in d.get("hooks",{}).get(sys.argv[2],[]) or [] for h in (g.get("hooks") or []) if sys.argv[3] in (h.get("command") or "")))' "$IH" "$1" "$2"; }
+eq "install registers PostToolUse worktree" "$(sn PostToolUse "cc-hooks.sh worktree")" "1"
+eq "install registers UserPromptSubmit"    "$(sn UserPromptSubmit "cc-hooks.sh status")" "1"
+eq "install registers Stop"                "$(sn Stop "cc-hooks.sh status")" "1"
+eq "install registers Notification"        "$(sn Notification "cc-hooks.sh status")" "1"
 HOME="$IH" bash "$CC/install.sh" --yes --dir "$IH/cc" >/dev/null 2>&1
-eq "re-install adds no duplicate" "$(sn UserPromptSubmit)+$(sn Stop)+$(sn Notification)" "1+1+1"
+eq "re-install adds no duplicate" "$(sn UserPromptSubmit "cc-hooks.sh status")+$(sn Stop "cc-hooks.sh status")+$(sn Notification "cc-hooks.sh status")" "1+1+1"
+# stale registrations (what a pre-refactor install would still carry): seeded, then stripped
+python3 -c 'import json,sys
+p=sys.argv[1]+"/.claude/settings.json"
+d={"hooks":{
+ "PostToolUse":[{"matcher":"Bash|EnterWorktree","hooks":[{"type":"command","command":"~/old/cc-worktree-cmux-hook.sh"}]}],
+ "UserPromptSubmit":[{"hooks":[{"type":"command","command":"~/old/cc-status-hook.sh"}]}],
+ "Stop":[{"hooks":[{"type":"command","command":"~/old/cc-status-hook.sh"},{"type":"command","command":"~/old/cc-notify.sh"}]}],
+ "Notification":[{"hooks":[{"type":"command","command":"~/old/cc-status-hook.sh"}]}]}}
+json.dump(d,open(p,"w"))' "$IH"
+HOME="$IH" bash "$CC/install.sh" --yes --dir "$IH/cc" >/dev/null 2>&1
+eq "strip removes stale PostToolUse"  "$(sn PostToolUse "cc-worktree-cmux-hook.sh")" "0"
+eq "strip removes stale status hooks" "$(sn UserPromptSubmit "cc-status-hook.sh")+$(sn Stop "cc-status-hook.sh")+$(sn Notification "cc-status-hook.sh")" "0+0+0"
+eq "strip removes stale cc-notify"    "$(sn Stop "cc-notify")" "0"
+eq "strip keeps new registration"     "$(sn Stop "cc-hooks.sh status")" "1"
+HOME="$IH" bash "$CC/install.sh" --yes --dir "$IH/cc" >/dev/null 2>&1
+eq "re-install after strip is stable" "$(sn PostToolUse "cc-hooks.sh worktree")+$(sn Stop "cc-hooks.sh status")" "1+1"
 rm -rf "$IH" "$RR" "$SB" "$NB" "$RD" "$RD2"; rm -f "$CC_TASKS_FILE" "$CC_STATUS_FILE"; unset CC_TASKS_FILE CC_STATUS_FILE
 
 echo ""
@@ -375,7 +404,7 @@ eq "empty CC_WT_SHARE disables seed" "$( [ -e "$SR/wtN/scratchpad/e2e" ] && echo
 # zsh side: an exported-empty CC_WT_SHARE must survive sourcing (docs say empty disables)
 eq "zsh keeps empty CC_WT_SHARE" "$(CC_WT_SHARE= zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; printf '%s' \"\$CC_WT_SHARE\"")" ""
 # gwt-claude + hook both go through the surface script → it must be the one seeding
-grep -q 'cc-worktree-shared.sh" seed' "$CC/cc-cmux-surface-claude.sh" && ok "surface script seeds corpus" || no "surface script seeds corpus" missing present
+grep -q 'cc-worktree-shared.sh" seed' "$CC/cc-dispatch.sh" && ok "surface script seeds corpus" || no "surface script seeds corpus" missing present
 rm -rf "$SR"
 
 echo ""
@@ -423,8 +452,8 @@ zprov 'nope' >/dev/null 2>&1;       eq "gwt-provider rejects unknown" "$?" "1"
 zprov '../x' >/dev/null 2>&1;       eq "gwt-provider rejects traversal" "$?" "1"
 rm -f "$LF"; rm -rf "$PD"
 # surface maps provider name → launch command (default ccteam; other → cld <name>)
-grep -q 'CC_LAUNCH_FILE' "$CC/cc-cmux-surface-claude.sh" && ok "surface reads provider config" || no "surface reads provider config" missing present
-grep -q 'cld \$_provider' "$CC/cc-cmux-surface-claude.sh" && ok "surface maps provider→cld" || no "surface maps provider→cld" missing present
+grep -q 'CC_LAUNCH_FILE' "$CC/cc-dispatch.sh" && ok "surface reads provider config" || no "surface reads provider config" missing present
+grep -q 'cld \$_provider' "$CC/cc-dispatch.sh" && ok "surface maps provider→cld" || no "surface maps provider→cld" missing present
 
 echo ""
 echo "== syntax =="

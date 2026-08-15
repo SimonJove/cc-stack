@@ -4,6 +4,8 @@
 #   Bash tool invokes it directly (`bash ~/.config/cc-stack/cc-board.sh [--all]`) because the
 #   old zsh-only render silently printed nothing there (the cmux tree + capture-pane
 #   workaround is retired).
+# Usage: cc-board.sh log <worktree-dir> <surface_ref> <caller_surface> <initial-prompt> [parent-branch]
+#          append one worktree sub-task record (the single write point; absorbs cc-tasks-log.sh)
 # Usage: cc-board.sh [--all] [--archive]
 #   (default)  live board: worktree-tasks.tsv joined with the worktree-status.tsv sidecar
 #   --all      disable the repo filter (rows from every repo)
@@ -18,13 +20,42 @@
 #   STATUS  sidecar join on dir: working(23m) / idle(2h) / blocked(5m) / "-" ("?" age on a
 #           malformed ts) — never "ready": readiness stays owned by gwt-done + a clean tree
 # Row rules: rows whose dir no longer exists are pruned on read (locked rewrite under the
-#   same mkdir lock cc-tasks-log.sh appends with); the NEWEST row per dir wins (the archive
+#   same mkdir lock the log subcommand appends with); the NEWEST row per dir wins (the archive
 #   keeps every row — it's a log, and its dirs are often gone by design).
 # Repo filter: only rows under the caller's git root (git rev-parse --show-toplevel from
 #   PWD), BOTH sides canonicalized with pwd -P — git reports the physical /private/var/...
 #   form on macOS while a stored row can carry the logical /var/... form; outside any repo
 #   (or with --all) everything shows.
 set -u
+
+# ── log subcommand: append one worktree sub-task record (absorbs cc-tasks-log.sh) ─────────
+# The single write point, keeping the TSV format consistent with the render below.
+# Called by cc-dispatch.sh surface (hook path and gwt-claude path both land there).
+# Fields (TAB-separated): time \t branch \t surface \t dir \t caller-tab \t task-summary \t parent-branch
+#   (parent = the caller's branch at dispatch; the board's PARENT column falls back to it
+#    once the branch's branch.<b>.ccMergeInto git config is gone, e.g. deleted after merge)
+if [ "${1:-}" = "log" ]; then
+  shift
+  dir="${1:-}"; ref="${2:-?}"; caller="${3:-}"; prompt="${4:-}"; parent="${5:-}"
+  [ -n "$dir" ] || exit 0
+  f="${CC_TASKS_FILE:-$HOME/.config/cc-stack/worktree-tasks.tsv}"
+
+  branch="$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
+  # Task summary: collapse to one line, strip TAB/pipe, truncate — keeps TSV and `column` display intact
+  summary="$(printf '%s' "$prompt" | tr '\t\n' '  ' | tr '|' '/' | cut -c1-140)"
+  [ -n "$summary" ] || summary='(idle ccteam, no initial prompt)'
+
+  # Locked append (avoid losing lines racing with the prune rewrite below). mkdir is atomic; macOS lacks flock.
+  lock="$f.lock"
+  for _ in $(seq 1 60); do
+    if mkdir "$lock" 2>/dev/null; then trap 'rmdir "$lock" 2>/dev/null' EXIT; break; fi
+    sleep 0.05
+  done
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$(date '+%Y-%m-%d %H:%M:%S')" "$branch" "$ref" "$dir" "$caller" "$summary" "$parent" \
+    >> "$f" 2>/dev/null || true
+  exit 0
+fi
 
 all=""; archive=""
 while [ $# -gt 0 ]; do
@@ -59,7 +90,7 @@ fi
 
 # ── prune-on-read (live board only): drop rows whose dir no longer exists ──────────────
 # Same rewrite discipline as worktree.zsh's _gwt_tasks_rewrite: read→rewrite under the mkdir
-# lock shared with cc-tasks-log.sh's append, so a concurrent append can't be lost.
+# lock shared with the log subcommand's append, so a concurrent append can't be lost.
 if [ -z "$archive" ] && [ -f "$tasks" ]; then
   lock="$tasks.lock" got=""
   i=0; while [ "$i" -lt 60 ]; do mkdir "$lock" 2>/dev/null && { got=1; break; }; sleep 0.05; i=$((i+1)); done

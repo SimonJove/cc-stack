@@ -70,7 +70,7 @@ _gwt_tasks_rewrite() {
   emulate -L zsh
   local f; f="$(_gwt_tasks_file)"; [[ -f "$f" ]] || return 0
   local keep_fn="$1" tmp="$f.tmp.$$" lock="$f.lock" got= i
-  # Share one mkdir lock with cc-tasks-log.sh's append, to avoid losing a concurrent append during read→mv
+  # Share one mkdir lock with cc-board.sh log's append, to avoid losing a concurrent append during read→mv
   for i in {1..60}; do mkdir "$lock" 2>/dev/null && { got=1; break }; sleep 0.05; done
   local ts branch ref dir caller task parent
   : > "$tmp"
@@ -133,13 +133,13 @@ _gwt_archive_branch() {
   return 0
 }
 
-# ── Agent-state sidecar (worktree-status.tsv, written by cc-status-hook.sh) ───
+# ── Agent-state sidecar (worktree-status.tsv, written by cc-hooks.sh status) ───
 # dir \t state \t unix-ts, one row per dir. States: working / idle / blocked — never "ready":
 # readiness stays owned by gwt-done + a clean tree, so the sidecar only describes liveness of the agent.
 _gwt_status_file() { echo "${CC_STATUS_FILE:-$HOME/.config/cc-stack/worktree-status.tsv}" }
 
 # Rewrite the sidecar by a "keep predicate" (same contract and lock discipline as _gwt_tasks_rewrite;
-# cc-status-hook.sh appends under the same $f.lock, so a rewrite here can't lose its row updates)
+# cc-hooks.sh status appends under the same $f.lock, so a rewrite here can't lose its row updates)
 _gwt_status_rewrite() {
   emulate -L zsh
   local f; f="$(_gwt_status_file)"; [[ -f "$f" ]] || return 0
@@ -180,7 +180,7 @@ gwt-new() {
   echo "✔ worktree: $wtpath   branch: $branch"
   ~/.config/cc-stack/cc-merge.sh capture "$root" "$branch" "$PWD" >/dev/null 2>&1
   # When inside cmux, open a workspace (empty shell, focus it) for this worktree; no-op when not in cmux
-  ~/.config/cc-stack/cc-cmux-workspace.sh "$wtpath" "$name" true >/dev/null 2>&1
+  ~/.config/cc-stack/cc-dispatch.sh workspace "$wtpath" "$name" true >/dev/null 2>&1
   cd "$wtpath"
 }
 
@@ -225,7 +225,7 @@ gwt-adopt() {
   _gwt_bootstrap_wt "$root" "$wtpath" "$branch" || return 1
   echo "  ↳ worktree: $wtpath"
   # focus=false: enrolling a branch must not yank you out of what you're doing.
-  ~/.config/cc-stack/cc-cmux-workspace.sh "$wtpath" "$name" false >/dev/null 2>&1
+  ~/.config/cc-stack/cc-dispatch.sh workspace "$wtpath" "$name" false >/dev/null 2>&1
 }
 
 # gwt-ls — list all worktrees
@@ -235,9 +235,9 @@ gwt-ls() { git worktree list }
 #   cc-board.sh in bash so the SAME implementation works from any shell (Claude's non-interactive
 #   Bash included — the old zsh-only render silently printed nothing there). Args are forwarded
 #   (--all: rows from every repo, not just the current one).
-#   data source 1: $CC_TASKS_FILE, appended by cc-cmux-surface-claude.sh whenever it opens a tab
+#   data source 1: $CC_TASKS_FILE, appended by cc-dispatch.sh surface whenever it opens a tab
 #     fields: time \t branch \t surface \t dir \t caller-tab \t task-summary \t parent-branch
-#   data source 2: $CC_STATUS_FILE sidecar (dir \t state \t unix-ts), written by cc-status-hook.sh on
+#   data source 2: $CC_STATUS_FILE sidecar (dir \t state \t unix-ts), written by cc-hooks.sh status on
 #     UserPromptSubmit/Stop/permission-Notification → STATUS column, joined on dir. idle = not-running,
 #     NOT done — "ready" still comes only from gwt-done + a clean tree (gwt-tree), never from here.
 #   Output contract (unchanged since the zsh original): header has TAB before STATUS; STATUS

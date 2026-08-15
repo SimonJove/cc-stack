@@ -50,7 +50,7 @@ bak(){ [ -f "$1" ] || return 0; [ -n "$DRY" ] && { say "  [dry-run] back up $(ti
 # ── Decide source: local (cc-stack files next to this script) or remote (piped via curl, needs downloading) ──
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd -P || true)"
 LOCAL_SRC=""
-[ -n "$SELF" ] && [ -f "$SELF/worktree.zsh" ] && [ -f "$SELF/cc-cmux-surface-claude.sh" ] && LOCAL_SRC="$SELF"
+[ -n "$SELF" ] && [ -f "$SELF/worktree.zsh" ] && [ -f "$SELF/cc-dispatch.sh" ] && LOCAL_SRC="$SELF"
 
 say "╭─ cc-stack installer ${DRY:+ [DRY-RUN]}"
 say "│  source: $([ -n "$LOCAL_SRC" ] && echo "local $(tilde "$LOCAL_SRC")" || echo "remote git clone")"
@@ -129,7 +129,7 @@ say "▸ 4. Claude Code hooks (settings.json)"
 SET="$HOME/.claude/settings.json"; mkdir -p "$HOME/.claude"
 [ -f "$SET" ] || { [ -n "$DRY" ] || echo '{}' > "$SET"; say "  (created settings.json)"; }
 bak "$SET"
-CC_SET="$SET" CC_HOOK="$CCT/cc-worktree-cmux-hook.sh" CC_STAT="$CCT/cc-status-hook.sh" CC_DRY="$DRY" python3 - <<'PY'
+CC_SET="$SET" CC_HOOK="$CCT/cc-hooks.sh worktree" CC_STAT="$CCT/cc-hooks.sh status" CC_DRY="$DRY" python3 - <<'PY'
 import json,os,sys,tempfile
 p=os.environ["CC_SET"];hook=os.environ["CC_HOOK"];stat=os.environ["CC_STAT"];dry=os.environ.get("CC_DRY","")
 try: d=json.load(open(p,encoding="utf-8"))
@@ -143,21 +143,23 @@ def has(ev,cmd):
     return False
 added=[]
 if not has("PostToolUse",hook): hk.setdefault("PostToolUse",[]).append({"matcher":"Bash|EnterWorktree","hooks":[{"type":"command","command":hook}]}); added.append("PostToolUse")
-# cc-status-hook.sh: sub-task agent state (working/idle/blocked) for gwt-status's STATUS column.
+# cc-hooks.sh status: sub-task agent state (working/idle/blocked) for gwt-status's STATUS column.
 # Lifecycle events, not tool events → no matcher key.
 for ev in ("UserPromptSubmit","Stop","Notification"):
     if not has(ev,stat): hk.setdefault(ev,[]).append({"hooks":[{"type":"command","command":stat}]}); added.append(ev)
-# Migration: cc-notify.sh is gone. Strip any stale hook still pointing at it (Stop/SubagentStop/Notification,
-# which older installs registered). Only the cc-notify command is removed; every other hook is left untouched
-# (the status hook above shares these events and must survive the sweep).
+# Migration: strip stale hook commands from older layouts, wherever they appear — cc-notify.sh
+# (long gone) and cc-worktree-cmux-hook.sh / cc-status-hook.sh (absorbed into cc-hooks.sh by the
+# cc-* consolidation). Only matching commands are removed; every other hook is left untouched
+# (the cc-hooks.sh registrations above share these events and must survive the sweep).
+STALE=("cc-notify","cc-worktree-cmux-hook.sh","cc-status-hook.sh")
 removed=[]
-for ev in ("Stop","SubagentStop","Notification"):
+for ev in list(hk.keys()):
     groups=hk.get(ev,[]) or []
     if not groups: continue
     new_groups=[]; changed=False
     for g in groups:
         hs=g.get("hooks") or []
-        keep=[h for h in hs if "cc-notify" not in (h.get("command","") or "")]
+        keep=[h for h in hs if not any(s in (h.get("command","") or "") for s in STALE)]
         if len(keep)!=len(hs): changed=True
         if keep: gg=dict(g); gg["hooks"]=keep; new_groups.append(gg)
     if changed:
@@ -168,14 +170,14 @@ if not added and not removed: print("  ✓ already in place (all hooks present, 
 if dry:
     msg=[]
     if added: msg.append("would add: "+", ".join(added))
-    if removed: msg.append("would remove stale cc-notify hooks on: "+", ".join(removed))
+    if removed: msg.append("would remove stale hooks on: "+", ".join(removed))
     print("  [dry-run] "+"; ".join(msg)); sys.exit(0)
 fd,tmp=tempfile.mkstemp(dir=os.path.dirname(p),prefix=".settings.cc.")
 with os.fdopen(fd,"w",encoding="utf-8") as f: json.dump(d,f,ensure_ascii=False,indent=2)
 os.replace(tmp,p)
 msg=[]
 if added: msg.append("added: "+", ".join(added))
-if removed: msg.append("removed stale cc-notify hooks on: "+", ".join(removed))
+if removed: msg.append("removed stale hooks on: "+", ".join(removed))
 print("  ✓ "+"; ".join(msg))
 PY
 

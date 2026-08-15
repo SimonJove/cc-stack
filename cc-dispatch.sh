@@ -1,13 +1,83 @@
 #!/usr/bin/env bash
-# cc-stack · Open a new surface (tab) in the CURRENT cmux workspace for an existing directory and start a ccteam claude,
-#            optionally with an initial prompt. Opens in background, doesn't steal focus. Not in cmux (remote/not installed) = safe no-op.
-# Called automatically by cc-worktree-cmux-hook.sh, and reused by cc-worktree-claude.sh (gwt-claude).
-# Usage: cc-cmux-surface-claude.sh <path> [prompt]
-# Related env: CC_WT_PERMISSION_MODE (default auto; set plan for a plan-first sub-task), CC_WT_PRETRUST (default 1), CC_WT_COPY (files to copy into the worktree)
+# cc-dispatch.sh · THE dispatch pipeline — one script, three subcommands.
+#   wt-claude <name> <prompt> [--prefix <p>] [--base <b>]   gwt-claude implementation: build/reuse
+#                                                             the worktree, then delegate to surface
+#                                                             [absorbs cc-worktree-claude.sh]
+#   surface   <path> [prompt]                                open tab + copy .env + trust + launch +
+#                                                             register — the single source of truth
+#                                                             [absorbs cc-cmux-surface-claude.sh]
+#   workspace <path> [name] [focus]                          open a cmux workspace (empty shell) for a dir
+#                                                             [absorbs cc-cmux-workspace.sh]
 set -u
 
+case "${1:-}" in
+
+# ─────────────────────────────────────────────────────────────────────────────
+# wt-claude — gwt-claude: spin a task off the main task into an independent sub-task.
+#   This subcommand only handles "build/reuse the worktree + ensure .gitignore", then DELEGATES the
+#   whole "open tab + copy .env + start ccteam (plan) + pre-trust + send prompt + register" part to
+#   surface (single source of truth, avoids two copies of the logic drifting).
+# Usage: cc-dispatch.sh wt-claude <name> <initial-prompt> [--prefix <p>] [--base <b>]
+#        (legacy positional form still accepted: <name> <initial-prompt> [branch-prefix=feat] [base=HEAD])
+wt-claude)
+shift
+name="${1:-}"; prompt="${2:-}"
+[ -n "$name" ] && [ -n "$prompt" ] || {
+  echo "usage: cc-dispatch.sh wt-claude <name> <initial-prompt> [--prefix <p>] [--base <b>]" >&2; exit 2; }
+shift 2
+
+# Flag form (what the worktree-subtask skill documents) or legacy positionals — both work.
+prefix="feat"; base="HEAD"; posi=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --base)   [ -n "${2:-}" ] || { echo "✗ --base needs a value" >&2; exit 2; }; base="$2"; shift 2 ;;
+    --prefix) [ -n "${2:-}" ] || { echo "✗ --prefix needs a value" >&2; exit 2; }; prefix="$2"; shift 2 ;;
+    *)
+      posi=$((posi+1))
+      case $posi in 1) prefix="$1" ;; 2) base="$1" ;; *) echo "✗ unexpected argument: $1" >&2; exit 2 ;; esac
+      shift ;;
+  esac
+done
+
+# Must be inside cmux (this whole thing is designed around cmux tabs)
+command -v cmux >/dev/null 2>&1 && cmux ping >/dev/null 2>&1 || {
+  echo "✗ can't reach cmux, aborting (this command needs cmux)" >&2; exit 1; }
+
+# ── Resolve main repo root + worktree dir (works from the main repo or from any worktree) ──
+g="$(git rev-parse --git-common-dir 2>/dev/null)" || { echo "✗ not inside a git repo" >&2; exit 1; }
+g="$(cd "$g" && pwd -P)"; root="$(dirname "$g")"
+if [ -d "$root/.claude" ]; then rel=".claude/worktrees"; else rel=".worktrees"; fi
+wtbase="$root/$rel"; mkdir -p "$wtbase"
+gi="$root/.gitignore"
+grep -qxF "/$rel/" "$gi" 2>/dev/null || { printf '/%s/\n' "$rel" >> "$gi"; echo "  ↳ .gitignore now ignores /$rel/"; }
+wtpath="$wtbase/$name"; branch="$prefix/$name"
+
+# ── Build/reuse the worktree ──
+if git -C "$root" show-ref --verify --quiet "refs/heads/$branch"; then
+  git -C "$root" worktree add "$wtpath" "$branch" || exit 1
+else
+  git -C "$root" worktree add "$wtpath" -b "$branch" "$base" || exit 1
+fi
+echo "✔ worktree : $wtpath"
+echo "✔ branch   : $branch"
+"$HOME/.config/cc-stack/cc-merge.sh" capture "$root" "$branch" "$PWD" >/dev/null 2>&1
+
+# ── Delegate: open tab + copy .env + start ccteam (plan) + pre-trust + send prompt + register ──
+exec "$HOME/.config/cc-stack/cc-dispatch.sh" surface "$wtpath" "$prompt"
+;;
+
+# ─────────────────────────────────────────────────────────────────────────────
+# surface — open a new surface (tab) in the CURRENT cmux workspace for an existing directory and
+#   start a ccteam claude, optionally with an initial prompt. Opens in background, doesn't steal
+#   focus. Not in cmux (remote/not installed) = safe no-op.
+# Called automatically by cc-hooks.sh worktree, and reused by wt-claude above (gwt-claude).
+# Usage: cc-dispatch.sh surface <path> [prompt]
+# Related env: CC_WT_PERMISSION_MODE (default auto; set plan for a plan-first sub-task),
+#   CC_WT_PRETRUST (default 1), CC_WT_COPY (files to copy into the worktree)
+surface)
+shift
 path="${1:-}"; prompt="${2:-}"
-[ -n "$path" ] || { echo "usage: cc-cmux-surface-claude.sh <path> [prompt]" >&2; exit 2; }
+[ -n "$path" ] || { echo "usage: cc-dispatch.sh surface <path> [prompt]" >&2; exit 2; }
 [ -d "$path" ] || { echo "directory does not exist: $path" >&2; exit 2; }
 abspath="$(cd "$path" 2>/dev/null && pwd -P)" || exit 2
 
@@ -47,7 +117,7 @@ if [ -n "$root" ] && [ "$root" != "$abspath" ]; then
 fi
 
 # Record the merge target (parent = caller's branch) — HOOK PATH ONLY.
-# On the gwt-claude path CC_CALLER_CWD is unset and cc-worktree-claude.sh already
+# On the gwt-claude path CC_CALLER_CWD is unset and wt-claude above already
 # captured with the real caller cwd; skipping here avoids overwriting it.
 if [ -n "${CC_CALLER_CWD:-}" ] && command -v git >/dev/null 2>&1; then
   _root="$(git -C "$abspath" rev-parse --git-common-dir 2>/dev/null)" && _root="$(cd "$_root/.." && pwd -P)"
@@ -94,7 +164,7 @@ done
 # approval round-trip, the same mode the main session runs in; `plan` was the old default and cost a human
 # round-trip on every single dispatch.
 # Per-dispatch override: CC_WT_PERMISSION_MODE=plan (env on the gwt-claude call, or as a prefix token on the
-# `git worktree add` command line — the hook parses it out of the command text and passes it through here).
+# `git worktree add` command line — cc-hooks.sh worktree parses it out of the command text and passes it through here).
 # Whitelisted because the value is interpolated into the launch command below; anything else falls back to auto.
 pm="${CC_WT_PERMISSION_MODE:-auto}"
 case "$pm" in
@@ -162,9 +232,41 @@ done
 # 5th arg = parent branch (the caller's branch at dispatch — CC_CALLER_CWD on the hook path,
 # PWD on the gwt-claude path; empty when detached / not a repo): feeds the board's PARENT
 # column and outlives the branch.<b>.ccMergeInto git config.
-"$HOME/.config/cc-stack/cc-tasks-log.sh" "$abspath" "$ref" "${caller_surface:-}" "$prompt" \
+"$HOME/.config/cc-stack/cc-board.sh" log "$abspath" "$ref" "${caller_surface:-}" "$prompt" \
   "$(git -C "${CC_CALLER_CWD:-$PWD}" symbolic-ref --short HEAD 2>/dev/null)"
 
 echo "✔ new tab : $ref  cwd=$abspath  $([ -n "$prompt" ] && echo '(initial prompt sent)' || echo '(idle ccteam)')"
 [ -n "$caller_surface" ] && echo "✔ backchannel: the new claude can report back via cmux send --surface $caller_surface"
 exit 0
+;;
+
+# ─────────────────────────────────────────────────────────────────────────────
+# workspace — open a cmux workspace (empty shell) for a directory.
+#   - Safe no-op when not inside cmux (no CMUX_SOCKET), so remote/bare-terminal callers have no side effects.
+#   - Best-effort dedup: if a workspace already points at the same directory, don't open another.
+# Usage: cc-dispatch.sh workspace <path> [name] [focus=false]
+workspace)
+shift
+# Can we talk to cmux? (don't rely on CMUX_SOCKET — it's often empty in CC's Bash env; the cmux CLI uses its default socket)
+command -v cmux >/dev/null 2>&1 || exit 0      # cmux not installed (remote): silently skip
+cmux ping >/dev/null 2>&1 || exit 0            # can't reach cmux: silently skip
+
+path="${1:-}"
+[ -n "$path" ] || { echo "cc-dispatch.sh workspace: need <path>" >&2; exit 2; }
+[ -d "$path" ] || { echo "cc-dispatch.sh workspace: directory does not exist: $path" >&2; exit 2; }
+
+abspath="$(cd "$path" 2>/dev/null && pwd -P)" || exit 2
+name="${2:-$(basename "$abspath")}"
+focus="${3:-false}"
+
+# Dedup (best effort): if this absolute path already shows up in the workspace list, don't open again
+if cmux list-workspaces 2>/dev/null | grep -qF "$abspath"; then
+  exit 0
+fi
+
+exec cmux new-workspace --name "$name" --cwd "$abspath" --focus "$focus"
+;;
+
+*)
+  echo "usage: cc-dispatch.sh wt-claude <name> <prompt> [--prefix <p>] [--base <b>] | surface <path> [prompt] | workspace <path> [name] [focus]" >&2; exit 2 ;;
+esac

@@ -14,16 +14,16 @@
 **根因:**
 脚本不从自身位置或 `CC_STACK_DIR` 推导 cc-stack 根目录,而是写死 `$HOME/.config/cc-stack`(或 `~/.config/cc-stack`)。
 
-**硬编码处**(仓库内 `grep -rn config/cc-stack`,排除 `.bak`/worktrees):
+**硬编码处**(仓库内 `grep -rn config/cc-stack`,排除 `.bak`/worktrees;处数为 grep 行命中,含注释。
+2026-08 cc-* 脚本合并后文件已改名,行数按合并后文件重新统计):
 
 | 文件 | 处数 | 后果(DEST ≠ 默认时) |
 |---|---|---|
-| `worktree.zsh` | 21 | `gwt-new`/`gwt-rm` 调 `cc-worktree-shared.sh`、`cc-merge.sh`、`cc-trust.sh`、`cc-cmux-workspace.sh` 全部找不到 |
+| `worktree.zsh` | 23 | `gwt-new`/`gwt-rm` 调 `cc-worktree-shared.sh`、`cc-merge.sh`、`cc-trust.sh`、`cc-dispatch.sh`(workspace)全部找不到 |
 | `aliases.zsh` | 3 | `claude()`、`gwt-claude`、`gwt-test` 失效 |
-| `cc-cmux-surface-claude.sh` | 5 | hook 路径下文件不存在 → 子任务永远开不了 tab |
-| `cc-worktree-claude.sh` | 2 | 同上 |
-| `cc-worktree-cmux-hook.sh` | 1 | 同上 |
-| `cc-tasks-log.sh` | `CC_TASKS_FILE` 默认值 | 任务表写错位置,`gwt-status` 读空 |
+| `cc-dispatch.sh` | 8 | hook 路径下文件不存在 → 子任务永远开不了 tab(吸收了 `cc-cmux-surface-claude.sh`/`cc-worktree-claude.sh`/`cc-cmux-workspace.sh`) |
+| `cc-hooks.sh` | 3 | 同上(吸收了 `cc-worktree-cmux-hook.sh`/`cc-status-hook.sh`) |
+| `cc-board.sh` | 7 | 任务表写错位置,`gwt-status` 读空(`log` 子命令,吸收了 `cc-tasks-log.sh`;其余为渲染路径默认值) |
 
 **修复方向:**
 - **推荐 A — 脚本自解析根目录:** bash 脚本用 `${BASH_SOURCE[0]}`、zsh 用 `${(%):-%x}`(或在 source 时记录一次)推导出 cc-stack 安装根,替代硬编码。自包含,不依赖外部 state。
@@ -37,3 +37,11 @@
 ```
 
 **关联:** `install.sh` 的 `--dir`/`CC_STACK_DIR` 处理(约行 13、34)、README 的 install 文档(约行 40-65)。
+
+## hook 防双开过滤的非规范引号角落(cc-hooks.sh worktree)
+
+**现象:** `CC_WT_PROMPT` 若不用文档规定的单引号形式(例如双引号包裹、或 `'\''` 内嵌撇号),且 payload 文本里恰好字面点名 `cc-dispatch.sh` 或两个 legacy 脚本名,该次派发会被 SKIP(无 tab,但失败可见:cc-failures.log 有记录)。
+
+**界定:** 规范单引号形式完全不受影响(剥离按 `CC_WT_PROMPT='…'` span 做);该角落是剥离方式的固有边界,方向为净收紧(基线对新名字本来就是 DISPATCH),触发需要同时违反引号约定并在 payload 里点名 dispatcher,概率极低。
+
+**处置:** 无需修复;记录在案。若将来出现真实误触,把剥离从"单引号 span"升级为"引号无关的 token 级检测"即可。

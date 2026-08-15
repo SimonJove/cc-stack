@@ -1,5 +1,17 @@
 #!/usr/bin/env bash
-# cc-stack · Claude Code PostToolUse hook (matcher: Bash|EnterWorktree)
+# cc-hooks.sh · ALL Claude Code hook entries — one script, one subcommand per event.
+#   cc-hooks.sh worktree   PostToolUse hook (matcher: Bash|EnterWorktree): the worktree tab opener
+#                           [absorbs cc-worktree-cmux-hook.sh]
+#   cc-hooks.sh status     UserPromptSubmit / Stop / Notification hook: the agent-state sidecar writer
+#                           [absorbs cc-status-hook.sh]
+# Both read the hook JSON on stdin and follow the hook hard rules: zero output, always exit 0,
+# any failure degrades to a silent no-op (never interrupts Claude).
+set -u
+
+case "${1:-}" in
+
+# ─────────────────────────────────────────────────────────────────────────────
+# worktree — PostToolUse (Bash|EnterWorktree) tab opener
 # What it does: after Claude runs `git worktree add` in Bash, automatically open a new surface (tab)
 #   in the current cmux workspace and start a ccteam claude there; if CC_WT_PROMPT is set, send it as the first message.
 #   - Only handles a Bash `git worktree add` (adjacent tokens); list/remove/prune do NOT trigger.
@@ -15,10 +27,11 @@
 #   - Synchronous launch: CC reaps backgrounded children when the hook returns (tested: `&`/nohup/setsid all fail —
 #     setsid detaches the session and then cmux gives Broken pipe), so it must be synchronous; the cost is this tool
 #     call waits a few extra seconds (< CC's 60s hook timeout).
-#   - cc-worktree-claude.sh / cc-cmux-surface-claude.sh open their own tab, so skip when the command references them (avoids double tabs).
+#   - cc-dispatch.sh (wt-claude / surface) opens its own tab, so skip when the command references it (avoids
+#     double tabs); the legacy cc-worktree-claude / cc-cmux-surface-claude names stay for pre-refactor installs.
 #   - Always exits 0; never interrupts Claude.
-set -u
-
+worktree)
+shift
 input="$(cat 2>/dev/null || true)"
 [ -n "$input" ] || exit 0
 
@@ -35,7 +48,7 @@ cmux ping >/dev/null 2>&1 || exit 0
 # Parse: the just-created worktree absolute path + CC_WT_PROMPT value, TAB-separated (prompt may be empty)
 line="$(
   CC_HOOK_INPUT="$input" python3 - <<'PY' 2>/dev/null || true
-import json, os, sys, subprocess, time, shlex
+import json, os, sys, subprocess, time, shlex, re
 try:
     d = json.loads(os.environ.get("CC_HOOK_INPUT", ""))   # passed via env: the heredoc occupies stdin, so json.load(stdin) is not usable
 except Exception:
@@ -47,8 +60,16 @@ low = cmd.lower()
 # Only handle a Bash `worktree` command; tools without a `command` field (EnterWorktree) are naturally excluded
 if "worktree" not in low:
     sys.exit(0)
-# These scripts open their own tab, so do not let the hook open another (double tab). gwt-claude=cc-worktree-claude.sh
-if "cc-worktree-claude" in low or "cc-cmux-surface-claude" in low:
+# These scripts open their own tab, so do not let the hook open another (double tab).
+# gwt-claude=cc-dispatch.sh wt-claude. The CC_WT_PROMPT payload is FREE TEXT: strip the
+# single-quoted span before substring testing, so a brief that merely MENTIONS a script name
+# does not kill the dispatch. The legacy cc-worktree-claude / cc-cmux-surface-claude names stay
+# listed — pre-refactor installs may still run those scripts.
+# (q = chr(39): a literal apostrophe must not appear in this heredoc — bash 3.2 mis-parses one
+#  inside a heredoc nested in $( ).)
+q = chr(39)
+bare = re.sub("cc_wt_prompt=" + q + "[^" + q + "]*" + q, " ", low)
+if "cc-dispatch.sh" in bare or "cc-worktree-claude" in bare or "cc-cmux-surface-claude" in bare:
     sys.exit(0)
 
 try:
@@ -151,13 +172,93 @@ fi
 [ -n "$newpath" ] || exit 0
 
 # Per-dispatch permission mode: CC_WT_PERMISSION_MODE=plan on the command line pins THIS sub-task to
-# plan-first (default is auto). cc-cmux-surface-claude.sh whitelists the value.
+# plan-first (default is auto). cc-dispatch.sh surface whitelists the value.
 [ -n "$mode" ] && export CC_WT_PERMISSION_MODE="$mode"
 
 # Synchronously open surface + start ccteam (+send prompt). Must be synchronous: see the header notes.
-# (Shared-corpus seeding [CC_WT_SHARE] happens inside cc-cmux-surface-claude.sh — the single point
+# (Shared-corpus seeding [CC_WT_SHARE] happens inside cc-dispatch.sh surface — the single point
 #  both this hook path and gwt-claude go through.)
 CC_CALLER_CWD="$(printf '%s' "$input" | python3 -c 'import json,sys;d=json.load(sys.stdin);print(d.get("cwd",""))' 2>/dev/null || true)" \
-  "$HOME/.config/cc-stack/cc-cmux-surface-claude.sh" "$newpath" "$prompt" >/dev/null 2>&1
+  "$HOME/.config/cc-stack/cc-dispatch.sh" surface "$newpath" "$prompt" >/dev/null 2>&1
 
 exit 0
+;;
+
+# ─────────────────────────────────────────────────────────────────────────────
+# status — UserPromptSubmit / Stop / Notification agent-state writer
+#   Keeps a per-sub-task agent-state sidecar (worktree-status.tsv, read by gwt-status's STATUS column)
+#   with ZERO model cooperation and ZERO token cost: Claude Code fires these hooks on its own lifecycle,
+#   the hook just records them.
+#   - Board membership is the filter: only dirs already registered in worktree-tasks.tsv (written when
+#     the tab was opened) get a row — the MAIN session and unrelated projects never write here,
+#     even though the hook is registered globally.
+#   - States: UserPromptSubmit → working; Stop → idle; Notification → blocked ONLY when the message
+#     text mentions "permission" (other notifications are noise). There is deliberately NO ready
+#     state: readiness stays owned by gwt-done + a clean tree (see README).
+#   - The board's dir column is `cd <dir> && pwd -P` output (cc-dispatch.sh surface), so the
+#     hook's cwd is canonicalized the exact same way before matching.
+#   - Read-modify-write (one row per dir, newest wins) under cc-board.sh log's mkdir-lock pattern
+#     (macOS has no flock); the same lock discipline in worktree.zsh keeps gwt-rm/gwt-prune rewrites
+#     from losing a concurrent hook update.
+#   - HARD RULES: never write to stdout/stderr (UserPromptSubmit stdout gets injected into the
+#     model's context — zero token cost means zero output); ALWAYS exit 0 (exit 2 would block the
+#     user's prompt); any failure (no python3, malformed JSON, unreadable board) degrades to a
+#     silent no-op. cmux-independent by design — pure file bookkeeping, no surfaces touched.
+status)
+shift
+input="$(cat 2>/dev/null || true)"
+[ -n "$input" ] || exit 0
+
+# Parse the three fields we need from the hook payload: event \t cwd \t notification-message
+# (TAB-separated, message last). python reads real stdin via -c (no heredoc here); any parse
+# failure prints nothing → the event match below exits 0.
+parsed="$(printf '%s' "$input" | python3 -c '
+import json, sys
+try: d = json.load(sys.stdin)
+except Exception: sys.exit(0)
+if not isinstance(d, dict): sys.exit(0)
+sys.stdout.write("%s\t%s\t%s" % (d.get("hook_event_name") or "", d.get("cwd") or "", d.get("message") or ""))' 2>/dev/null || true)"
+ev="${parsed%%$'\t'*}"; rest="${parsed#*$'\t'}"
+cwd="${rest%%$'\t'*}"; msg="${rest#*$'\t'}"
+
+# Event → state. Notification only counts when the message mentions permission (that is the
+# "sub-task is stuck waiting for a human" signal); everything else is ignored, never written.
+case "$ev" in
+  UserPromptSubmit) state="working" ;;
+  Stop)             state="idle" ;;
+  Notification)
+    case "$msg" in
+      *[Pp]ermission*) state="blocked" ;;
+      *)               exit 0 ;;
+    esac ;;
+  *) exit 0 ;;
+esac
+
+# Canonical dir, same form the board stores. CDPATH= so a stray CDPATH can neither redirect the cd
+# nor echo into $canon; an un-enterable cwd can never match the board anyway.
+[ -n "$cwd" ] || exit 0
+canon="$(CDPATH= cd -- "$cwd" 2>/dev/null && pwd -P)" || exit 0
+
+tasks="${CC_TASKS_FILE:-$HOME/.config/cc-stack/worktree-tasks.tsv}"
+[ -f "$tasks" ] || exit 0
+awk -F'\t' -v d="$canon" '$4==d{found=1} END{exit found?0:1}' "$tasks" 2>/dev/null || exit 0
+
+f="${CC_STATUS_FILE:-$HOME/.config/cc-stack/worktree-status.tsv}"
+# Locked read-modify-write: drop any previous row for this dir, append the fresh one (cc-board.sh log
+# pattern — mkdir is atomic; if the lock never frees we still write, matching its append behavior).
+lock="$f.lock"
+for _ in $(seq 1 60); do
+  if mkdir "$lock" 2>/dev/null; then trap 'rmdir "$lock" 2>/dev/null' EXIT; break; fi
+  sleep 0.05
+done
+tmp="$f.tmp.$$"
+awk -F'\t' -v OFS='\t' -v d="$canon" '$1!=d' "$f" 2>/dev/null > "$tmp" || : > "$tmp"
+printf '%s\t%s\t%s\n' "$canon" "$state" "$(date +%s)" >> "$tmp"
+mv "$tmp" "$f" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+
+exit 0
+;;
+
+*)
+  echo "usage: cc-hooks.sh worktree|status   (Claude Code hook JSON on stdin)" >&2; exit 2 ;;
+esac
