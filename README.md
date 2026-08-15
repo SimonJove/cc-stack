@@ -56,7 +56,7 @@ cd ~/Desktop/cc-stack && ./install.sh                                     # guid
 1. Install the source into the target dir (excluding `.git`/backups/runtime-generated files)
 2. Executable bits + dependency check (cmux / claude / git / python3 / zsh / shasum / column)
 3. Make `~/.zshrc` load `worktree.zsh` + `aliases.zsh`
-4. Add the PostToolUse hook to `~/.claude/settings.json` (opens the tab on `git worktree add`; also strips any stale `cc-notify` hooks left by older installs)
+4. Add the Claude Code hooks to `~/.claude/settings.json`: the PostToolUse tab hook (opens the tab on `git worktree add`) and the `cc-status-hook.sh` status hook on `UserPromptSubmit`/`Stop`/`Notification` (agent-state tracking; also strips any stale `cc-notify` hooks left by older installs)
 5. Add the worktree rules to `~/.claude/CLAUDE.md` (a managed block, sourced from `claude-rules.md`)
 6. cmux.json workflow settings (optional, `--cmux`; deep-merged, your config is backed up)
 
@@ -105,6 +105,27 @@ CC_WT_PROMPT='the full first instruction for the task (may be multi-line)' git w
 
 > Not inside cmux (remote SSH) → everything is a **safe no-op**.
 
+### Sub-task agent status: working / idle / blocked
+
+`gwt-status` shows a **STATUS** column per sub-task. It is driven by Claude Code **hooks**, not by the
+model: `install.sh` registers `cc-status-hook.sh` for `UserPromptSubmit` / `Stop` / `Notification`, and
+the hook writes a tiny sidecar row (`worktree-status.tsv`, joined on dir) — **zero model cooperation,
+zero token cost**. Only dirs already on the task board get rows, so the main session and unrelated
+projects never write anything.
+
+| STATUS cell | Written on | Meaning |
+|---|---|---|
+| `working(23m)` | `UserPromptSubmit` | the sub-task claude just got a message and is on it (age = time since the last event) |
+| `idle(2h)` | `Stop` | the agent finished its turn, **not running — NOT done** |
+| `blocked(5m)` | `Notification` whose message mentions *permission* | the sub-task is stuck on a permission prompt — answer its tab |
+| `-` | (no row) | no hook event recorded yet (sub-task started before the hook was installed, or claude never launched) |
+
+**`idle` ≠ done.** An idle sub-task has simply stopped running; it may be waiting for you, done, or
+crashed mid-thought. Readiness to merge still comes **only** from `gwt-done` plus a clean working tree
+(what `gwt-tree` shows) — the hook deliberately never writes a "ready" state; that stays a human
+decision. State rows are swept along with the board (`gwt-rm` drops the row, `gwt-prune` removes rows
+whose dir no longer exists).
+
 ---
 
 ## Hierarchical worktrees (A ⊃ {A1,A2,A3})
@@ -146,7 +167,7 @@ gwt-adopt <branch> [--into <parent>] [--no-worktree]  # enroll an EXISTING branc
                                #   by default, give it a worktree so an agent can start on it. Does not cd or
                                #   steal focus, so an orchestrating claude can fold hand-made branches in.
 gwt-ls                         # git worktree list
-gwt-status                     # board: status (✔live/⌫closed/?old-session) + branch + surface + dir + what it's doing (auto-cleans deleted dirs)
+gwt-status                     # board: tab (✔live/⌫closed/?old-session) + branch + surface + dir + agent STATUS (working/idle/blocked + age) + task (auto-cleans deleted dirs)
 gwt-rm <name> [--branch]       # remove worktree (+ clear task record + clear pre-trust; optionally the branch)
 gwt-prune                      # compact the task list (drop dead records + keep newest per dir)
 gwt-clean                      # git worktree prune + show current state
@@ -183,6 +204,7 @@ Every sub-task still launches in **team mode** (`cmux claude-teams`) regardless 
 | `CC_WT_COPY` | `.env .env.local .claude/settings.local.json` | Files copied from the main repo into a new worktree (space-separated, no spaces in paths). |
 | `CC_WT_SHARE` | `scratchpad/e2e` | Gitignored dir(s) shared across worktrees as **independent copies**: seeded into a new worktree on create, merged back into the main repo on `gwt-rm` (never overwrites main; clashes kept as `<name>.from-<branch>.<ext>`). Space-separated; **export** it to customize, exported-empty (`""`) disables. |
 | `CC_TASKS_FILE` | `~/.config/cc-stack/worktree-tasks.tsv` | Task list path (rarely changed). |
+| `CC_STATUS_FILE` | `~/.config/cc-stack/worktree-status.tsv` | Agent-state sidecar written by `cc-status-hook.sh`, read by `gwt-status`'s STATUS column (override for tests). |
 | `CC_LAUNCH_FILE` | `~/.config/cc-stack/launch` | Written by `gwt-provider`; the provider name for NEW sub-tasks (`kimi`, `glm`, or `anthropic`/empty=default). Override path for tests. |
 
 ---
@@ -202,6 +224,12 @@ cc-cmux-surface-claude.sh  ◀────── single source of truth ──�
   │  ⑦ screen-scrape trust fallback  ⑧ register (cc-tasks-log.sh)   failure → cc-failures.log + cmux notify
   ▼
 worktree-tasks.tsv  ──►  gwt-status (reads the list + judges liveness via cmux; auto-prunes deleted dirs)
+
+each sub-task claude's own lifecycle events ──►
+cc-status-hook.sh             UserPromptSubmit / Stop / permission-Notification hooks (registered globally,
+  │                           but only board dirs ever match): dir + state + ts under a mkdir lock
+  ▼
+worktree-status.tsv  ──►  gwt-status STATUS column: working(23m) / idle(2h) / blocked(5m) / -
 ```
 
 **Key design choices:**
@@ -221,6 +249,7 @@ worktree-tasks.tsv  ──►  gwt-status (reads the list + judges liveness via 
 | **Sub-task edits code right away** | Not in plan mode. Check `CC_WT_PERMISSION_MODE` isn't set to a non-plan value; only newly spawned sub-tasks pick it up. |
 | **Sub-task auto-merges / removes the worktree** | The superpowers `finishing-a-development-branch` skill picked "merge" by itself in an autonomous sub-task. The CLAUDE.md rules forbid this; make sure the rules block is present and it's a new session. |
 | **`gwt-status` shows all `?old-session`** | cmux was restarted, all registered surface refs are stale. Dirs still exist, cleanup is unaffected; `gwt-prune` compacts it. |
+| **Sub-task stuck on `blocked(...)`** | It's waiting on a permission prompt in its tab — go answer there; the state refreshes on the sub-task's next event. |
 | **Sub-task can't run without `.env`** | Ensure `$CC_WT_COPY` includes the needed files; the hook path now copies them automatically. **Port collisions** between parallel dev servers must be handled by parameterizing ports in each worktree's `.env`. |
 | **Afraid of breaking cc-stack when editing it** | `gwt-test` runs the smoke test (hook parsing / registration / prune / trust) in one command. |
 
@@ -237,12 +266,14 @@ cc-cmux-surface-claude.sh    # [single source of truth] open tab + copy .env + p
 cc-worktree-claude.sh        # gwt-claude: build worktree + ensure .gitignore, delegates the surface part above
 cc-cmux-workspace.sh         # used by gwt-new: open an empty workspace for a dir (no-op when not in cmux)
 cc-tasks-log.sh              # single task-registration entry point (keeps TSV format consistent)
+cc-status-hook.sh            # UserPromptSubmit/Stop/Notification hook: sub-task agent state (working/idle/blocked) → worktree-status.tsv
 cc-trust.sh                  # pre-authorize/revoke trust for a dir (edits ~/.claude.json, atomic write, only adds/removes pure-trust signatures)
 claude-rules.md              # single source of the global CLAUDE.md worktree rules (install syncs it into the managed block)
 install.sh                   # one-command install/repair (idempotent/backs up; --dry-run / --cmux)
 config/cmux.json             # workflow cmux config (minimalMode + workspace/tab nav keys); applied via install.sh --cmux
 test.sh                      # smoke test (gwt-test calls it)
 worktree-tasks.tsv           # task registration list (auto-generated)
+worktree-status.tsv          # per-sub-task agent state, written by cc-status-hook.sh (auto-generated)
 cc-failures.log              # records of tabs that failed to open (auto-generated)
 README.md                    # this file
 ```

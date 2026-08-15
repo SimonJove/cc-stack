@@ -12,3 +12,4 @@ launch
 # transient design docs (local only)
 /docs/plans/
 /docs/specs/
+worktree-status.tsv

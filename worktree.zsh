@@ -92,6 +92,57 @@ _gwt_keep_not_target() { [[ "$1" != "$_gwt_drop_target" ]] }
 _gwt_tasks_prune_dead() { _gwt_tasks_rewrite '_gwt_keep_dir_exists' }
 _gwt_keep_dir_exists() { [[ -n "$1" && -d "$1" ]] }
 
+# ── Agent-state sidecar (worktree-status.tsv, written by cc-status-hook.sh) ───
+# dir \t state \t unix-ts, one row per dir. States: working / idle / blocked — never "ready":
+# readiness stays owned by gwt-done + a clean tree, so the sidecar only describes liveness of the agent.
+_gwt_status_file() { echo "${CC_STATUS_FILE:-$HOME/.config/cc-stack/worktree-status.tsv}" }
+
+# Rewrite the sidecar by a "keep predicate" (same contract and lock discipline as _gwt_tasks_rewrite;
+# cc-status-hook.sh appends under the same $f.lock, so a rewrite here can't lose its row updates)
+_gwt_status_rewrite() {
+  emulate -L zsh
+  local f; f="$(_gwt_status_file)"; [[ -f "$f" ]] || return 0
+  local keep_fn="$1" tmp="$f.tmp.$$" lock="$f.lock" got= i
+  for i in {1..60}; do mkdir "$lock" 2>/dev/null && { got=1; break }; sleep 0.05; done
+  local d st ts
+  : > "$tmp"
+  while IFS=$'\t' read -r d st ts; do
+    "$keep_fn" "$d" && printf '%s\t%s\t%s\n' "$d" "$st" "$ts" >> "$tmp"
+  done < "$f"
+  mv "$tmp" "$f"
+  [[ -s "$f" ]] || rm -f "$f"
+  [[ -n "$got" ]] && rmdir "$lock" 2>/dev/null
+  return 0
+}
+
+# Human age for a unix ts: 23m / 2h / 5d (gwt-status STATUS column suffix); "?" on a malformed ts
+_gwt_status_age() {
+  emulate -L zsh
+  local ts="$1"
+  [[ "$ts" == <-> ]] || { echo "?"; return 0 }
+  # two statements, NOT one `local now=… age=$(( now - ts ))`: a single local expands all its words
+  # before assigning, so `now` would still be unset inside the arithmetic (same typeset gotcha as _gwt_tree_render)
+  local now=${EPOCHSECONDS:-$(date +%s)}
+  local age=$(( now - ts ))
+  (( age < 0 )) && age=0
+  if (( age < 3600 )); then echo "$(( age / 60 ))m"
+  elif (( age < 86400 )); then echo "$(( age / 3600 ))h"
+  else echo "$(( age / 86400 ))d"; fi
+}
+
+# Drop the state row for a removed dir (gwt-rm) — keep rows whose dir differs
+_gwt_status_drop_dir() {
+  emulate -L zsh
+  local target="$1"; [[ -n "$target" ]] || return 0
+  _gwt_status_drop_target="$target"
+  _gwt_status_rewrite '_gwt_status_keep_not_target'
+  unset _gwt_status_drop_target
+}
+_gwt_status_keep_not_target() { [[ "$1" != "$_gwt_status_drop_target" ]] }
+
+# Drop state rows whose dir no longer exists (gwt-prune) — reuses the board-side predicate
+_gwt_status_prune_dead() { _gwt_status_rewrite '_gwt_keep_dir_exists' }
+
 # gwt-new <name> [branch-prefix=feat] [base=HEAD] — create/reuse a worktree and cd into it
 gwt-new() {
   emulate -L zsh
@@ -154,9 +205,12 @@ gwt-adopt() {
 # gwt-ls — list all worktrees
 gwt-ls() { git worktree list }
 
-# gwt-status — list registered worktree sub-tasks, flag whether each is alive + what it's doing
-#   data source: $CC_TASKS_FILE, appended by cc-cmux-surface-claude.sh whenever it opens a tab
-#   fields: time \t branch \t surface \t dir \t caller-tab \t task-summary
+# gwt-status — list registered worktree sub-tasks: tab liveness, branch/surface/dir, agent state, what it's doing
+#   data source 1: $CC_TASKS_FILE, appended by cc-cmux-surface-claude.sh whenever it opens a tab
+#     fields: time \t branch \t surface \t dir \t caller-tab \t task-summary
+#   data source 2: $CC_STATUS_FILE sidecar (dir \t state \t unix-ts), written by cc-status-hook.sh on
+#     UserPromptSubmit/Stop/permission-Notification → STATUS column, joined on dir. idle = not-running,
+#     NOT done — "ready" still comes only from gwt-done + a clean tree (gwt-tree), never from here.
 gwt-status() {
   emulate -L zsh
   local f; f="$(_gwt_tasks_file)"
@@ -175,23 +229,35 @@ gwt-status() {
       [[ -n "$r" ]] && grep -qF "$r" <<<"$live" && { some_live=1; break }
     done < "$f"
   fi
+  # Agent-state sidecar loaded once (dir → state, ts); joined per row below
+  local sf sd ss sr cell
+  typeset -A sstate stag
+  sstate=(); stag=()
+  sf="$(_gwt_status_file)"
+  if [[ -r "$sf" ]]; then
+    while IFS=$'\t' read -r sd ss sr; do
+      [[ -n "$sd" ]] && { sstate[$sd]="$ss"; stag[$sd]="$sr"; }
+    done < "$sf"
+  fi
   typeset -A seen
   local -a rows
-  local ts branch ref dir caller task st
+  local ts branch ref dir caller task tab
   # Read in reverse: the first time a dir appears is its newest record (after prune all dirs exist)
   while IFS=$'\t' read -r ts branch ref dir caller task; do
     [[ -n "$dir" ]] || continue
     [[ -n "${seen[$dir]:-}" ]] && continue
     seen[$dir]=1
-    if [[ -z "$live" ]]; then          st="?no-cmux"    # can't reach cmux, can't tell
-    elif grep -qF "$ref" <<<"$live"; then st="✔live"
-    elif [[ -z "$some_live" ]]; then    st="?old-session"  # no ref alive at all → likely a cmux restart, refs stale
-    else                                 st="⌫closed"     # this ref is gone within the same session → the tab really closed
+    if [[ -z "$live" ]]; then          tab="?no-cmux"    # can't reach cmux, can't tell
+    elif grep -qF "$ref" <<<"$live"; then tab="✔live"
+    elif [[ -z "$some_live" ]]; then    tab="?old-session"  # no ref alive at all → likely a cmux restart, refs stale
+    else                                 tab="⌫closed"     # this ref is gone within the same session → the tab really closed
     fi
-    rows+=("$st|${branch:-?}|${ref:-?}|$dir|$task")
+    cell="-"                                               # no sidecar row → the hook never fired for this sub-task
+    [[ -n "${sstate[$dir]:-}" ]] && cell="${sstate[$dir]}($(_gwt_status_age "${stag[$dir]:-}"))"
+    rows+=("$tab|${branch:-?}|${ref:-?}|$dir|$cell|$task")
   done < <(tail -r "$f")
   (( ${#rows} )) || { echo "no records"; return 0 }
-  { echo "STATUS|BRANCH|SURFACE|DIR|TASK"; printf '%s\n' "${rows[@]}"; } | column -t -s '|'
+  { echo "TAB|BRANCH|SURFACE|DIR|STATUS|TASK"; printf '%s\n' "${rows[@]}"; } | column -t -s '|'
   [[ -n "$live" && -z "$some_live" ]] && echo "(note: all registered surface refs are stale — cmux was probably restarted → status shows '?old-session'; dirs still exist, cleanup unaffected)"
   # Failure breadcrumb: if there were "built a worktree but no tab" failures in the last 24h, warn
   local flog="$HOME/.config/cc-stack/cc-failures.log"
@@ -205,6 +271,7 @@ gwt-status() {
 # gwt-prune — compact the task list: drop dead-dir records + keep only the newest per dir
 gwt-prune() {
   emulate -L zsh
+  _gwt_status_prune_dead          # sweep the agent-state sidecar too (rows whose dir vanished)
   local f; f="$(_gwt_tasks_file)"; [[ -f "$f" ]] || { echo "list is empty"; return 0 }
   _gwt_tasks_prune_dead
   [[ -f "$f" ]] || { echo "✔ emptied (no live records)"; return 0 }
@@ -369,7 +436,7 @@ cc-stack · worktree sub-task commands
   gwt-merge <name> [--squash|--no-ff|--rebase] [--into <b>] [--force]
                                          GATED merge into its recorded parent (asks strategy [default: squash] + confirms first)
   gwt-collect <parent>                   run one gated gwt-merge per ready child of <parent>
-  gwt-status                             list sub-tasks: status/branch/surface/dir/what-it's-doing (auto-cleans deleted dirs)
+  gwt-status                             list sub-tasks: tab/branch/surface/dir + agent state (working/idle/blocked + age) + task (auto-cleans deleted dirs)
   gwt-rm <name> [--branch]               remove worktree (+ clear task record + pre-trust; optionally the branch)
   gwt-prune                              compact the task list (drop dead records + keep newest per dir)
   gwt-clean                              git worktree prune + show current state
@@ -402,6 +469,7 @@ gwt-rm() {
   git worktree remove "$wtpath" 2>/dev/null || git worktree remove --force "$wtpath" || return 1
   echo "✔ removed worktree: $wtpath"
   _gwt_tasks_drop_dir "${wtabs:-$wtpath}" && echo "  ↳ removed from task list"
+  _gwt_status_drop_dir "${wtabs:-$wtpath}"   # drop the agent-state row for the same canonical dir
   ~/.config/cc-stack/cc-trust.sh --remove "${wtabs:-$wtpath}" >/dev/null 2>&1   # clear the pre-trust entry (only pure-trust-signature ones)
   if [[ "$2" == "--branch" ]]; then
     local br="${wtbranch:-feat/$name}"   # real branch when readable; default prefix as fallback (dir without HEAD)

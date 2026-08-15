@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # cc-stack · smoke test (pure logic, no real cmux tab needed). Guards the regressions we've hit:
-#   hook parsing (A path / B cross-repo / $VAR fallback / non-add-doesn't-trigger / CC_WT_PROMPT), tasks-log, prune/drop, trust add/remove.
+#   hook parsing (A path / B cross-repo / $VAR fallback / non-add-doesn't-trigger / CC_WT_PROMPT), tasks-log, prune/drop, trust add/remove,
+#   status-hook (agent-state sidecar writes, Notification classification, gwt-status rendering, install registration).
 # Usage: bash ~/.config/cc-stack/test.sh
 set -u
-CC=~/.config/cc-stack
+# Test the copy of cc-stack this script lives in (a worktree checkout tests itself), fallback to the default install.
+CC="$(cd "$(dirname "$0")" 2>/dev/null && pwd -P)"; CC="${CC:-$HOME/.config/cc-stack}"
 pass=0; fail=0
 ok(){ echo "  ✔ $1"; pass=$((pass+1)); }
 no(){ echo "  ✗ $1  expected[$3] got[$2]"; fail=$((fail+1)); }
@@ -37,6 +39,70 @@ export CC_TASKS_FILE=$(mktemp -u)
 eq "writes 6 fields"        "$(awk -F'\t' 'NR==1{print NF}' "$CC_TASKS_FILE")" "6"
 eq "task sanitized (no tab)" "$(awk -F'\t' 'NR==1{print ($6 ~ /\t/)?"bad":"ok"}' "$CC_TASKS_FILE")" "ok"
 rm -f "$CC_TASKS_FILE"; unset CC_TASKS_FILE
+
+echo "== 2b. cc-status-hook: agent-state sidecar =="
+# Board rows must hold pwd -P-canonical dirs — exactly what cc-tasks-log.sh writes in production
+# (mktemp hands back /var/... which pwd -P resolves to /private/var/... on macOS).
+cn(){ CDPATH= cd -- "$1" >/dev/null 2>&1 && pwd -P; }
+SB="$(cn "$(mktemp -d)")"; NB="$(cn "$(mktemp -d)")"; RD="$(cn "$(mktemp -d)")"   # SB: board dir  NB: not on the board  RD: render-only
+export CC_TASKS_FILE=$(mktemp -u) CC_STATUS_FILE=$(mktemp -u)
+printf '2026-01-01 00:00:00\tfeat/B\tsurface:2\t%s\tsurface:1\tdo B\n' "$SB" > "$CC_TASKS_FILE"
+hj(){ python3 -c 'import json,sys; print(json.dumps({"hook_event_name":sys.argv[1],"cwd":sys.argv[2],"message":sys.argv[3]}))' "$1" "$2" "$3"; }
+hr(){ printf '%s' "$1" | "$CC/cc-status-hook.sh" 2>&1; }                # hook runner: stdout+stderr together
+hs(){ local o rc; o="$(hr "$1")"; rc=$?; eq "$2 silent" "$o" ""; eq "$2 exit0" "$rc" "0"; }   # HARD RULES: prints nothing, exits 0 — every path
+hs "$(hj UserPromptSubmit "$SB" '')" "UPS board-dir"
+eq "UPS writes working"        "$(awk -F'\t' -v d="$SB" '$1==d{print $2}' "$CC_STATUS_FILE")" "working"
+eq "ts is unix epoch"          "$(awk -F'\t' -v d="$SB" '$1==d{print ($3 ~ /^[0-9]+$/)?"ok":"no"}' "$CC_STATUS_FILE")" "ok"
+hs "$(hj Stop "$SB" '')" "Stop board-dir"
+eq "Stop updates to idle"      "$(awk -F'\t' -v d="$SB" '$1==d{print $2}' "$CC_STATUS_FILE")" "idle"
+eq "one row per dir"           "$(wc -l < "$CC_STATUS_FILE" | tr -d ' ')" "1"
+hs "$(hj Notification "$SB" 'Claude needs your permission to use Bash')" "permission notification"
+eq "permission → blocked"      "$(awk -F'\t' -v d="$SB" '$1==d{print $2}' "$CC_STATUS_FILE")" "blocked"
+tsb=$(awk -F'\t' -v d="$SB" '$1==d{print $3}' "$CC_STATUS_FILE"); sleep 1
+hs "$(hj Notification "$SB" 'Task completed successfully')" "non-permission notification"
+eq "non-perm keeps state"      "$(awk -F'\t' -v d="$SB" '$1==d{print $2}' "$CC_STATUS_FILE")" "blocked"
+eq "non-perm keeps ts"         "$(awk -F'\t' -v d="$SB" '$1==d{print $3}' "$CC_STATUS_FILE")" "$tsb"
+hs "$(hj UserPromptSubmit "$NB" '')" "UPS non-board-dir"
+eq "non-board dir writes no row" "$(grep -cF "$NB" "$CC_STATUS_FILE")" "0"
+hs "not json" "malformed stdin"
+hs "" "empty stdin"
+# gwt-status rendering against a fabricated tasks+status pair: working/idle/blocked with age, dash when no row
+RD2="$(cn "$(mktemp -d)")"; RD3="$(cn "$(mktemp -d)")"
+printf '2026-01-01 00:00:00\tfeat/Q\tsurface:4\t%s\tsurface:1\tno status row\n' "$RD"  >> "$CC_TASKS_FILE"
+printf '2026-01-01 00:00:00\tfeat/R\tsurface:5\t%s\tsurface:1\trender R\n' "$RD2" >> "$CC_TASKS_FILE"
+printf '2026-01-01 00:00:00\tfeat/S\tsurface:6\t%s\tsurface:1\trender S\n' "$RD3" >> "$CC_TASKS_FILE"
+now=$(date +%s)
+printf '%s\tworking\t%s\n%s\tidle\t%s\n%s\tblocked\t%s\n' "$RD" $((now-23*60)) "$RD2" $((now-2*3600)) "$RD3" $((now-5*60)) > "$CC_STATUS_FILE"
+ROUT="$(CC_TASKS_FILE="$CC_TASKS_FILE" CC_STATUS_FILE="$CC_STATUS_FILE" zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; gwt-status" 2>/dev/null)"
+eq "render working(23m)"  "$(echo "$ROUT" | grep -c 'working(23m)')" "1"
+eq "render idle(2h)"      "$(echo "$ROUT" | grep -c 'idle(2h)')" "1"
+eq "render blocked(5m)"   "$(echo "$ROUT" | grep -c 'blocked(5m)')" "1"
+eq "render dash w/o row"  "$(echo "$ROUT" | grep -F "$SB" | grep -c ' - ')" "1"
+eq "header has TAB+STATUS" "$(echo "$ROUT" | head -1 | grep -c 'TAB.*STATUS')" "1"
+# gwt-prune sweeps status rows whose dir no longer exists (sidecar stays consistent with the board)
+rm -rf "$RD3"
+CC_TASKS_FILE="$CC_TASKS_FILE" CC_STATUS_FILE="$CC_STATUS_FILE" zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; gwt-prune" >/dev/null 2>&1
+eq "prune sweeps dead status row" "$(grep -cF "$RD3" "$CC_STATUS_FILE")" "0"
+eq "prune keeps live status rows" "$(wc -l < "$CC_STATUS_FILE" | tr -d ' ')" "2"
+# gwt-rm drops the status row of the removed dir (same bookkeeping as the task list)
+RR=$(mktemp -d); ( cd "$RR"; git init -q; git config user.email t@t; git config user.name t; git commit -q --allow-empty -m i
+  mkdir .claude; git worktree add -q .claude/worktrees/wtS -b feat/S >/dev/null )
+SW="$(cd "$RR/.claude/worktrees/wtS" && pwd -P)"
+printf '%s\tidle\t%s\n' "$SW" "$(date +%s)" >> "$CC_STATUS_FILE"
+CC_TASKS_FILE="$CC_TASKS_FILE" CC_STATUS_FILE="$CC_STATUS_FILE" zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; cd '$RR'; gwt-rm wtS" >/dev/null 2>&1
+eq "gwt-rm drops status row" "$(grep -cF "$SW" "$CC_STATUS_FILE" 2>/dev/null)" "0"
+# install.sh registers the three status-hook events, idempotently (re-run never duplicates)
+IH=$(mktemp -d)
+HOME="$IH" bash "$CC/install.sh" --yes --dir "$IH/cc" >/dev/null 2>&1
+sn(){ python3 -c 'import json,sys
+d=json.load(open(sys.argv[1]+"/.claude/settings.json"))
+print(sum(1 for g in d.get("hooks",{}).get(sys.argv[2],[]) or [] for h in (g.get("hooks") or []) if "cc-status-hook" in (h.get("command") or "")))' "$IH" "$1"; }
+eq "install registers UserPromptSubmit" "$(sn UserPromptSubmit)" "1"
+eq "install registers Stop"              "$(sn Stop)" "1"
+eq "install registers Notification"      "$(sn Notification)" "1"
+HOME="$IH" bash "$CC/install.sh" --yes --dir "$IH/cc" >/dev/null 2>&1
+eq "re-install adds no duplicate" "$(sn UserPromptSubmit)+$(sn Stop)+$(sn Notification)" "1+1+1"
+rm -rf "$IH" "$RR" "$SB" "$NB" "$RD" "$RD2"; rm -f "$CC_TASKS_FILE" "$CC_STATUS_FILE"; unset CC_TASKS_FILE CC_STATUS_FILE
 
 echo "== 3. cc-trust add/remove (isolated json) =="
 TJ=$(mktemp); echo '{"projects":{}}' > "$TJ"
@@ -237,7 +303,7 @@ eq "adopt rejects the trunk"          "$arc" "1"
 
 # gwt-rm --branch must resolve the REAL branch (any prefix) from the worktree, not assume feat/<name>
 ( cd "$AR"; git worktree add -q .claude/worktrees/custom-pre -b fix/custom-pre >/dev/null 2>&1 )
-CC_TASKS_FILE=/dev/null zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; cd '$AR'; gwt-rm custom-pre --branch" >/dev/null 2>&1
+CC_TASKS_FILE=/dev/null CC_STATUS_FILE=/dev/null zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; cd '$AR'; gwt-rm custom-pre --branch" >/dev/null 2>&1
 eq "gwt-rm removes the worktree"      "$([ -d "$AR/.claude/worktrees/custom-pre" ] && echo no || echo yes)" "yes"
 eq "gwt-rm deletes custom-prefix branch" "$(git -C "$AR" show-ref --verify --quiet refs/heads/fix/custom-pre && echo still-there || echo gone)" "gone"
 rm -rf "$AR"

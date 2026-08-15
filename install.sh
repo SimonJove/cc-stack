@@ -91,7 +91,7 @@ if [ -n "$SRC" ] && [ "$SRC" != "$DEST" ]; then
   else
     mkdir -p "$DEST"
     ( cd "$SRC" && find . -type f ! -path './.git/*' ! -name '*.bak.*' \
-        ! -name 'worktree-tasks.tsv' ! -name 'cc-failures.log' ! -name '.DS_Store' -print0 ) \
+        ! -name 'worktree-tasks.tsv' ! -name 'worktree-status.tsv' ! -name 'cc-failures.log' ! -name '.DS_Store' -print0 ) \
       | while IFS= read -r -d '' f; do mkdir -p "$DEST/$(dirname "$f")"; cp -p "$SRC/$f" "$DEST/$f"; done
     say "  ✓ installed"
   fi
@@ -129,9 +129,9 @@ say "▸ 4. Claude Code hooks (settings.json)"
 SET="$HOME/.claude/settings.json"; mkdir -p "$HOME/.claude"
 [ -f "$SET" ] || { [ -n "$DRY" ] || echo '{}' > "$SET"; say "  (created settings.json)"; }
 bak "$SET"
-CC_SET="$SET" CC_HOOK="$CCT/cc-worktree-cmux-hook.sh" CC_DRY="$DRY" python3 - <<'PY'
+CC_SET="$SET" CC_HOOK="$CCT/cc-worktree-cmux-hook.sh" CC_STAT="$CCT/cc-status-hook.sh" CC_DRY="$DRY" python3 - <<'PY'
 import json,os,sys,tempfile
-p=os.environ["CC_SET"];hook=os.environ["CC_HOOK"];dry=os.environ.get("CC_DRY","")
+p=os.environ["CC_SET"];hook=os.environ["CC_HOOK"];stat=os.environ["CC_STAT"];dry=os.environ.get("CC_DRY","")
 try: d=json.load(open(p,encoding="utf-8"))
 except Exception: d={}
 if not isinstance(d,dict): d={}
@@ -143,8 +143,13 @@ def has(ev,cmd):
     return False
 added=[]
 if not has("PostToolUse",hook): hk.setdefault("PostToolUse",[]).append({"matcher":"Bash|EnterWorktree","hooks":[{"type":"command","command":hook}]}); added.append("PostToolUse")
+# cc-status-hook.sh: sub-task agent state (working/idle/blocked) for gwt-status's STATUS column.
+# Lifecycle events, not tool events → no matcher key.
+for ev in ("UserPromptSubmit","Stop","Notification"):
+    if not has(ev,stat): hk.setdefault(ev,[]).append({"hooks":[{"type":"command","command":stat}]}); added.append(ev)
 # Migration: cc-notify.sh is gone. Strip any stale hook still pointing at it (Stop/SubagentStop/Notification,
-# which older installs registered). Only the cc-notify command is removed; every other hook is left untouched.
+# which older installs registered). Only the cc-notify command is removed; every other hook is left untouched
+# (the status hook above shares these events and must survive the sweep).
 removed=[]
 for ev in ("Stop","SubagentStop","Notification"):
     groups=hk.get(ev,[]) or []
@@ -159,7 +164,7 @@ for ev in ("Stop","SubagentStop","Notification"):
         removed.append(ev)
         if new_groups: hk[ev]=new_groups
         else: hk.pop(ev,None)            # event emptied → drop the key, keep settings.json tidy
-if not added and not removed: print("  ✓ already in place (PostToolUse present, no stale cc-notify hooks)"); sys.exit(0)
+if not added and not removed: print("  ✓ already in place (all hooks present, nothing stale)"); sys.exit(0)
 if dry:
     msg=[]
     if added: msg.append("would add: "+", ".join(added))
