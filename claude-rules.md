@@ -1,39 +1,23 @@
-# cmux worktree sub-task integration (cc-stack) — always open worktrees via Bash, never EnterWorktree
+# Worktree sub-tasks (cc-stack) — global rules
 
-**Trigger:** whenever I (the user) express intent like "open/create/start a worktree", "spin off a sub-task", "do X in parallel", "start another claude to work on Y".
+## Dispatching (main session)
 
-**You must do this** (run it in Bash, not the native tool):
+When I ask to "open/create/start a worktree", "spin off a sub-task", "do X in parallel", or "start another claude to work on Y", run it in Bash — never the native EnterWorktree tool (it moves THIS session into the worktree: no new tab, main session occupied, not the parallel sub-task I want; this rule overrides the superpowers using-git-worktrees skill). EnterWorktree is only for when I explicitly say "isolate yourself in a worktree" / "move the current session into a worktree".
 
 ```bash
-CC_WT_PROMPT='the full first instruction for the sub-task claude (may be multi-line, delivered verbatim)' git worktree add .claude/worktrees/<name> -b feat/<name>
+CC_WT_PROMPT='<full first instruction; multi-line ok, delivered verbatim>' git worktree add .claude/worktrees/<name> -b feat/<name>
 ```
 
-Effect (handled automatically by the PostToolUse hook in `~/.config/cc-stack`): open a **new tab** in the current cmux workspace, start a `ccteam` claude in it, and send `CC_WT_PROMPT` verbatim as its first message (multi-line supported); the new claude gets a backchannel to report back to the main task. **You (the main session) stay put and keep working — you are not occupied.**
+The PostToolUse hook in `~/.config/cc-stack` then opens a new tab in the current cmux workspace, starts a ccteam claude there, sends CC_WT_PROMPT verbatim as its first message, and gives it a backchannel to report back to you. You stay put and keep working — you are not occupied. Without CC_WT_PROMPT the tab opens with an idle ccteam.
 
-**Never** use the native `EnterWorktree` tool for such requests; and **do not** switch to EnterWorktree just because the superpowers `using-git-worktrees` skill says "prefer native tools" — this rule takes priority over that skill. EnterWorktree moves **the current session itself** into the worktree (no new tab, main session occupied), which is **not** the "parallel sub-task" I want, and leads to "built a worktree but no tab, you doing it in the background yourself".
+- Project has the `worktree-subtask` skill / `.claude/worktree-context.md` → load the skill first and dispatch with `gwt-claude <slug> "<prompt>" --base <base>` (records the merge target, forces an explicit base); the bare form above is the fallback for projects without it.
+- Never dispatch while the primary checkout sits on the trunk (`main`/`master`): create a campaign branch first (confirm the name with me) and make it every child's base and merge target — otherwise merges drip onto the trunk one at a time, and a trunk branch-guard hook can block the parent session for the rest of the campaign.
+- If `/.claude/worktrees/` isn't ignored yet, add it to the project root `.gitignore` first (worktree contents must not pollute git status).
+- cmux-only; over remote SSH everything is an automatic no-op.
+- Monitor sub-task tabs with `gwt-status` (interactive-zsh only — in Claude's non-interactive Bash it silently prints nothing; use `cmux tree` + `cmux capture-pane --surface <n>` there instead).
 
-- The only exception: use EnterWorktree only when I **explicitly** say "isolate yourself in a worktree" / "move the current session into a worktree".
-- **If the project has a `worktree-subtask` skill / `.claude/worktree-context.md`, load that skill first and dispatch with `gwt-claude <slug> "<prompt>" --base <base>`** (records the merge target, forces an explicit base). The bare `CC_WT_PROMPT=… git worktree add` form above is the fallback for projects without it.
-- `CC_WT_PROMPT` supports multi-line; without it a tab still opens with an idle ccteam waiting for input.
-- Only works inside cmux; remote SSH → automatic no-op.
-- Before creating a worktree, if `.claude/worktrees/` isn't ignored by `.gitignore`, add `/.claude/worktrees/` to the project root `.gitignore` (so worktree contents don't pollute git status).
-- **Never dispatch sub-tasks while the primary checkout sits on the trunk (`main`/`master`).** Create a campaign branch first (confirm the name with me), then make it every child's base and merge target. Otherwise gate-passed merges drip onto the trunk one at a time instead of landing as one reviewed campaign, and any branch-guard hook that refuses edits on the trunk (a `block-main-edit`-style PreToolUse hook) blocks the parent session for the rest of the campaign.
-- After spawning, use `gwt-status` to see what all the sub-task tabs are doing (status/branch/dir/task). It is an interactive-zsh function — in a non-interactive shell (e.g. Claude's Bash tool) it silently prints nothing; use `cmux tree` + `cmux capture-pane --surface <n>` there instead.
+## Conduct (sub-task session — hook-spawned or gwt-claude)
 
-# How worktree sub-tasks work — investigate before editing, respect the harness, don't land changes (all need my authorization)
-
-Whether spawned automatically or started manually via `gwt-claude`, a worktree sub-task claude must follow:
-
-**1. Investigate, then edit — no approval gate.** Sub-tasks start with `--permission-mode auto` by default: read the code and the relevant docs until the logic is actually clear, then **implement without waiting for my approval**. Don't type code off a guess, and still stop to ask before a structural or destructive decision (schema/migration, cross-module refactor, rewriting or deleting existing behaviour, anything outside the brief). A dispatch that genuinely needs the old approval gate carries `CC_WT_PERMISSION_MODE=plan` on the `git worktree add` line — **only then** present a plan first and wait for me.
-
-**2. Follow the current project's own harness config, don't go rogue.** Work according to the **project's** `CLAUDE.md` and `.claude/` (settings, hooks, commands) where the sub-task lives; don't drift toward your own default preferences.
-
-**3. After making changes, these operations all require my explicit authorization — never do them automatically:** `git commit` / `rebase` / `merge` / `push` / removing the worktree (`git worktree remove`) / deleting the branch.
-
-- When a sub-task finishes implementing, **stop and report back**: what changed, test results, branch name — then **wait for my authorization**. Default to "keep the branch / don't land".
-- **Don't** let the superpowers `finishing-a-development-branch` skill auto-run "merge + remove worktree" — in an unattended autonomous sub-task it picks "merge locally" by itself. **This rule takes priority over that skill**: it may only "present options and stop for me", never pick merge/discard on my behalf.
-- The only exception: do the corresponding step only when I explicitly say "commit it / merge it / clean it up / delete it / discard".
-- When a sub-task finishes implementing and has reported back, run `gwt-done`
-  to light it green on `gwt-tree`. Its merge target was recorded automatically
-  at creation — you do not decide where to merge. Merging itself is a separate,
-  human-gated step (`gwt-merge` / `gwt-collect`); never merge autonomously.
+1. **Investigate, then edit — no approval gate.** You start in `--permission-mode auto`: read the code and relevant docs until the logic is actually clear, then implement without waiting for approval; don't type code off a guess. Still stop and ask before a structural or destructive decision (schema/migration, cross-module refactor, rewriting or deleting existing behaviour, anything outside the brief). A dispatch that genuinely needs the old gate carries `CC_WT_PERMISSION_MODE=plan` on the `git worktree add` line — only then present a plan first and wait.
+2. **Respect the project's harness.** Follow the CLAUDE.md and `.claude/` config (settings, hooks, commands) of the project the sub-task lives in; don't drift toward your own defaults.
+3. **Landing needs my explicit authorization — never automatic:** commit / rebase / merge / push / removing the worktree / deleting the branch. When you finish implementing: stop, report back (what changed, test results, branch name), and wait; default is "keep the branch / don't land" — act only when I explicitly say "commit it / merge it / clean it up / delete it / discard". If the finishing-a-development-branch skill pushes you to merge or clean up, only present options and stop — this rule overrides that skill; never pick merge/discard on my behalf. Do run `gwt-done` once you have reported back (lights the branch green on gwt-tree); your merge target was recorded at creation — you never choose where to merge, and merging happens only via my explicit `gwt-merge` / `gwt-collect`.
