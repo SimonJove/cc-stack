@@ -54,6 +54,8 @@ cc-send <surface> "<text>"
 **⚠ 失效排查锚点(重点,防 TUI 升级后无法查因)**:见 docs/known-issues.md "cc-send 门卫失效"条目。claude TUI 改版输入区后,症状是"cc-send 不再等待/恒走 fail-open",先跑 read-screen 看输入行形态、对照模式列表。
 **token 账**:门卫 0,消息照旧,等待免费(墙钟非 token)。
 
+**实施注记(2026-08-15,feat/cc-send-impl)**:落地为 `cc-dispatch.sh send`(另有 `calibrate` 复检子命令),四层加固全部就位。实测补充:两种渲染器(claude 2.1.233)输入行**字节级一致**——空态 `❯`+NBSP(非 ASCII 空格),transcript 以 `❯`+ASCII 空格回显已提交消息在活输入框上方,故取**自底向上最后一条命中行**;RDY 探针保持裸 send(目标是全新 shell,无人可撞,且走 cc-send 会每次误报 fail-open 面包屑),trust 应答 Enter 同理保持裸;launch 命令投递经 cc-send 但带 `CC_SEND_QUIET=1`(shell 目标,抑制 fail-open 面包屑)。测试 180 → 215。
+
 ## 3. ~~Feature D · gwt-review(验收 diff 一键看)~~ 已裁剪(2026-08-15)
 
 决定不做:git 客户端已有成熟的分支 diff 功能,再造一个薄包装徒增维护面;

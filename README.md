@@ -92,7 +92,7 @@ CC_WT_PROMPT='the full first instruction for the task (may be multi-line)' git w
 - **Investigate, then edit**: in auto mode (the default) the sub-task researches first and then implements with **no approval round-trip** — structural/destructive decisions still come back to you; `CC_WT_PERMISSION_MODE=plan` restores the old "present a plan and wait" gate;
 - **Respect the project harness**: works per the **sub-task's own project** `CLAUDE.md`/`.claude`, no going rogue;
 - **Don't land changes**: `commit` / `rebase` / `merge` / `push` / remove worktree / delete branch **all require your authorization**, defaulting to "keep the branch";
-- **Backchannel**: the sub-task knows how to `cmux send` a report back to the main task.
+- **Backchannel**: the sub-task reports back via `cc-dispatch.sh send <caller-surface> "<message>"` (the cc-send primitive — it waits out any half-typed line in the target tab instead of colliding with it; raw `cmux send` + Enter is never used).
 
 ### The ways to create a worktree
 
@@ -294,7 +294,7 @@ worktree.zsh                 # gwt-* functions (sourced by .zshrc)
 aliases.zsh                  # ccteam / gwt-test / claude router (sourced by .zshrc)
 cc-claude                    # claude/cld launch router (in cmux → team-ready, remote/subcommands → native)
 cc-hooks.sh                  # ALL Claude Code hook entries: worktree (PostToolUse tab opener) + status (agent-state sidecar writer)
-cc-dispatch.sh               # the dispatch pipeline: wt-claude (gwt-claude) | surface ([single source of truth] open tab + copy .env + pre-trust + start ccteam + send prompt + register, with retries/failure breadcrumb) | workspace (empty workspace for a dir, used by gwt-new)
+cc-dispatch.sh               # the dispatch pipeline: wt-claude (gwt-claude) | surface ([single source of truth] open tab + copy .env + pre-trust + start ccteam + send prompt + register, with retries/failure breadcrumb) | send (cc-send: the collision-safe text+Enter primitive, the only sanctioned injection exit into a running claude tab) | calibrate (re-probe the cc-send patterns on a known-empty tab) | workspace (empty workspace for a dir, used by gwt-new)
 cc-board.sh                  # [the board] renders gwt-status/gwt-log from any shell (bash): tasks+status join, repo filter, tab liveness, prune-on-read; `log` subcommand = single task-registration write point
 cc-merge.sh                  # branch tree: set/get-parent, preflight, do-merge (squash/no-ff), capture, tree (backs gwt-merge/gwt-collect/gwt-tree)
 cc-worktree-shared.sh        # shared test corpus (CC_WT_SHARE): seed into a new worktree, collect back on merge

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# cc-dispatch.sh · THE dispatch pipeline — one script, three subcommands.
+# cc-dispatch.sh · THE dispatch pipeline — one script, five subcommands.
 #   wt-claude <name> <prompt> [--prefix <p>] [--base <b>]   gwt-claude implementation: build/reuse
 #                                                             the worktree, then delegate to surface
 #                                                             [absorbs cc-worktree-claude.sh]
@@ -8,7 +8,130 @@
 #                                                             [absorbs cc-cmux-surface-claude.sh]
 #   workspace <path> [name] [focus]                          open a cmux workspace (empty shell) for a dir
 #                                                             [absorbs cc-cmux-workspace.sh]
+#   send      <surface-ref> "<text>"                         cc-send: the collision-safe text+Enter
+#                                                             primitive — the ONLY sanctioned injection
+#                                                             exit into a running claude tab (both ways)
+#   calibrate <surface-ref> [label]                           re-probe the cc-send input-line patterns
+#                                                             on a tab whose input box is known empty
 set -u
+
+# ─────────────────────────────────────────────────────────────────────────────
+# cc-send — the collision-safe send primitive (roadmap 2b, design finalized 2026-08-15).
+# `cc-dispatch.sh send <surface-ref> "<text>"` replaces every raw `cmux send` + `send-key Enter`
+# pair that injects text into a RUNNING claude tab, both directions (child reports to parent,
+# parent instructs child). A raw send races whatever a human is half-typing into that tab's
+# composer; this gate removes the race (zero token cost — nothing here passes through a model):
+#   input line empty                    → send text + Enter immediately (preempt; nobody typing)
+#   input line has text                 → a human is composing → sleep 0.5, retry (their submit
+#                                         empties the line; the next round preempts)
+#   timeout (CC_SEND_TIMEOUT, def 60s)  → cmux notify desktop reminder once, then KEEP waiting —
+#                                         never drop, never collide
+#   read-screen failure OR unrecognized → fail-open to raw send NOW; NEVER interpret ambiguity
+#                                         as "someone is typing" and hold the message forever
+#
+# Input-line patterns (hardening layer 1+2): a LIST, not one regex, matched bottom-up — the
+# input box is the LAST matching line on screen (transcript echoes never render the prompt at
+# line start; probed). CC_SEND_INPUT_PATTERNS (colon-separated ERE list) REPLACES the defaults;
+# every entry is auto-anchored to line start. Live probe 2026-08-15, claude 2.1.233, BOTH
+# renderers (`tui: fullscreen` via live settings, `tui: default` via --settings override) draw
+# the input line IDENTICALLY: "❯ " between ── rules when empty, "❯ <draft>" while composing.
+# `^❯` is the observed form for both; `^>` is a defensive glyph-variant entry for drift.
+# Breadcrumbs go to cc-failures.log (CC_SEND_FAILLOG overrides; the board surfaces the last
+# 24h): fail-open and calibration misses append a line, so renderer drift is visible the same
+# day. CC_SEND_QUIET=1 suppresses the fail-open breadcrumb for call sites that knowingly target
+# a plain shell (nothing to recognize there — e.g. the launch command right after the RDY probe).
+CCSEND_PATTERNS_DEFAULT='^❯:^>'
+CCSEND_LINES=40        # read-screen window: wide enough that a wrapped draft's prompt line stays in it
+
+_ccsend_eval() {       # stdin: screen text → prints empty|busy|unknown (the state evaluator)
+  awk -v pl="${CC_SEND_INPUT_PATTERNS:-$CCSEND_PATTERNS_DEFAULT}" '
+    BEGIN {
+      n = split(pl, P, ":")
+      nbsp = sprintf("%c", 194) sprintf("%c", 160)   # U+00A0 no-break space, UTF-8 byte pair — the
+                                                     # claude TUI renders the empty input line as
+                                                     # prompt + NBSP cursor placeholder (probed), so
+                                                     # it must count as blank
+    }
+    { L[NR] = $0 }
+    END {
+      for (i = NR; i >= 1; i--) {            # bottom-up: the input box is the LAST matching line
+        for (j = 1; j <= n; j++) {           # (the transcript also echoes submitted messages with
+          p = P[j]; sub(/^\^/, "", p)        # a prompt prefix — always ABOVE the live input box)
+          if (p == "") continue              # empty list entry (trailing/double colon in the env
+                                             # var): match() with an empty pattern hits ANY line
+                                             # with RLENGTH=0 → rest = the whole line → an EMPTY
+                                             # input line would read as BUSY and hold forever
+          if (match(L[i], "^" p)) {
+            rest = substr(L[i], RSTART + RLENGTH)
+            gsub(nbsp, " ", rest)
+            sub(/[ \t\r]+$/, "", rest)       # read-screen padding; a boxed variant is a pattern-
+                                             # list concern, not a tail-stripping concern
+            print (rest ~ /^[ \t\r]*$/) ? "empty" : "busy"
+            exit
+          }
+        }
+      }
+      print "unknown"
+    }'
+}
+
+_ccsend_state() {      # $1 = surface ref → prints empty|busy|unknown (read failure ⇒ unknown)
+  cmux read-screen --surface "$1" --lines "$CCSEND_LINES" 2>/dev/null | _ccsend_eval
+}
+
+_ccsend_crumb() {      # $1 = locator, $2 = message → cc-failures.log (same format as _fail below)
+  echo "[$(date '+%F %T')] $1 — $2" >> "${CC_SEND_FAILLOG:-$HOME/.config/cc-stack/cc-failures.log}" 2>/dev/null || true
+}
+
+_ccsend_raw() {        # $1 = ref, $2 = text — the raw exit point. The Enter is load-bearing beyond
+                       # submission: it also flushes cmux's idle-pane parking (docs/known-issues.md,
+                       # "cmux send to an idle pane parks the message").
+  cmux send --surface "$1" "$2" || { echo "✗ cc-send: cmux send failed for $1" >&2; return 1; }
+  cmux send-key --surface "$1" Enter >/dev/null 2>&1 || true
+}
+
+_ccsend() {            # $1 = surface ref, $2 = text — the gate loop
+  local ref text start now notified to
+  command -v cmux >/dev/null 2>&1 || { echo "✗ cc-send: cmux not found" >&2; return 1; }
+  ref="$1"; text="$2"
+  to="${CC_SEND_TIMEOUT:-60}"; case "$to" in ''|*[!0-9]*) to=60 ;; esac
+  start=$(date +%s); notified=0
+  while :; do
+    case "$(_ccsend_state "$ref")" in
+      empty) break ;;
+      busy)  : ;;
+      *)     # read-screen failure OR unrecognized layout → fail-open NOW (worst case = status quo)
+             [ "${CC_SEND_QUIET:-0}" = "1" ] || \
+               _ccsend_crumb "$ref" "cc-send fail-open: input line unrecognized (raw send, no collision guard) — renderer drift? see docs/known-issues.md"
+             _ccsend_raw "$ref" "$text"; return $? ;;
+    esac
+    now=$(date +%s)
+    if [ "$notified" -eq 0 ] && [ $((now - start)) -ge "$to" ]; then
+      notified=1
+      cmux notify --title "cc-send: message held — input box busy" \
+        --body "surface $ref: a half-typed line has held the message for $((now - start))s; it sends the moment the line clears (never dropped)" \
+        >/dev/null 2>&1 || true
+    fi
+    sleep 0.5
+  done
+  echo "✔ cc-send: delivered to $ref"
+  _ccsend_raw "$ref" "$text"
+}
+
+_ccsend_calibrate() {  # $1 = ref, $2 = dir — self-calibration (hardening layer 4), called right
+                       # after a new tab's TUI is up and its input box is KNOWN empty. A pattern
+                       # miss breadcrumbs so renderer drift is visible the same day (gwt-status
+                       # surfaces cc-failures.log). A failed read-screen (cmux hiccup) is NOT
+                       # drift → skip silently. rc 1 = miss.
+  local scr
+  scr="$(cmux read-screen --surface "$1" --lines "$CCSEND_LINES" 2>/dev/null)" || return 0
+  [ -n "$scr" ] || return 0
+  if [ "$(printf '%s\n' "$scr" | _ccsend_eval)" = "unknown" ]; then
+    _ccsend_crumb "$2" "cc-send calibration: no input-line pattern matched on $1 (renderer drift? update CC_SEND_INPUT_PATTERNS — see docs/known-issues.md)"
+    return 1
+  fi
+  return 0
+}
 
 case "${1:-}" in
 
@@ -151,6 +274,10 @@ done
 [ -n "$marker" ] && : > "$marker" 2>/dev/null || true
 
 # Wait for the shell to be ready (only counts once the marker command's OUTPUT appears, avoiding the shell-init race)
+# RDY stays a RAW send by decision (2026-08-15): the target is the fresh SHELL, not a claude TUI —
+# no pattern can recognize a shell prompt, so cc-send would fail-open on every dispatch (one wasted
+# read-screen + a misleading "renderer drift" breadcrumb). The tab is milliseconds old and
+# unfocused; there is no human typing to collide with.
 ready=""
 cmux send     --surface "$ref" 'echo RDY$((20+2))' >/dev/null 2>&1
 cmux send-key --surface "$ref" Enter               >/dev/null 2>&1
@@ -183,7 +310,7 @@ full="$prompt"
 if [ -n "$prompt" ]; then
   full="$full
 ——[Working agreement] $way1 (2) Follow this project's own CLAUDE.md and .claude config (harness) throughout; don't drift toward your own defaults. (3) After making changes, commit / rebase / merge / push / removing the worktree or branch ALL require human authorization — even if the finishing-a-development-branch skill prompts you, just stop at 'keep the branch'. (4) When you finish implementing and have reported back, run \`gwt-done\` to mark this branch ready; your merge target is already recorded, so you never choose where to merge, and you never merge without my authorization."
-  [ -n "$caller_surface" ] && full="$full (5) To report back / ask the main task: cmux send --surface $caller_surface \"message\" then cmux send-key --surface $caller_surface Enter."
+  [ -n "$caller_surface" ] && full="$full (5) To report back / ask the main task: ~/.config/cc-stack/cc-dispatch.sh send $caller_surface \"message\" — cc-send waits out any half-typed line instead of colliding; never use raw cmux send + Enter."
 fi
 
 # Start the sub-task claude. Key point: don't type the prompt straight into the terminal (a very long line gets shredded,
@@ -204,26 +331,39 @@ pf=""
 if [ -n "$full" ]; then
   pf="${TMPDIR:-/tmp}/cc-wt-prompt.$$.txt"
   printf '%s' "$full" > "$pf"
-  cmux send --surface "$ref" "$launch --permission-mode $pm \"\$(cat '$pf')\"" >/dev/null 2>&1
+  # Routed through cc-send (the single injection exit point). The tab is still a SHELL here — no
+  # claude input box yet — so CC_SEND_QUIET suppresses the fail-open breadcrumb that an
+  # unrecognized shell prompt would otherwise write on every dispatch.
+  ( export CC_SEND_QUIET=1; _ccsend "$ref" "$launch --permission-mode $pm \"\$(cat '$pf')\"" ) >/dev/null 2>&1 || true
 else
-  cmux send --surface "$ref" "$launch --permission-mode $pm" >/dev/null 2>&1
+  ( export CC_SEND_QUIET=1; _ccsend "$ref" "$launch --permission-mode $pm" ) >/dev/null 2>&1 || true
 fi
-cmux send-key --surface "$ref" Enter >/dev/null 2>&1
 
 # Fallback: in case pre-trust didn't take effect (concurrency / schema change), still screen-scrape to confirm "trust this folder".
 # Early exit when the claude TUI is already up (its footer hint is visible) — pre-trust worked, no dialog is coming.
 # Without that second exit the loop idles its full 24×0.25s on EVERY dispatch (hook path is synchronous = main-session latency).
+# tui=1 records that the TUI was SEEN up (feeds the cc-send calibration below). After answering
+# the trust dialog we no longer break blind: sleep and let the loop confirm the TUI, so the
+# calibration never reads a pre-TUI screen and cries "renderer drift".
+tui=""
 for _ in $(seq 1 24); do
   scr="$(cmux read-screen --surface "$ref" --lines 30 2>/dev/null | tr 'A-Z' 'a-z')"
   case "$scr" in
     *trust*folder*|*trust*file*|*trust*director*|*"do you trust"*)
-      cmux send-key --surface "$ref" Enter >/dev/null 2>&1   # highlighted default = "Yes, I trust"
-      break ;;
-    *"esc to interrupt"*|*"? for shortcuts"*|*"ctrl+c to exit"*)
-      break ;;                                              # claude TUI is up → no trust dialog coming
+      cmux send-key --surface "$ref" Enter >/dev/null 2>&1   # keystroke-answering a dialog, NOT text
+                                                             # injection — deliberately stays a raw send-key
+      sleep 1 ;;                                            # dialog leaves; the loop then sees the TUI
+    *"esc to interrupt"*|*"? for shortcuts"*|*"ctrl+c to exit"*|*"-- insert --"*)
+      tui=1; break ;;                                       # claude TUI is up → no trust dialog coming
   esac
   sleep 0.25
 done
+
+# ── cc-send self-calibration (roadmap 2b, hardening layer 4) ──
+# The TUI is up and its input box is KNOWN empty right now: verify a pattern hits it. A miss
+# breadcrumbs to cc-failures.log (the board surfaces it) — renderer drift becomes visible the
+# same day instead of silently degrading every future send to fail-open.
+[ -n "$tui" ] && _ccsend_calibrate "$ref" "$abspath" || true
 
 # claude is up and the prompt is already read into argv by the shell — the temp file can go
 [ -n "$pf" ] && rm -f "$pf" 2>/dev/null
@@ -236,8 +376,44 @@ done
   "$(git -C "${CC_CALLER_CWD:-$PWD}" symbolic-ref --short HEAD 2>/dev/null)"
 
 echo "✔ new tab : $ref  cwd=$abspath  $([ -n "$prompt" ] && echo '(initial prompt sent)' || echo '(idle ccteam)')"
-[ -n "$caller_surface" ] && echo "✔ backchannel: the new claude can report back via cmux send --surface $caller_surface"
+[ -n "$caller_surface" ] && echo "✔ backchannel: the new claude can report back via cc-dispatch.sh send $caller_surface \"<message>\""
 exit 0
+;;
+
+# ─────────────────────────────────────────────────────────────────────────────
+# send — cc-send, the collision-safe send primitive (roadmap 2b). The ONLY sanctioned way to
+#   inject text + Enter into a RUNNING claude tab, both directions (child reports to parent,
+#   parent instructs child). Reads the target's input line via read-screen, waits out any
+#   half-typed draft instead of colliding with it, fail-opens to raw send when the layout is
+#   unrecognized. Gate semantics + pattern list: see the cc-send block at the top of this file.
+# Usage: cc-dispatch.sh send <surface-ref> "<text>"
+# Related env: CC_SEND_TIMEOUT (notify threshold, default 60s), CC_SEND_INPUT_PATTERNS
+#   (colon-separated ERE list, replaces the defaults), CC_SEND_FAILLOG (breadcrumb path),
+#   CC_SEND_QUIET=1 (suppress the fail-open breadcrumb — for shell-targeting call sites only)
+send)
+shift
+ref="${1:-}"; text="${2:-}"
+[ -n "$ref" ] && [ -n "$text" ] || { echo 'usage: cc-dispatch.sh send <surface-ref> "<text>"' >&2; exit 2; }
+_ccsend "$ref" "$text"
+exit $?
+;;
+
+# ─────────────────────────────────────────────────────────────────────────────
+# calibrate — re-run the cc-send self-calibration against any tab whose input box is known
+#   empty (an idle claude nobody is typing into). This is the step-3 probe documented in
+#   docs/known-issues.md "cc-send 门卫失效": after a TUI upgrade, run this to see whether the
+#   current pattern list still hits the live input-line form. rc 1 + breadcrumb on a miss.
+# Usage: cc-dispatch.sh calibrate <surface-ref> [label]
+calibrate)
+shift
+ref="${1:-}"; where="${2:-$ref}"
+[ -n "$ref" ] || { echo "usage: cc-dispatch.sh calibrate <surface-ref> [label]" >&2; exit 2; }
+if _ccsend_calibrate "$ref" "$where"; then
+  echo "✔ cc-send calibration: input-line pattern matched on $ref"
+else
+  echo "✗ cc-send calibration: pattern MISS on $ref (breadcrumb written) — see docs/known-issues.md" >&2
+  exit 1
+fi
 ;;
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -268,5 +444,5 @@ exec cmux new-workspace --name "$name" --cwd "$abspath" --focus "$focus"
 ;;
 
 *)
-  echo "usage: cc-dispatch.sh wt-claude <name> <prompt> [--prefix <p>] [--base <b>] | surface <path> [prompt] | workspace <path> [name] [focus]" >&2; exit 2 ;;
+  echo "usage: cc-dispatch.sh wt-claude <name> <prompt> [--prefix <p>] [--base <b>] | surface <path> [prompt] | send <surface-ref> \"<text>\" | calibrate <surface-ref> [label] | workspace <path> [name] [focus]" >&2; exit 2 ;;
 esac

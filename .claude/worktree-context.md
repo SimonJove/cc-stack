@@ -16,7 +16,7 @@
 
 ## Script map (post-consolidation, 10 → 6 .sh)
 - cc-hooks.sh — ALL hook entries: `worktree` (PostToolUse tab opener) | `status` (agent-state sidecar)
-- cc-dispatch.sh — dispatch pipeline: `wt-claude` (gwt-claude) | `surface` (single tab-opening source of truth) | `workspace`
+- cc-dispatch.sh — dispatch pipeline: `wt-claude` (gwt-claude) | `surface` (single tab-opening source of truth) | `send` (cc-send: collision-safe text+Enter primitive, the only sanctioned injection exit) | `calibrate` (cc-send pattern re-probe) | `workspace`
 - cc-board.sh — board render (`--all`/`--archive`) + `log` subcommand (the single task-registration write point)
 - unchanged: cc-merge.sh, cc-trust.sh, cc-worktree-shared.sh (+ the cc-claude router); install.sh registers the hooks and strips stale pre-consolidation registrations
 

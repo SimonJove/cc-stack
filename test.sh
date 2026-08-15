@@ -456,6 +456,131 @@ grep -q 'CC_LAUNCH_FILE' "$CC/cc-dispatch.sh" && ok "surface reads provider conf
 grep -q 'cld \$_provider' "$CC/cc-dispatch.sh" && ok "surface maps provider→cld" || no "surface maps provider→cld" missing present
 
 echo ""
+echo "== 16. cc-send (roadmap 2b: collision-safe send primitive) =="
+# fake-cmux harness: a fake `cmux` on PATH records send/send-key/notify into $CC_FAKE_LOG and
+# serves $CC_FAKE_SCREEN from read-screen. CC_FAKE_CLEAR_AT=N flips the screen to the empty
+# input line on the Nth read (the human submits their draft); CC_FAKE_FAIL=1 makes read-screen
+# fail (cmux hiccup). CC_SEND_FAILLOG keeps breadcrumbs off the live cc-failures.log.
+FS=$(mktemp -d); export CC_FAKE_LOG="$FS/log"; export CC_FAKE_SCREEN="$FS/screen"
+cat > "$FS/cmux" <<'CMUX'
+#!/usr/bin/env bash
+case "$1" in
+  ping) exit 0 ;;
+  send)     shift; printf 'SEND|%s\n'  "$*" >> "$CC_FAKE_LOG" ;;
+  send-key) shift; printf 'KEY|%s\n'   "$*">> "$CC_FAKE_LOG" ;;
+  notify)   shift; printf 'NOTIFY|%s\n' "$*" >> "$CC_FAKE_LOG" ;;
+  read-screen)
+    [ -n "${CC_FAKE_FAIL:-}" ] && exit 1
+    if [ -n "${CC_FAKE_CLEAR_AT:-}" ]; then
+      n=$(( $(cat "${CC_FAKE_LOG}.cnt" 2>/dev/null || echo 0) + 1 )); echo "$n" > "${CC_FAKE_LOG}.cnt"
+      [ "$n" -ge "$CC_FAKE_CLEAR_AT" ] && printf '\xe2\x9d\xaf\xc2\xa0\n' > "$CC_FAKE_SCREEN"
+    fi
+    cat "$CC_FAKE_SCREEN" 2>/dev/null ;;
+esac
+exit 0
+CMUX
+chmod +x "$FS/cmux"
+FL="$FS/failures.log"
+csend_reset(){ : > "$CC_FAKE_LOG"; rm -f "${CC_FAKE_LOG}.cnt"; rm -f "$FL"; cp "$1" "$CC_FAKE_SCREEN"; }
+OPATH="$PATH"; PATH="$FS:$PATH"
+# byte-exact fixtures from the 2026-08-15 live probes (claude 2.1.233, BOTH renderers):
+# empty input line = prompt glyph + U+00A0 NBSP cursor placeholder; composing = + draft; the
+# transcript echoes submitted messages as prompt + ASCII space + text (ABOVE the live box).
+P='❯'; NB="$(printf '\xc2\xa0')"; R20='────────────────────────────'
+fw(){ echo ""; echo "$R20"; printf '%s%s\n' "$P" "$NB"; echo "$R20"; echo "  glm-5.3[1m] 7% / session"; echo "  -- INSERT -- auto mode on"; }
+{ echo "╰──────────╯"; fw; }                                        > "$FS/scr-def-empty"   # default renderer
+{ fw; }                                                            > "$FS/scr-full-empty"  # fullscreen renderer
+{ echo "$R20"; printf '%s%s%s\n' "$P" "$NB" 'user typing draft text 123'; echo "$R20"; echo "  status"; } > "$FS/scr-busy"
+{ echo ""; printf '%s %s\n' "$P" 'fullscreen draft xyzparked draft for smoke2'; fw; } > "$FS/scr-echo"   # transcript echo ABOVE empty live box
+{ echo "$ last login"; echo "PROMPT> "; }                          > "$FS/scr-prompt"     # no claude TUI at all
+# 1) empty input line → immediate send (both renderer fixtures), no notify, no crumb
+csend_reset "$FS/scr-full-empty"
+CC_SEND_FAILLOG="$FL" bash "$CC/cc-dispatch.sh" send surface:1 "hello gate" >/dev/null 2>&1; rcs=$?
+eq "fullscreen empty rc0"       "$rcs" "0"
+eq "fullscreen empty sends"     "$(grep -cF 'hello gate' "$CC_FAKE_LOG")" "1"
+eq "fullscreen empty Enter"     "$(grep -c 'KEY|.*Enter' "$CC_FAKE_LOG")" "1"
+eq "fullscreen empty no notify" "$(grep -c 'NOTIFY|' "$CC_FAKE_LOG")" "0"
+eq "fullscreen empty no crumb"  "$([ -f "$FL" ] && echo yes || echo no)" "no"
+csend_reset "$FS/scr-def-empty"
+CC_SEND_FAILLOG="$FL" bash "$CC/cc-dispatch.sh" send surface:1 "hi default" >/dev/null 2>&1
+eq "default empty sends"        "$(grep -cF 'hi default' "$CC_FAKE_LOG")" "1"
+eq "default empty no crumb"     "$([ -f "$FL" ] && echo yes || echo no)" "no"
+# 2) transcript echo (busy-looking, prompt+ASCII space) must NOT beat the live empty box
+csend_reset "$FS/scr-echo"
+CC_SEND_FAILLOG="$FL" bash "$CC/cc-dispatch.sh" send surface:1 "beat the echo" >/dev/null 2>&1
+eq "echo-above still sends"     "$(grep -cF 'beat the echo' "$CC_FAKE_LOG")" "1"
+eq "echo-above no crumb"        "$([ -f "$FL" ] && echo yes || echo no)" "no"
+# 3) composing → waits, sends after the line clears (CLEAR_AT=3 → two 0.5s waits)
+csend_reset "$FS/scr-busy"
+t0=$(date +%s)
+CC_FAKE_CLEAR_AT=3 CC_SEND_FAILLOG="$FL" bash "$CC/cc-dispatch.sh" send surface:1 "after clear" >/dev/null 2>&1
+t1=$(date +%s)
+eq "busy waits (≥1s)"           "$(( t1 - t0 >= 1 ))" "1"
+eq "busy sends after clear"     "$(grep -cF 'after clear' "$CC_FAKE_LOG")" "1"
+eq "busy no notify (60s def)"   "$(grep -c 'NOTIFY|' "$CC_FAKE_LOG")" "0"
+# 4) timeout (short env override) → notify fired once, KEEPS waiting, still delivers after clear
+csend_reset "$FS/scr-busy"
+t0=$(date +%s)
+CC_SEND_TIMEOUT=1 CC_FAKE_CLEAR_AT=6 CC_SEND_FAILLOG="$FL" bash "$CC/cc-dispatch.sh" send surface:1 "held msg" >/dev/null 2>&1
+t1=$(date +%s)
+eq "timeout notifies once"      "$(grep -c 'NOTIFY|' "$CC_FAKE_LOG")" "1"
+eq "timeout kept waiting (≥2s)" "$(( t1 - t0 >= 2 ))" "1"
+eq "timeout never drops"        "$(grep -cF 'held msg' "$CC_FAKE_LOG")" "1"
+nline=$(grep -n 'NOTIFY|' "$CC_FAKE_LOG" | cut -d: -f1); sline=$(grep -n 'SEND|' "$CC_FAKE_LOG" | head -1 | cut -d: -f1)
+[ "$nline" -lt "$sline" ] && ok "notify precedes send" || no "notify precedes send" "$nline" "< $sline"
+# 5) read-screen failure → fail-open raw send + breadcrumb; CC_SEND_QUIET suppresses the crumb
+csend_reset "$FS/scr-busy"
+CC_FAKE_FAIL=1 CC_SEND_FAILLOG="$FL" bash "$CC/cc-dispatch.sh" send surface:1 "failopen" >/dev/null 2>&1; rcs=$?
+eq "read-fail rc0 (sent)"       "$rcs" "0"
+eq "read-fail sends anyway"     "$(grep -cF 'failopen' "$CC_FAKE_LOG")" "1"
+eq "read-fail crumbs"           "$(grep -c 'fail-open' "$FL" 2>/dev/null)" "1"
+csend_reset "$FS/scr-busy"
+CC_FAKE_FAIL=1 CC_SEND_QUIET=1 CC_SEND_FAILLOG="$FL" bash "$CC/cc-dispatch.sh" send surface:1 "quiet" >/dev/null 2>&1
+eq "quiet sends"                "$(grep -cF 'quiet' "$CC_FAKE_LOG")" "1"
+eq "quiet no crumb"             "$([ -f "$FL" ] && echo yes || echo no)" "no"
+# 6) CC_SEND_INPUT_PATTERNS REPLACES the defaults (no union), auto-anchored at line start
+csend_reset "$FS/scr-prompt"
+CC_SEND_FAILLOG="$FL" bash "$CC/cc-dispatch.sh" send surface:1 "foreign layout" >/dev/null 2>&1
+eq "foreign layout fail-opens"  "$(grep -c 'fail-open' "$FL" 2>/dev/null)" "1"
+csend_reset "$FS/scr-prompt"
+CC_SEND_INPUT_PATTERNS='PROMPT>' CC_SEND_FAILLOG="$FL" bash "$CC/cc-dispatch.sh" send surface:1 "custom pat" >/dev/null 2>&1
+eq "override matches new form"  "$(grep -cF 'custom pat' "$CC_FAKE_LOG")" "1"
+eq "override no crumb"          "$([ -f "$FL" ] && echo yes || echo no)" "no"
+csend_reset "$FS/scr-busy"
+CC_SEND_INPUT_PATTERNS='PROMPT>' CC_SEND_FAILLOG="$FL" bash "$CC/cc-dispatch.sh" send surface:1 "no union" >/dev/null 2>&1
+eq "override replaces defaults" "$(grep -c 'fail-open' "$FL" 2>/dev/null)" "1"
+# 6b) empty list entries (trailing/double colon — one-char typo in the drift-recovery knob) must
+# be skipped, NOT treated as match-anything: an empty pattern hits any line with RLENGTH=0, rest
+# becomes the whole line, and an EMPTY input line would read BUSY → silent hold-forever
+csend_reset "$FS/scr-full-empty"
+CC_SEND_INPUT_PATTERNS='^❯:' CC_SEND_FAILLOG="$FL" bash "$CC/cc-dispatch.sh" send surface:1 "trailcolon" >/dev/null 2>&1
+eq "trailing-colon still sends"  "$(grep -cF 'trailcolon' "$CC_FAKE_LOG")" "1"
+eq "trailing-colon no crumb"     "$([ -f "$FL" ] && echo yes || echo no)" "no"
+csend_reset "$FS/scr-full-empty"
+CC_SEND_INPUT_PATTERNS='^❯::^>' CC_SEND_FAILLOG="$FL" bash "$CC/cc-dispatch.sh" send surface:1 "dblcolon" >/dev/null 2>&1
+eq "double-colon still sends"    "$(grep -cF 'dblcolon' "$CC_FAKE_LOG")" "1"
+eq "double-colon no crumb"       "$([ -f "$FL" ] && echo yes || echo no)" "no"
+# 7) calibration: breadcrumb on pattern miss; hit stays silent; read-fail is not drift
+csend_reset "$FS/scr-prompt"
+CC_SEND_FAILLOG="$FL" bash "$CC/cc-dispatch.sh" calibrate surface:9 /tmp/cal-x >/dev/null 2>&1; rcs=$?
+eq "calibrate miss rc1"         "$rcs" "1"
+eq "calibrate miss crumbs"      "$(grep -c 'calibration' "$FL" 2>/dev/null)" "1"
+csend_reset "$FS/scr-full-empty"
+CC_SEND_FAILLOG="$FL" bash "$CC/cc-dispatch.sh" calibrate surface:9 /tmp/cal-x >/dev/null 2>&1; rcs=$?
+eq "calibrate hit rc0"          "$rcs" "0"
+eq "calibrate hit no crumb"     "$([ -f "$FL" ] && echo yes || echo no)" "no"
+csend_reset "$FS/scr-prompt"
+CC_FAKE_FAIL=1 CC_SEND_FAILLOG="$FL" bash "$CC/cc-dispatch.sh" calibrate surface:9 /tmp/cal-x >/dev/null 2>&1; rcs=$?
+eq "calibrate read-fail skip"   "$rcs" "0"
+eq "calibrate read-fail quiet"  "$([ -f "$FL" ] && echo yes || echo no)" "no"
+# 8) usage + migration surface: raw `cmux send` remains ONLY at the RDY exception + the raw exit
+bash "$CC/cc-dispatch.sh" send >/dev/null 2>&1; eq "send usage rc2" "$?" "2"
+eq "raw cmux send sites = RDY + raw-exit" "$(grep -cE '^[[:space:]]*cmux send ' "$CC/cc-dispatch.sh")" "2"
+eq "cc-hooks.sh has no send site"         "$(grep -c 'cmux send' "$CC/cc-hooks.sh")" "0"
+grep -q 'cc-dispatch.sh send \$caller_surface' "$CC/cc-dispatch.sh" && ok "backchannel teaches cc-send" || no "backchannel teaches cc-send" missing present
+PATH="$OPATH"; unset CC_FAKE_LOG CC_FAKE_SCREEN; rm -rf "$FS"
+
+echo ""
 echo "== syntax =="
 for s in "$CC"/*.sh; do bash -n "$s" && : || { echo "  ✗ syntax $s"; fail=$((fail+1)); }; done
 zsh -n "$CC/worktree.zsh" && ok "worktree.zsh syntax" || { no "worktree.zsh syntax" x x; }

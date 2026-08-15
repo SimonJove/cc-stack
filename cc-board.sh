@@ -191,12 +191,12 @@ if [ -z "$archive" ]; then
   if [ -n "$live" ] && [ -z "$some_live" ]; then
     echo "(note: all registered surface refs are stale — cmux was probably restarted → status shows '?old-session'; dirs still exist, cleanup unaffected)"
   fi
-  # failure breadcrumb: "built a worktree but no tab" failures in the last 24h
+  # failure breadcrumb: "built a worktree but no tab" + cc-send fail-open/calibration lines, last 24h
   flog="$HOME/.config/cc-stack/cc-failures.log"
   if [ -f "$flog" ]; then
     recent="$(awk -v cut="$(date -v-1d '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo 0)" '$0 >= "["cut' "$flog" 2>/dev/null | tail -3)"
     if [ -n "$recent" ]; then
-      echo "⚠ recent worktrees that failed to open a tab (fix with gwt-claude):"
+      echo "⚠ recent dispatch/cc-send failures (see cc-failures.log):"
       printf '%s\n' "$recent" | sed 's/^/   /'
     fi
   fi
