@@ -390,6 +390,7 @@ gwt-rm() {
   [[ -n "$name" ]] || { echo "usage: gwt-rm <name> [--branch]"; return 1 }
   local wtpath="$(_gwt_dir)/$name"
   local wtabs; wtabs="$(cd "$wtpath" 2>/dev/null && pwd -P)"   # canonical path (before removal) for bookkeeping
+  local wtbranch; wtbranch="$(git -C "$wtpath" symbolic-ref --short HEAD 2>/dev/null)"   # real branch, any prefix (captured before removal)
   # Merge the worktree's shared corpus (new e2e tests) back into the main repo BEFORE removal, so
   # nothing is lost. Same-name-different-content clashes are preserved as <name>.from-<branch>.<ext>.
   if [[ -n "$CC_WT_SHARE" && -d "$wtpath" ]]; then
@@ -405,8 +406,12 @@ gwt-rm() {
   echo "✔ removed worktree: $wtpath"
   _gwt_tasks_drop_dir "${wtabs:-$wtpath}" && echo "  ↳ removed from task list"
   ~/.config/cc-stack/cc-trust.sh --remove "${wtabs:-$wtpath}" >/dev/null 2>&1   # clear the pre-trust entry (only pure-trust-signature ones)
-  [[ "$2" == "--branch" ]] && { git branch -D "feat/$name" 2>/dev/null && echo "✔ deleted branch feat/$name" }
-  [[ "$2" == "--branch" ]] && git config --remove-section "branch.feat/$name" 2>/dev/null   # drop ccMergeInto/ccDone
+  if [[ "$2" == "--branch" ]]; then
+    local br="${wtbranch:-feat/$name}"   # real branch when readable; default prefix as fallback (dir without HEAD)
+    if git branch -D "$br" 2>/dev/null; then echo "✔ deleted branch $br"
+    else echo "⚠ could not delete branch $br (already gone / merged elsewhere?)"; fi
+    git config --remove-section "branch.$br" 2>/dev/null   # drop ccMergeInto/ccDone
+  fi
   return 0
 }
 
