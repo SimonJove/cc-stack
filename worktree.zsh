@@ -34,6 +34,29 @@ _gwt_ensure_ignore() {
   printf '%s\n' "$entry" >> "$gi" && echo "  ↳ .gitignore now ignores $entry"
 }
 
+# _gwt_bootstrap_wt <root> <wtpath> <branch> [base=HEAD] — the shared "stand up a worktree" block:
+# gitignore guard → worktree add (reuse the branch if it exists, else create from <base>) →
+# copy CC_WT_COPY files → seed the shared corpus. Single home for gwt-new AND gwt-adopt.
+_gwt_bootstrap_wt() {
+  emulate -L zsh
+  local root="$1" wtpath="$2" branch="$3" base="${4:-HEAD}"
+  local wtdir="${wtpath:h}" rel="${wtdir#$root/}"                 # .claude/worktrees or .worktrees
+  _gwt_ensure_ignore "$root" "/$rel/"
+  mkdir -p "$wtdir"
+  if git -C "$root" show-ref --verify --quiet "refs/heads/$branch"; then
+    git -C "$root" worktree add "$wtpath" "$branch" || return 1
+  else
+    git -C "$root" worktree add "$wtpath" -b "$branch" "$base" || return 1
+  fi
+  local f
+  for f in ${(s: :)CC_WT_COPY}; do
+    if [[ -f "$root/$f" ]]; then
+      mkdir -p "$wtpath/${f:h}"; cp -p "$root/$f" "$wtpath/$f" && echo "  ↳ copied $f"
+    fi
+  done
+  [[ -n "$CC_WT_SHARE" ]] && ~/.config/cc-stack/cc-worktree-shared.sh seed "$root" "$wtpath" ${(s: :)CC_WT_SHARE}
+}
+
 # ── Task list (worktree-tasks.tsv) maintenance ───────────────────────────────
 _gwt_tasks_file() { echo "${CC_TASKS_FILE:-$HOME/.config/cc-stack/worktree-tasks.tsv}" }
 
@@ -75,23 +98,8 @@ gwt-new() {
   local name="$1" prefix="${2:-feat}" base="${3:-HEAD}"
   [[ -n "$name" ]] || { echo "usage: gwt-new <name> [branch-prefix=feat] [base=HEAD]"; return 1 }
   local root; root="$(_gwt_root)" || { echo "✗ not inside a git repo"; return 1 }
-  local wtdir; wtdir="$(_gwt_dir)"
-  local rel="${wtdir#$root/}"                 # .claude/worktrees or .worktrees
-  _gwt_ensure_ignore "$root" "/$rel/"
-  local wtpath="$wtdir/$name" branch="$prefix/$name"
-  mkdir -p "$wtdir"
-  if git show-ref --verify --quiet "refs/heads/$branch"; then
-    git worktree add "$wtpath" "$branch" || return 1
-  else
-    git worktree add "$wtpath" -b "$branch" "$base" || return 1
-  fi
-  local f
-  for f in ${(s: :)CC_WT_COPY}; do
-    if [[ -f "$root/$f" ]]; then
-      mkdir -p "$wtpath/${f:h}"; cp -p "$root/$f" "$wtpath/$f" && echo "  ↳ copied $f"
-    fi
-  done
-  [[ -n "$CC_WT_SHARE" ]] && ~/.config/cc-stack/cc-worktree-shared.sh seed "$root" "$wtpath" ${(s: :)CC_WT_SHARE}
+  local wtpath="$(_gwt_dir)/$name" branch="$prefix/$name"
+  _gwt_bootstrap_wt "$root" "$wtpath" "$branch" "$base" || return 1
   echo "✔ worktree: $wtpath   branch: $branch"
   ~/.config/cc-stack/cc-merge.sh capture "$root" "$branch" "$PWD" >/dev/null 2>&1
   # When inside cmux, open a workspace (empty shell, focus it) for this worktree; no-op when not in cmux
@@ -135,20 +143,9 @@ gwt-adopt() {
   if git -C "$root" worktree list --porcelain | grep -qxF "branch refs/heads/$branch"; then
     echo "  ↳ $branch already has a worktree; leaving it in place"; return 0
   fi
-  local wtdir; wtdir="$(_gwt_dir)"
-  local rel="${wtdir#$root/}"
-  _gwt_ensure_ignore "$root" "/$rel/"
   local name="${branch//\//-}"                 # feature/x → feature-x (collision-free dir)
-  local wtpath="$wtdir/$name"
-  mkdir -p "$wtdir"
-  git -C "$root" worktree add "$wtpath" "$branch" || return 1
-  local f
-  for f in ${(s: :)CC_WT_COPY}; do
-    if [[ -f "$root/$f" ]]; then
-      mkdir -p "$wtpath/${f:h}"; cp -p "$root/$f" "$wtpath/$f" && echo "  ↳ copied $f"
-    fi
-  done
-  [[ -n "$CC_WT_SHARE" ]] && ~/.config/cc-stack/cc-worktree-shared.sh seed "$root" "$wtpath" ${(s: :)CC_WT_SHARE}
+  local wtpath="$(_gwt_dir)/$name"
+  _gwt_bootstrap_wt "$root" "$wtpath" "$branch" || return 1
   echo "  ↳ worktree: $wtpath"
   # focus=false: enrolling a branch must not yank you out of what you're doing.
   ~/.config/cc-stack/cc-cmux-workspace.sh "$wtpath" "$name" false >/dev/null 2>&1
