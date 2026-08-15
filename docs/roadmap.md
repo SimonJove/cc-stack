@@ -17,12 +17,10 @@ cc-* 脚本 10→6 收拢重构(install 自动迁移)、审计修复 P1-P4、hoo
 - TSV 刷新新 surface ref;状态侧列清旧行;
 - 注意:cc-dispatch.sh surface 目前首发 prompt,需要一个 no-prompt + resume 变体或参数。
 
-## 3. Feature D · gwt-review(验收 diff 一键看)
+## 3. ~~Feature D · gwt-review(验收 diff 一键看)~~ 已裁剪(2026-08-15)
 
-痛点:gate 通过后想人眼看完整 diff,得手敲 git diff。
-设计要点(已讨论):`gwt-review <name>` 包装 cmux 内置 diff viewer
-(`cmux diff --source <branch> --base <merge-target> --focus true`),target 从 ccMergeInto 取。
-低成本:一个薄 zsh 函数 + README 一行 + 一两条测试。
+决定不做:git 客户端已有成熟的分支 diff 功能,再造一个薄包装徒增维护面;
+功能克制优先(用户决定)。
 
 ## 工作流备忘
 
