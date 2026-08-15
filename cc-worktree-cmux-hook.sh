@@ -28,7 +28,7 @@ case "$input" in
   *) exit 0 ;;
 esac
 
-# cmux available? if we can't reach it (remote/Zellij/not installed), silently skip
+# cmux available? if we can't reach it (remote/not installed), silently skip
 command -v cmux >/dev/null 2>&1 || exit 0
 cmux ping >/dev/null 2>&1 || exit 0
 

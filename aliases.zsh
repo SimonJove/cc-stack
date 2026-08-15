@@ -6,7 +6,7 @@
 alias ccteam='cmux claude-teams --teammate-mode in-process'
 
 # By default, run claude (and cld) in cmux as "team-ready" (= cmux claude-teams) — teammates can be spawned mid-task.
-# Subcommands (mcp/config…), headless (-p), remote (SSH/Zellij) auto-route to native claude.
+# Subcommands (mcp/config…), headless (-p), remote (SSH) auto-route to native claude.
 # Force native temporarily:  command claude …  or  \claude …
 claude() { ~/.config/cc-stack/cc-claude "$@" }
 
@@ -16,7 +16,3 @@ alias gwt-claude='~/.config/cc-stack/cc-worktree-claude.sh'
 
 # cc-stack self-test: run the smoke test in one command (self-check for regressions after editing cc-stack)
 alias gwt-test='bash ~/.config/cc-stack/test.sh'
-
-# SSH+Zellij fallback channel: attach/create the persistent local session "main"
-# Connect from a remote machine:  ssh <mini-tailscale-host> -t 'zellij attach -c main'
-alias zmain='zellij attach -c main'

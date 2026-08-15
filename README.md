@@ -15,21 +15,19 @@ Around that: a task board (`gwt-status`), lifecycle management (`gwt-*`), a one-
 - [Architecture & data flow](#architecture--data-flow)
 - [Troubleshooting](#troubleshooting)
 - [File list](#file-list)
-- [SSH + Zellij fallback channel](#ssh--zellij-fallback-channel)
 - [cmux.json key settings](#cmuxjson-key-settings)
 - [Rollback](#rollback)
 
 ---
 
-## Three channels
+## Two channels
 
 | Channel | When | How |
 |------|--------|--------|
 | **Local main** | sitting at the mac mini | **cmux native teams** (`ccteam` = `cmux claude-teams --teammate-mode in-process`) — teammates/subagents stay in-process: no split panes, no lost completion events; named-pane teammates still available per-launch by appending `--teammate-mode auto` (last flag wins) |
 | **Remote live view** | connecting back to the mini from another machine | **screen sharing + Tailscale** — you see the same still-running cmux, all sessions continue as-is |
-| **Lightweight terminal fallback** | low bandwidth / phone / pure terminal SSH | **SSH + Zellij** — attach the mini's persistent zellij session, survives disconnects |
 
-> Design point: local agent orchestration goes to **cmux**; **Zellij is only a fallback terminal channel**.
+> Design point: local agent orchestration goes to **cmux**; for terminal-only remote access cmux has its own `cmux ssh` / remotes / iOS client. (A former SSH + Zellij fallback channel was removed — zellij is no longer installed.)
 
 ---
 
@@ -105,7 +103,7 @@ CC_WT_PROMPT='the full first instruction for the task (may be multi-line)' git w
 | `gwt-claude <name> "<prompt>"` (manual) | you | ✅ same as the Bash path, one command (also copies `.env`) |
 | `gwt-new <name>` (manual) | you | just builds a worktree + opens an empty workspace, no claude |
 
-> Not inside cmux (remote SSH / Zellij) → everything is a **safe no-op**.
+> Not inside cmux (remote SSH) → everything is a **safe no-op**.
 
 ---
 
@@ -152,7 +150,6 @@ gwt-status                     # board: status (✔live/⌫closed/?old-session) 
 gwt-rm <name> [--branch]       # remove worktree (+ clear task record + clear pre-trust; optionally the branch)
 gwt-prune                      # compact the task list (drop dead records + keep newest per dir)
 gwt-clean                      # git worktree prune + show current state
-gwt-fan                        # zellij only: fan each worktree into a pane running claude
 gwt-provider <name>            # set AI provider for NEW sub-tasks: kimi|glm|anthropic (team mode either way; existing unchanged); no arg lists current + available
 gwt-help                       # command cheatsheet
 gwt-test                       # run the smoke test (self-check for regressions after editing cc-stack)
@@ -233,7 +230,7 @@ worktree-tasks.tsv  ──►  gwt-status (reads the list + judges liveness via 
 
 ```
 worktree.zsh                 # gwt-* functions (sourced by .zshrc)
-aliases.zsh                  # ccteam / zmain / gwt-test / claude router (sourced by .zshrc)
+aliases.zsh                  # ccteam / gwt-test / claude router (sourced by .zshrc)
 cc-claude                    # claude/cld launch router (in cmux → team-ready, remote/subcommands → native)
 cc-worktree-cmux-hook.sh     # PostToolUse(Bash) hook: git worktree add → call the surface script
 cc-cmux-surface-claude.sh    # [single source of truth] open tab + copy .env + pre-trust + start ccteam(plan) + send prompt + register (with retries/failure breadcrumb)
@@ -241,7 +238,6 @@ cc-worktree-claude.sh        # gwt-claude: build worktree + ensure .gitignore, d
 cc-cmux-workspace.sh         # used by gwt-new: open an empty workspace for a dir (no-op when not in cmux)
 cc-tasks-log.sh              # single task-registration entry point (keeps TSV format consistent)
 cc-trust.sh                  # pre-authorize/revoke trust for a dir (edits ~/.claude.json, atomic write, only adds/removes pure-trust signatures)
-cc-zellij-fan.sh             # worktree fan-out (zellij fallback channel)
 claude-rules.md              # single source of the global CLAUDE.md worktree rules (install syncs it into the managed block)
 install.sh                   # one-command install/repair (idempotent/backs up; --dry-run / --cmux)
 config/cmux.json             # workflow cmux config (minimalMode + workspace/tab nav keys); applied via install.sh --cmux
@@ -252,24 +248,6 @@ README.md                    # this file
 ```
 
 **External files the installer changes** (all backed up): `~/.zshrc`, `~/.claude/settings.json`, `~/.claude/CLAUDE.md`. `cc-trust.sh` edits `~/.claude.json` at runtime (only adds/removes pure-trust-signature entries).
-
----
-
-## SSH + Zellij fallback channel
-
-On the local box (mini): `zmain` (= `zellij attach -c main`, attach/create the persistent session).
-Remote: `ssh <mini-tailscale-host> -t 'zellij attach -c main'`.
-
-Common zellij keys (the bottom of the screen shows live hints):
-```
-Ctrl+p then n   # new pane (d/r splits down/right)
-Ctrl+t then n   # new tab
-Ctrl+o then d   # detach (leave the session running on the mini)
-Ctrl+g          # lock/unlock keybindings
-```
-> For flaky networks / phones: `brew install mosh`, then `mosh <mini> -- zellij attach -c main`.
-
-**Notifications**: local/screen-sharing relies on cmux's native per-agent notifications (ring + sidebar + desktop banner); in Zellij it relies on pane/tab indicators + visible agent output.
 
 ---
 

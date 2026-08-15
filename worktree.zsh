@@ -376,7 +376,6 @@ cc-stack · worktree sub-task commands
   gwt-rm <name> [--branch]               remove worktree (+ clear task record + pre-trust; optionally the branch)
   gwt-prune                              compact the task list (drop dead records + keep newest per dir)
   gwt-clean                              git worktree prune + show current state
-  gwt-fan                                (zellij only) fan each worktree into its own pane running claude
   gwt-provider <name>                    set which AI provider starts NEW sub-tasks: gwt-provider kimi|glm|anthropic (existing sub-tasks unchanged); no arg shows current + available
 Note: telling the main Claude to "open a worktree / spin off a sub-task" auto-triggers the hook to open a parallel tab;
       sub-tasks default to auto mode (investigate, then edit — no approval gate; prefix CC_WT_PERMISSION_MODE=plan to
@@ -419,16 +418,6 @@ gwt-clean() {
   echo "✔ pruned stale entries. Current worktrees:"
   git worktree list
   echo "  (delete one with: gwt-rm <name> [--branch])"
-}
-
-# gwt-fan — fan each worktree of the current repo into a zellij pane running claude (zellij fallback channel only)
-gwt-fan() {
-  if [[ -n "${ZELLIJ:-}" ]]; then
-    ~/.config/cc-stack/cc-zellij-fan.sh
-  else
-    echo "gwt-fan is only for the zellij fallback channel. Locally use ccteam (cmux native teams, better notifications)."
-    return 1
-  fi
 }
 
 # gwt-provider [kimi|glm|anthropic|default] — choose which AI provider starts NEW worktree sub-tasks.

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # cc-stack · Open a new surface (tab) in the CURRENT cmux workspace for an existing directory and start a ccteam claude,
-#            optionally with an initial prompt. Opens in background, doesn't steal focus. Not in cmux (remote/Zellij/not installed) = safe no-op.
+#            optionally with an initial prompt. Opens in background, doesn't steal focus. Not in cmux (remote/not installed) = safe no-op.
 # Called automatically by cc-worktree-cmux-hook.sh, and reused by cc-worktree-claude.sh (gwt-claude).
 # Usage: cc-cmux-surface-claude.sh <path> [prompt]
 # Related env: CC_WT_PERMISSION_MODE (default auto; set plan for a plan-first sub-task), CC_WT_PRETRUST (default 1), CC_WT_COPY (files to copy into the worktree)

@@ -15,7 +15,7 @@ Effect (handled automatically by the PostToolUse hook in `~/.config/cc-stack`): 
 - The only exception: use EnterWorktree only when I **explicitly** say "isolate yourself in a worktree" / "move the current session into a worktree".
 - **If the project has a `worktree-subtask` skill / `.claude/worktree-context.md`, load that skill first and dispatch with `gwt-claude <slug> "<prompt>" --base <base>`** (records the merge target, forces an explicit base). The bare `CC_WT_PROMPT=… git worktree add` form above is the fallback for projects without it.
 - `CC_WT_PROMPT` supports multi-line; without it a tab still opens with an idle ccteam waiting for input.
-- Only works inside cmux; remote SSH / Zellij → automatic no-op.
+- Only works inside cmux; remote SSH → automatic no-op.
 - Before creating a worktree, if `.claude/worktrees/` isn't ignored by `.gitignore`, add `/.claude/worktrees/` to the project root `.gitignore` (so worktree contents don't pollute git status).
 - **Never dispatch sub-tasks while the primary checkout sits on the trunk (`main`/`master`).** Create a campaign branch first (confirm the name with me), then make it every child's base and merge target. Otherwise gate-passed merges drip onto the trunk one at a time instead of landing as one reviewed campaign, and any branch-guard hook that refuses edits on the trunk (a `block-main-edit`-style PreToolUse hook) blocks the parent session for the rest of the campaign.
 - After spawning, use `gwt-status` to see what all the sub-task tabs are doing (status/branch/dir/task). It is an interactive-zsh function — in a non-interactive shell (e.g. Claude's Bash tool) it silently prints nothing; use `cmux tree` + `cmux capture-pane --surface <n>` there instead.

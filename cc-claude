@@ -2,7 +2,7 @@
 # cc-stack · claude launch router
 #   - inside cmux + interactive launch → cmux claude-teams (team-ready; teammates can be spawned mid-task)
 #   - subcommands (mcp/config…), headless (-p), queries (--version/-h) → native claude
-#   - remote (SSH) or inside Zellij (no cmux GUI) → native claude
+#   - remote (SSH) or any non-cmux terminal → native claude
 # Force native temporarily: command claude …  or  \claude …
 set -u
 
@@ -26,9 +26,9 @@ _tm=1
 for _a in "$@"; do
   case "$_a" in --teammate-mode|--teammate-mode=*) _tm=0 ;; esac
 done
-if [ -n "${CMUX_PANEL_ID:-}" ] && [ -z "${ZELLIJ:-}" ] && [ -z "${SSH_CONNECTION:-}" ]; then
+if [ -n "${CMUX_PANEL_ID:-}" ] && [ -z "${SSH_CONNECTION:-}" ]; then
   [ "$_tm" = 1 ] && set -- --teammate-mode in-process "$@"
   exec cmux claude-teams "$@"     # inside cmux: team-ready launch, teammates stay in-process
 else
-  exec claude "$@"                # remote / Zellij / non-cmux: native claude
+  exec claude "$@"                # remote / non-cmux: native claude
 fi

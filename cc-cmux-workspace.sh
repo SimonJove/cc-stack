@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # cc-stack · Open a cmux workspace (empty shell) for a directory.
-#   - Safe no-op when not inside cmux (no CMUX_SOCKET), so remote/Zellij/bare-terminal callers have no side effects.
+#   - Safe no-op when not inside cmux (no CMUX_SOCKET), so remote/bare-terminal callers have no side effects.
 #   - Best-effort dedup: if a workspace already points at the same directory, don't open another.
 # Usage: cc-cmux-workspace.sh <path> [name] [focus=false]
 set -u
 
 # Can we talk to cmux? (don't rely on CMUX_SOCKET — it's often empty in CC's Bash env; the cmux CLI uses its default socket)
-command -v cmux >/dev/null 2>&1 || exit 0      # cmux not installed (remote/Zellij): silently skip
+command -v cmux >/dev/null 2>&1 || exit 0      # cmux not installed (remote): silently skip
 cmux ping >/dev/null 2>&1 || exit 0            # can't reach cmux: silently skip
 
 path="${1:-}"
