@@ -45,7 +45,13 @@ cc-send <surface> "<text>"
 
 **语义**:撞车只可能发生在"发送瞬间输入框有字";检查-为空-即发把竞窗压到毫秒级(cmux 若将来出锁 API 可归零,可选提 feedback)。门卫零 token:检查/等待/通知均不经模型;消息本体成本与今天相同。
 
-**唯一技术点**:可靠检测"输入行有未提交文本"(read-screen 解析 claude TUI 的输入行,注意主题/布局变化;fail-open 兜底)。
+**唯一技术点 + 通用性加固(定稿)**:检测信号只用"❯ 行是否有内容",不用周围 chrome。但输入区形态随 `tui: fullscreen|default` 渲染器、版本而变——四层加固:
+1. **模式列表**而非单一正则(fullscreen `^❯` + default 盒式变体,实施时两种渲染器各实测);
+2. **模式可配置**(env 覆盖默认列表);
+3. **歧义 fail-open 到"视为空"**——认不出布局就退回裸 send,最坏=现状,永不做"误判有人打字而扣死消息";
+4. **开 tab 自校准**:cc-dispatch surface 在新 tab 的 TUI 起来后(已有等待点)对"已知为空"状态验证模式命中,不中则写面包屑——版本漂移当天可见,不默默失效。
+
+**⚠ 失效排查锚点(重点,防 TUI 升级后无法查因)**:见 docs/known-issues.md "cc-send 门卫失效"条目。claude TUI 改版输入区后,症状是"cc-send 不再等待/恒走 fail-open",先跑 read-screen 看输入行形态、对照模式列表。
 **token 账**:门卫 0,消息照旧,等待免费(墙钟非 token)。
 
 ## 3. ~~Feature D · gwt-review(验收 diff 一键看)~~ 已裁剪(2026-08-15)

@@ -45,3 +45,16 @@
 **界定:** 规范单引号形式完全不受影响(剥离按 `CC_WT_PROMPT='…'` span 做);该角落是剥离方式的固有边界,方向为净收紧(基线对新名字本来就是 DISPATCH),触发需要同时违反引号约定并在 payload 里点名 dispatcher,概率极低。
 
 **处置:** 无需修复;记录在案。若将来出现真实误触,把剥离从"单引号 span"升级为"引号无关的 token 级检测"即可。
+
+## cc-send 门卫失效(claude TUI 升级后)——排查锚点
+
+**症状**:cc-send 不再等待正在输入的用户(恒直达),或恒走 fail-open 面包屑;开 tab 自校准报模式不命中。
+
+**根因**:cc-send 靠 read-screen 解析 claude TUI 输入行的"❯ 提示符 + 行内是否已有未提交文本"判断撞车。该形态由 TUI 渲染器(`tui: fullscreen|default`)和 claude 版本决定——**claude TUI 改版输入区后,模式列表失配,门卫失明**。
+
+**排查三步**:
+1. 任意 idle claude tab 跑 `cmux read-screen --surface <ref> --lines 8`,看输入行现在的形态(空态);
+2. 对照 cc-send 的模式列表(env 可覆盖,见实现)是否匹配新形态;
+3. 不匹配 → 更新模式列表(配置改一行)或跟进新版式;更新后用"注入文本不按 Enter + read-screen"复检(设计验证手法,2026-08-15 已用此法实证过)。
+
+**兜底语义**:模式失配时 fail-open 退回裸 send——行为=本功能出现之前,不会丢消息、不会扣死,只是失去防撞保护。开 tab 自校准的面包屑是第一报警线。
