@@ -106,11 +106,11 @@
 ## ~~block-worktree-commit.sh 未入库(运行态孤儿文件)~~ 已收编(2026-08-16,feat/safe-close-impl)
 
 原风险:`~/.claude/hooks/block-worktree-commit.sh`(v2,命令有效目录判定)是 commit 门卫的唯一实现,不在仓库——机器迁移即丢、无测试覆盖。
-**处置**:原样收编为 `hooks/block-worktree-commit.sh`(v2 语义未改:命令有效目录 `cd X`/`-C X` 优先,解析失败回退会话 cwd;哨兵一次一 commit),install.sh 与 `hooks/block-unsafe-close.sh` 一起注册到 PreToolUse,并把旧的 `~/.claude/hooks/…` 注册当陈旧项剥离(按 `.claude/hooks/` 路径子串匹配,不会误伤新注册)。**残留清理靠人**:重跑 install.sh 后 `~/.claude/hooks/block-worktree-commit.sh` 文件本身还在(已不再被注册),可手工删。
+**处置**:原样收编为 `hooks/block-worktree-commit.sh`(v2 语义未改:命令有效目录 `cd X`/`-C X` 优先,解析失败回退会话 cwd;哨兵一次一 commit),install.sh 注册到 PreToolUse,并把旧的 `~/.claude/hooks/…` 注册当陈旧项剥离(按 `.claude/hooks/` 路径子串匹配,不会误伤新注册)。**残留清理靠人**:重跑 install.sh 后 `~/.claude/hooks/block-worktree-commit.sh` 文件本身还在(已不再被注册),可手工删。(当初与它一起注册的 `hooks/block-unsafe-close.sh` 已于 2026-08-16 退役,见下文"关 tab 事故"条。)
 
 ## 关 tab 事故(2026-08-16 02:19):父会话用漂移的短号自杀
 
-**严重度:** P1(已修 — 本条记录机理与门卫语义)
+**严重度:** P1(已修 — 本条记录机理;当初的文本门卫已于当天退役,见本条末尾)
 
 **时间线**:email-goal-4C campaign 的父会话(cloudoverture)完成已授权的合并后清理,准备关掉"自己的三个子 tab"。
 1. 先用裸数字 `cmux close-surface --surface 283`(等价形式)→ 3 次全失败:`Surface index not found`;
@@ -123,39 +123,39 @@
 - **位置参数被静默忽略**:`cmux close-surface surface:99999`(没有 `--surface` 旗标)**不报错、不关那个 surface**,而是回落到 `--surface` 的默认值 `$CMUX_SURFACE_ID`——**关掉调用者自己**。这才是父会话自杀的直接原因(不是"短号刚好漂到自己头上")。CLI help 里 `--surface` 标着 `(default: $CMUX_SURFACE_ID)`,这个默认值加上被忽略的位置参数,构成一个静默的自杀陷阱;
 - 稳定身份只有 **surface UUID**:`cmux close-surface --surface <UUID>` 实测精确、跨漂移可靠(`--id-format both` 可同时拿到短 ref 与 UUID)。
 
-**为什么 UI 路径豁免**:人在 cmux 界面上点关闭不经过 Claude Code 的 PreToolUse hook——那是人的操作,人对自己开的 tab 有完全处置权。所以"父/主 checkout tab 只有人能关"落到实现上就等于:**拦掉所有自动化(Bash)发起的、目标不是自己孩子的关闭**。
+**为什么 UI 路径豁免**(第一轮的推理,结论仍成立):人在 cmux 界面上点关闭根本不经过 Claude Code 的任何 hook——那是人的操作,人对自己开的 tab 有完全处置权。所以"父/主 checkout tab 只有人能关"落到实现上就等于:**拦掉所有自动化(Bash)发起的、目标不是自己孩子的关闭**。
 
-**修复(feat/safe-close-impl)**:
+**第一轮修复(feat/safe-close-impl,2026-08-16 上午)**:
 1. **账本带稳定身份**:派发时 `cc-dispatch.sh surface` 把两个 surface UUID 写进板子 launch-args 字段 —— `csuuid=<派发方(父)surface uuid>`、`suuid=<子 tab 自己的 surface uuid>`(model 仍恒排末位;旧行无这两项 = 无登记 owner);gwt-resume 恢复 tab 时同步刷新 `suuid`(surface UUID 随 tab 重建而变)。
-2. **PreToolUse 门卫** `hooks/block-unsafe-close.sh`:拦截命令位置上的 `cmux close-surface|close-window`,按 a→f 顺序判定(a 逃生门 `CC_ALLOW_SELF_CLOSE=1`;b 裸数字;c 无显式目标——含位置参数/管道/`$VAR`/命令替换;d 目标即调用者自己;e 目标不是已登记的 worktree tab 或是整个 window;f 目标的 `csuuid` 不是本会话)。exit 2 拦截并指名是哪条规则,exit 0 静默放行。
-3. **合法出口** `cc-dispatch.sh close <dir>` / `gwt-rm <name> --close`:按目录查板子 → 取 `suuid` → 打印解析结果(短 ref + UUID + cwd)→ 同一套策略校验 → **按 UUID 关**。
+2. **PreToolUse 门卫** `hooks/block-unsafe-close.sh`:文本解析每一条 Bash 命令,拦截命令位置上的关闭动词,按 a→f 判定。**已于当天退役,见下条。**
+3. **合法出口** `cc-dispatch.sh close <dir>` / `gwt-rm <name> --close`:按目录查账本 → 取 `suuid` → 打印解析结果(短 ref + UUID + cwd)→ 策略校验 → **按 UUID 关**。
 4. 规则一行进 claude-rules.md 托管块(install.sh 带进 `~/.claude/CLAUDE.md`)。
 
-**已知边界(有意为之)**:
-- **fail-closed**:解析不出目标身份、板上无行、无 `csuuid` —— 一律拦。宁可让人去 UI 点一下,不赌;
-- **cmux 会话库覆盖不到我们的子任务**:`~/.cmuxterm/claude-hook-sessions.json` 只记录 `claude` 启动器的会话,`ccteam`(= `cmux claude-teams`)起的子任务**根本不在里面**(2026-08-16 实测:当前 live 的 claude-teams tab 一个都没进库)。所以身份解析以**板上 suuid 为主**,会话库只作 cwd 兜底——gwt-resume 当初"uuid 直连会话库键"的设计在 `claude` 启动器下成立,对 `ccteam` 行不成立;
-- **`close-workspace` 未拦**:策略只覆盖 `close-surface` / `close-window`(关整个 workspace 同样是人的操作,目前靠规则约束,未上门卫);
-- **命令位置启发式 + 规避面(2026-08-16 验收轮加固)**:门卫只读命令文本,所以"哪个词是命令"必须靠启发式。基线是:只有站在命令位置(行首/`;`/`&&`/`do`/`then`/环境变量前缀之后)的 `cmux` 才被拦——否则汇报文本里引用一句 `cmux close-surface` 就会被误拦。首版这条启发式过窄,验收方**实弹验证了五种绕过**(每种都真关掉了 tab 却静默过门),现已全部覆盖:
+## 文本门卫退役(2026-08-16 晚,feat/tab-ledger)——为什么不再要拦截层
 
-  | 绕过写法 | 首版为何漏 | 现在被哪条拦 |
-  |---|---|---|
-  | `cmux 'close-surface' …` / `cmux "close-surface" …` | 子命令 token 带引号,和字面量 `close-surface` 不相等 | token 先归一化(去引号/去反斜杠)→ 正常判定(示例里落 **f**) |
-  | `cmux close\-surface …` | 同上,且 **JSON 里转义成 `close\\-surface`,连预过滤正则都不命中** | 预过滤放宽为 `close[^空白]{0,6}(surface\|window)` + token 归一化(落 **f**) |
-  | `CMD=cmux; $CMD close-surface …` | 命令词是变量,证明不了它是 cmux | 命令位置上**无法解析的命令词**($/反引号)置 unkcmd(粘滞到分隔符),其后的 close 动词一律 **rule c** |
-  | `` `which cmux` close-surface … `` | 同上,且不可解析部分与动词不相邻 | unkcmd 粘滞(不逐 token 清零)→ **rule c** |
-  | `env -u CLAUDECODE cmux close-surface …` | `env` 不在 wrapper 表里,`cmux` 前一个 token 是 `CLAUDECODE` | `env`/`sudo`/`timeout`/`nohup`/`command` 等进 wrapper 表(且 wrapper 本身必须在命令位置)→ 正常判定 |
-  | `cmux close-surface -- --surface <uuid>` | `--` 之后的 `--surface` 仍被当旗标解析 | 裸 `--` 之后一律算位置参数 → 无显式目标 → **rule c**(保守规则,不依赖 cmux 对 `--` 的真实处理,未实弹试探) |
-  | **`cmux --json close-surface …` / `cmux --password pw close-surface …`**(第二轮 N3) | 解析器要求动词**紧贴** `cmux`;而 cmux 自己的文法就是 `cmux [global-options] <command>`——**这条根本不是对抗写法,是文档里的合法语法**,属于"诚实用法也会漏"的面 | 命令位置状态跨越前导全局旗标及其取值继续找动词;"旗标取值 vs 动词"的歧义**一律判给动词**(动词检测先跑)。`cmux --json list-pane-surfaces` 这类无害组合不受影响 |
-  | **`cmux $'close-surface' …`**(N1) | `$'…'` 是 ANSI-C 引用,token 带 `$'` 前缀,和字面动词不相等 | 归一化先剥 `$'` 前缀,再走既有去引号(示例落 **f**,目标是自己落 **d**) |
-  | **`IFS=-; cmux close${IFS}surface …`**(N2) | 参数展开把动词从中间劈开,bash 实际交给 cmux 的仍是 `close-surface` | 不做求值:token 内每段参数展开(`${…}` / `$NAME`)替换成 `*` 哨兵,再把**整个 token 当 glob 模式去匹配两个字面动词**(反向 case)。守卫是 token 里必须字面含 close/surface/window,免得裸 `$X` 变成万能模式 |
+**结论**:`hooks/block-unsafe-close.sh` 连同它的 install 注册、test.sh 第 18 节的对抗性文本测试**整体删除**。关 tab 策略从此只有三条腿:**账本(数据面)+ 合法出口(执行面)+ CLAUDE.md 规则(约束面)**,没有任何机械拦截层。
 
-  另加两条同族收紧:`close-surface` 动词**自己**站在命令位置(alias/函数形态)拦(**rule c**);`cmux $VERB …` 这种**不可解析的子命令**也拦(**rule c**,同样只在该命令文本里别处出现 close 动词、能过预过滤时才生效)。
+**退役理由(两个方向的残留同时到达不可修的地步)**:
+- **过松方向不可闭合**:命令文本里看不见的形态门卫永远看不到——事先定义的 alias / shell 函数(定义好别名后只跑 `k --surface X`)、把关闭动作写进脚本文件再 `bash script.sh`、跨空格的 splice(动词被参数展开劈开且跨过空格)。要堵只能在 cmux 侧鉴权,不在本仓库范围;
+- **过紧方向反复咬到真实工作**:门卫必须猜"哪个词是命令",而**派发简报的正文里天然引用关闭命令的写法**。2026-08-16 当天两次实弹误拦:
+  1. `cmux --json diff --title '…stuff'`——全局旗标状态机把真动词 `diff` 当成 `--json` 的取值吞掉,`--title` 的取值文本被判成动词 → rule c;同族还有"旗标取值恰好长得像动词、真动词无害"的写法;
+  2. **(收尾时的那一次)父会话派发本项目这份简报本身被 rule c 拦掉**:简报正文举例引用了关闭命令的写法,而参数里 heredoc(`"$(cat <<'EOF' … EOF)"`)的正文中,一行以引用文本开头的例子——前面恰好有 `(` / `<` / `>` 这类被 tokenizer 当作语句分隔符的字符——被判成"命令位置上的 cmux"。**门卫在阻止一次派发,而不是在阻止一次关闭。**(同一现象在本次实现期间第三次出现:改这份文档的 Bash 写入命令,因为正文引用了关闭动词而被运行态门卫拦下。)
 
-  **仍未覆盖的残留**(方向都是"文本里看不见",门卫层面无解,靠规则+人工约束):
-  - **命令文本里完全没有痕迹的形态**:提前定义的 alias/shell 函数(`alias k='cmux close-surface'` 后跑 `k --surface X`)、或把关闭动作写进脚本文件再 `bash script.sh`——门卫只看得到 `k` / `bash script.sh`,预过滤就不会命中。要堵只能上更下层的拦截点(cmux 侧鉴权),不在本仓库范围;
-  - **把 `close…surface` 的字面邻接打散的 splice**:`cmux close$SEP surface …`(展开跨过一个**空格**)、`cmux ${X}lose-surface …`(吃掉动词头)。这两类**连预过滤都过不去**(正则是 `close[^空白]{0,6}(surface|window)`),因此 splice 检测根本没机会跑。把预过滤放宽到跨空格会把所有"提到 close 又提到 surface"的命令都拉进解析路径,误拦面明显变大——**有意不放宽**,记为残留。已覆盖的是不跨空格、动词头完整的 splice(N2 那一类);
-  - **过紧方向的误拦**:紧跟在 `;` 之后、写在引号里的同形文本(如 `echo "…; $x close-surface"`)会被当真。方向安全(拦错顶多让人加 `CC_ALLOW_SELF_CLOSE=1`),和 hook 防双开那条同类;
-  - **过紧(终验轮新增)**:`cmux --json diff --title 'close-window stuff'` 会被 rule c 拦——全局旗标状态机把真动词 `diff` 当成 `--json` 的取值吞掉后,`--title` 取值文本里的 close-window 被判为动词(无旗标数据库,"旗标取值 vs 动词"歧义一律判给动词,反方向猜错会放真 close)。同族:`cmux --password close-surface list-pane-surfaces`(旗标取值恰好长得像动词、真动词无害)也拦。方向安全、命令形状小众、响亮可逃生。**便宜的后续修法**:gflag 消费取值时若命中已知子命令白名单(send/diff/open/notify/read-screen/list-pane-surfaces/…)即终止扫描;
-  - `close-workspace` 仍不拦(见上条)。
+  这两类都能靠加白名单/加惰性命令集缓解,但方向是明确的:**一个必须判断"引号里的散文是不是命令"的解析器,在一个天天互相发命令文本的多 agent 系统里,误拦率只会继续涨**;而它换来的那点保护,本来就绕得过去。
+
+**替代它的是什么(本次落地)**:
+1. **第二本账本 `opened-tabs.tsv`**(`CC_TABS_FILE`;字段 `surface-uuid | owner-surface-uuid | dir | session-uuid | ts`,mkdir 锁追加,空字段写 `-` 防 TAB 塌缩):`cc-dispatch.sh surface` / `workspace` **每开一个 tab 就记一行**,owner = 开这个 tab 的 `$CMUX_SURFACE_ID`。它回答"**谁开了这个 tab**",板子回答"**这是谁的子任务**"——两本账**互不去重**,读时按 live surface 惰性剪枝(cmux 不可达时**不剪**:探测不到不等于 tab 死了)。`cc-dispatch.sh tabs` / `gwt-tabs` 是它的清单视图;
+2. **合法出口按两本账解析**:`close <dir>` 先板子 `suuid`,**再 opened-tabs 按目录**(板子行会被 `gwt-rm` 删掉,opened-tabs 不会——现场教训:先跑 `gwt-rm` 再 `close`,得到"no live tab resolves",三个 tab 只能人工去 UI 关),最后 cmux 会话库;
+3. **策略在出口处执行**(自动化调用方按进程祖先判定,见下条):不许关自己;非 worktree 目录只有"**本会话就是这个 tab 的 opener**"(opened-tabs owner)时放行——这正是"leader 关自己开的 runner tab"这个此前无解的场景;子任务 tab 由**派发它的父**关,**或**在 `gwt-done` 标记 ready 之后由任意自动化调用方回收(完成的子任务是可回收的;**未完成的子任务只有它自己的父(或人)能终止**——这条是保护不变量,四格真值表在 test.sh 第 18 节逐格断言);
+4. **规则面**:claude-rules.md 的关 tab 条目保留全部实操约束(只走合法出口;绝不硬编码短 ref / 裸数字 / 位置参数——cmux 会静默忽略位置参数并关掉调用者自己),只删掉"有 PreToolUse hook 拦着"这半句。
+
+**已知测试缺口/理论边角(验收轮备案,非阻塞)**:resume 回放开 tab 的记账写入(第 4 字段取回放命令里的 `--resume` 会话 uuid)目前**只有 gatekeeper 直探验证、无套件内覆盖**(fake cmux 不吐 uuid 回执;补法 = 让 fixture 的 new-surface 回执带 uuid);`_cc_repo_of` 的最后回退(非标准布局 + 目录已删)会落到调用方 repo——分支重名的理论性错读,标准 `.claude/worktrees/` / `.worktrees/` 布局按模式解析不受影响。
+
+**明确的新残留(有意接受)**:手写的关闭命令现在**没有任何机械阻拦**,只有规则约束。判断:2026-08-16 事故的三条直接成因(位置参数静默自杀、裸数字 index 语义、短 ref 漂移)都已在**规则文本 + 合法出口的响亮解析输出**里覆盖,而门卫在事故之后的实际战果是——拦下的多是自己人的简报。
+
+**已知边界(有意为之,沿用)**:
+- **fail-closed 仍在合法出口里**:解析不出目标身份、两本账都没有 owner、分支也没 ready —— 一律拒绝,宁可让人去 UI 点一下;
+- **cmux 会话库覆盖不到我们的子任务**:`~/.cmuxterm/claude-hook-sessions.json` 只记录 `claude` 启动器的会话,`ccteam`(= `cmux claude-teams`)起的子任务**根本不在里面**(2026-08-16 实测)。所以身份解析以**账本为主**,会话库只作 cwd 兜底;
+- **整 window / 整 workspace 的关闭**:同样是人的操作,只靠规则约束。
 
 - **"自动化 vs 人"不用环境变量判定,用进程祖先(2026-08-16 验收轮)**:`cc-dispatch.sh close` 的所有权强制原先看 `$CLAUDECODE`——验收方实弹验证 `env -u CLAUDECODE cc-dispatch.sh close <别人的子任务目录>` 会把强制降级成"只打印"并**真的关掉了那个 tab**。环境变量是被审查的那条命令行自己就能改的,不能当判据。现改为**沿 PPID 链上溯**(`ps -o ppid=`/`-o comm=`,深度上限 12):链上出现 claude 可执行文件 = 自动化调用方,强制所有权;走到 init/登录 shell 都没有 = 人,只打印不强制。`$CLAUDECODE` 只保留为快路径提示(**置位 ⇒ 一定是自动化;未置位不作任何结论**)。测试用 PATH shim 里的假 `ps` 驱动两条链,不给产品代码开 env 后门。

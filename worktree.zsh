@@ -285,6 +285,16 @@ gwt-resume() {
   return $?
 }
 
+# gwt-tabs [--all] — the opened-tabs inventory: every tab this stack opened (worktree sub-task or
+#   plain helper tab), joined with live cmux resolution — current short ref, stable surface uuid,
+#   alive/dead, the surface that opened it, and its directory. Thin wrapper around
+#   `cc-dispatch.sh tabs`; default shows only the rows this session opened, --all shows every row.
+gwt-tabs() {
+  emulate -L zsh
+  bash "$(_gwt_dispatch_script)" tabs "$@"
+  return $?
+}
+
 # gwt-prune — compact the task list: drop dead-dir records + keep only the newest per dir
 gwt-prune() {
   emulate -L zsh
@@ -363,18 +373,26 @@ gwt-tree() {
   unset _gt_ref _gt_parent _gt_ahead _gt_dirty _gt_done _gt_kids _gt_live
 }
 
-# gwt-done / gwt-undone — mark the current worktree's branch ready (harmless annotation, no gate)
+# gwt-done / gwt-undone — mark the current worktree's branch ready (harmless annotation, no gate).
+#   Both DELEGATE to the standalone `gwt-done` script (one implementation, same output): a zsh
+#   function only exists in a shell that sourced this file, and a sub-task's non-interactive Bash
+#   never did — `gwt-done` there died with "_gwt_root: command not found" (2026-08-16). Sub-tasks
+#   are taught the absolute path (~/.config/cc-stack/gwt-done) by the dispatch working agreement;
+#   these wrappers keep the bare name working for interactive users.
+_gwt_done_script() {
+  local d="${_gwt_src_dir:-}"
+  [[ -n "$d" && -x "$d/gwt-done" ]] && { echo "$d/gwt-done"; return 0 }
+  echo "$HOME/.config/cc-stack/gwt-done"
+}
 gwt-done() {
   emulate -L zsh
-  local root b; root="$(_gwt_root)" || return 1
-  b="$(git symbolic-ref --short HEAD 2>/dev/null)" || { echo "✗ detached HEAD"; return 1 }
-  ~/.config/cc-stack/cc-merge.sh done "$root" "$b" true && echo "✔ $b marked ready (gwt-done)"
+  bash "$(_gwt_done_script)" "$@"
+  return $?
 }
 gwt-undone() {
   emulate -L zsh
-  local root b; root="$(_gwt_root)" || return 1
-  b="$(git symbolic-ref --short HEAD 2>/dev/null)" || { echo "✗ detached HEAD"; return 1 }
-  ~/.config/cc-stack/cc-merge.sh done "$root" "$b" false && echo "✔ $b marked not-ready"
+  bash "$(_gwt_done_script)" --undone "$@"
+  return $?
 }
 
 # gwt-merge <name-or-branch> [--squash|--no-ff|--rebase] [--into <b>] [--message <text>] [--force] — GATED merge
@@ -470,6 +488,8 @@ cc-stack · worktree sub-task commands
   gwt-resume [--all]                     after a cmux restart: native restore first, then re-open still-missing sub-task tabs
                                          replaying the RECORDED session uuid + provider + mode (lists first, asks y/N; --all = every repo, no confirm)
   gwt-log                                the merged-task archive, same columns/filter (rows moved there by gwt-merge)
+  gwt-tabs [--all]                       opened-tabs inventory: every tab this stack opened — ref, stable uuid,
+                                         alive/dead, the surface that opened it, dir (--all = every session's rows)
   gwt-rm <name> [--branch] [--close]     remove worktree (+ clear task record + pre-trust; optionally the branch);
                                          --close also closes its cmux tab through cc-dispatch.sh close (by the
                                          RECORDED stable surface uuid — never a short ref, which drifts)

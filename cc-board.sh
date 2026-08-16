@@ -42,10 +42,10 @@ set -u
 #   csuuid/suuid (2026-08-16, tab-close permission model) are cmux SURFACE UUIDs, the only stable
 #   tab identities there are: short refs (surface:283) drift as panes open and close, so the 3rd
 #   field is an address, never an identity. csuuid = the session that dispatched this sub-task
-#   (the only one allowed to close its tab), suuid = the sub-task tab itself. Read by
-#   hooks/block-unsafe-close.sh and `cc-dispatch.sh close`; kept fresh across a cmux restart by
-#   gwt-resume. Rows without them (pre-feature) simply have no recorded owner → the close gate
-#   treats the tab as human-opened and refuses to close it automatically.
+#   (the one allowed to close its tab while it is still running), suuid = the sub-task tab itself.
+#   Read by `cc-dispatch.sh close`; kept fresh across a cmux restart by gwt-resume. Rows without
+#   them (pre-feature) have no recorded owner here — the close primitive then falls back to the
+#   opened-tabs ledger (opened-tabs.tsv), and refuses when neither ledger names an owner.
 #   POSITION: appended AFTER parent-branch, i.e. the LAST live-board field — every positional
 #   reader keys on fields 1-7 (cc-hooks.sh status matches $4 = dir; the PARENT fallback reads the
 #   7th), and the archive appends merged-at after it (live 8 fields → archive 9). Old 7-field rows

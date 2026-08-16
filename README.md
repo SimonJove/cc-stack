@@ -273,6 +273,7 @@ Every sub-task still launches in **team mode** (`cmux claude-teams`) regardless 
 | `CC_CMUX_SESSIONS` | `~/.cmuxterm/claude-hook-sessions.json` | cmux agent session store read by `gwt-resume` to match restored tabs (session id → surface + cwd). Override for tests. |
 | `CC_RESUME_SETTLE` | `2` | Seconds `gwt-resume` waits after `cmux restore-session` for restored surfaces to register (0 in tests). |
 | `CC_TASKS_FILE` | `~/.config/cc-stack/worktree-tasks.tsv` | Task list path (rarely changed). |
+| `CC_TABS_FILE` | `~/.config/cc-stack/opened-tabs.tsv` | Opened-tabs ledger: every tab this stack opened (surface uuid, owner surface uuid, dir, session uuid, ts). Written by `cc-dispatch.sh surface`/`workspace`, read by `close` / `tabs` (override for tests). |
 | `CC_STATUS_FILE` | `~/.config/cc-stack/worktree-status.tsv` | Agent-state sidecar written by `cc-hooks.sh status`, read by the board's STATUS column (override for tests). |
 | `CC_ARCHIVE_FILE` | `~/.config/cc-stack/worktree-tasks-archive.tsv` | Merged-task archive written on `gwt-merge`, rendered by `gwt-log` / `cc-board.sh --archive` (override for tests). |
 | `CC_LAUNCH_FILE` | `~/.config/cc-stack/launch` | Written by `gwt-provider`; the provider name for NEW sub-tasks (`kimi`, `glm`, or `anthropic`/empty=default). Override path for tests. |
@@ -311,14 +312,19 @@ after a cmux restart: gwt-resume (worktree.zsh) ──► cc-dispatch.sh resume
   │  ③ still-missing rows re-opened via surface (CC_WT_LAUNCH_CMD) replaying the recorded args
   │     in the recorded dir VERBATIM  ④ stale sidecar rows cleared for revived dirs
 
-closing tabs: any `cmux close-surface/close-window` via Bash ──►
-hooks/block-unsafe-close.sh   PreToolUse gate: positional/bare/targetless forms (the self-close
-  │                           incident vector: a positional target silently falls back to the
-  │                           CALLER's own surface), self-close, non-worktree targets, owner
-  ▼                           mismatch vs the board's csuuid — children only by their parent,
-cc-dispatch.sh close <dir>    parents/primary-checkout tabs only by the human (the cmux UI path
-gwt-rm --close                bypasses the hook). Sanctioned path: board lookup → suuid → same
-                              policy → close by stable UUID.
+opening a tab ──► opened-tabs.tsv   surface-uuid | owner-surface-uuid | dir | session-uuid | ts
+  │                                 EVERY tab this stack opens (sub-task or plain helper tab);
+  │                                 pruned lazily when a surface stops resolving.
+  ▼                                 `cc-dispatch.sh tabs` / `gwt-tabs` = the live inventory
+closing tabs: cc-dispatch.sh close <dir>   ① dir → stable surface uuid: board suuid, then
+              gwt-rm <name> --close          opened-tabs by dir (survives gwt-rm), then the cmux
+                                             session store  ② print the resolution  ③ policy:
+                                             never self; a non-worktree dir only when THIS session
+                                             opened it; a live sub-task only by its dispatching
+                                             parent, or by anyone once gwt-done marked it ready
+                                             (automated callers — decided by process ancestry;
+                                             a human shell reports instead of refusing)
+                                          ④ close by the STABLE uuid, never a short ref
 ```
 
 **Key design choices:**
@@ -328,7 +334,7 @@ gwt-rm --close                bypasses the hook). Sanctioned path: board lookup 
 - **Reliability**: short retries during cmux hiccups; a hard failure leaves `cc-failures.log` (surfaced by `gwt-status`).
 - **Reliable status**: `gwt-status` judges tab liveness against cmux's live surface list; after a cmux restart, stale refs show `?old-session` rather than falsely "closed".
 - **Recorded-args resume**: dispatch mints the claude `--session-id` and records the full launch args on the board row, so `gwt-resume` replays exactly what was launched (provider env included — the thing cmux's own restore loses). The resume always launches in the **recorded dir string verbatim**: claude keys project identity on the exact path, so `/Users` vs `/private` is a different project.
-- **Close permission model**: tab identity lives on the board as stable UUIDs (`csuuid`/`suuid` inside launch-args, never drifting short refs). Automated closes are gated by `hooks/block-unsafe-close.sh` — a child tab is closable only by its dispatching parent (ancestry-decided, not env-decidable), and parent/primary-checkout tabs are closable only by the human in the cmux UI. `cc-dispatch.sh close <dir>` and `gwt-rm --close` are the sanctioned paths that satisfy the gate by construction.
+- **Close permission model — ledgers + sanctioned paths, no interception layer**: tab identity is always a stable surface UUID, never a drifting short ref. Two ledgers answer two different questions and are never deduped: the board (`csuuid`/`suuid` inside launch-args) answers *whose sub-task is this*, `opened-tabs.tsv` answers *who opened this tab* — which is what makes a plain helper tab (a runner in the primary checkout, a scratch dir) closable by the session that opened it, and what keeps a close working after `gwt-rm` dropped the board row. `cc-dispatch.sh close <dir>` and `gwt-rm --close` are the sanctioned paths: they resolve, print the resolution, then enforce the policy (never self; a live sub-task only by its dispatching parent — ancestry-decided, not env-decidable — or by anyone once `gwt-done` marked the branch ready; parent/primary-checkout tabs stay the human's in the cmux UI). The 2026-08-16 PreToolUse text-parsing gate over every Bash command was **retired**: a parser that must decide whether prose quoting `cmux close-surface` is a command kept blocking real dispatch briefs, and could never see an alias or a script file anyway. The rules now live in `claude-rules.md` (installed into `~/.claude/CLAUDE.md`) plus these ledgers.
 
 ---
 
@@ -354,7 +360,7 @@ worktree.zsh                 # gwt-* functions (sourced by .zshrc)
 aliases.zsh                  # ccteam / gwt-test / claude router (sourced by .zshrc)
 cc-claude                    # claude/cld launch router (in cmux → team-ready, remote/subcommands → native)
 cc-hooks.sh                  # ALL Claude Code hook entries: worktree (PostToolUse tab opener) + status (agent-state sidecar writer)
-cc-dispatch.sh               # the dispatch pipeline: wt-claude (gwt-claude) | surface ([single source of truth] open tab + copy .env + pre-trust + start ccteam + send prompt + register, with retries/failure breadcrumb) | send (cc-send: the collision-safe text+Enter primitive, the only sanctioned injection exit into a running claude tab) | calibrate (re-probe the cc-send patterns on a known-empty tab) | resume (gwt-resume engine: native restore + recorded-args reopen) | workspace (empty workspace for a dir, used by gwt-new)
+cc-dispatch.sh               # the dispatch pipeline: wt-claude (gwt-claude) | surface ([single source of truth] open tab + copy .env + pre-trust + start ccteam + send prompt + register, with retries/failure breadcrumb) | send (cc-send: the collision-safe text+Enter primitive, the only sanctioned injection exit into a running claude tab) | calibrate (re-probe the cc-send patterns on a known-empty tab) | close (THE sanctioned tab close: dir → recorded stable surface uuid → policy → close) | tabs (the opened-tabs inventory, backs gwt-tabs) | resume (gwt-resume engine: native restore + recorded-args reopen) | workspace (empty workspace for a dir, used by gwt-new)
 cc-board.sh                  # [the board] renders gwt-status/gwt-log from any shell (bash): tasks+status join, repo filter, tab liveness, prune-on-read; `log` subcommand = single task-registration write point
 cc-merge.sh                  # branch tree: set/get-parent, preflight, do-merge (squash/no-ff/rebase, conventional message + triaged failures), capture, tree (backs gwt-merge/gwt-collect/gwt-tree)
 cc-worktree-shared.sh        # shared test corpus (CC_WT_SHARE): seed into a new worktree, collect back on merge
@@ -363,6 +369,8 @@ claude-rules.md              # single source of the global CLAUDE.md worktree ru
 install.sh                   # one-command install/repair (idempotent/backs up; --dry-run / --cmux)
 config/cmux.json             # workflow cmux config (minimalMode + workspace/tab nav keys); applied via install.sh --cmux
 test.sh                      # smoke test (gwt-test calls it)
+gwt-done                     # standalone `gwt-done` (bash, no zsh): mark this worktree's branch ready — the form sub-tasks are taught (a zsh function does not exist in their non-interactive shell)
+opened-tabs.tsv              # opened-tabs ledger: every tab this stack opened (auto-generated; who opened what, pruned when a surface stops resolving)
 worktree-tasks.tsv           # task registration list (auto-generated; 8th field = launch-args recorded at dispatch, replayed by gwt-resume)
 worktree-tasks-archive.tsv   # merged sub-task rows, moved on gwt-merge (auto-generated; rendered by gwt-log)
 worktree-status.tsv          # per-sub-task agent state, written by cc-hooks.sh status (auto-generated)

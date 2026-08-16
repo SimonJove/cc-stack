@@ -1,6 +1,7 @@
 # runtime-generated
 worktree-tasks.tsv
 worktree-tasks-archive.tsv
+opened-tabs.tsv
 cc-failures.log
 launch
 # backups

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# cc-dispatch.sh · THE dispatch pipeline — one script, seven subcommands.
+# cc-dispatch.sh · THE dispatch pipeline — one script, eight subcommands.
 #   wt-claude <name> <prompt> [--prefix <p>] [--base <b>]   gwt-claude implementation: build/reuse
 #                                                             the worktree, then delegate to surface
 #                                                             [absorbs cc-worktree-claude.sh]
@@ -15,10 +15,12 @@
 #                                                             on a tab whose input box is known empty
 #   close     <worktree-dir>                                 THE sanctioned tab close: resolve the dir
 #                                                             to a live surface by its RECORDED stable
-#                                                             uuid, print the resolution, enforce the
-#                                                             close policy, then close (hand-written
-#                                                             cmux close-* is blocked by the
-#                                                             hooks/block-unsafe-close.sh PreToolUse gate)
+#                                                             uuid (board first, opened-tabs ledger
+#                                                             second), print the resolution, enforce
+#                                                             the close policy, then close
+#   tabs      [--all]                                        the opened-tabs inventory: every tab this
+#                                                             stack opened, joined with live cmux
+#                                                             resolution (ref, uuid, alive/dead, owner, dir)
 #   resume    [--all]                                        gwt-resume engine (roadmap 2): cmux native
 #                                                             restore-session first, then reopen board
 #                                                             rows whose tab is still gone, replaying
@@ -238,6 +240,77 @@ _ccsend_calibrate() {  # $1 = ref, $2 = dir — self-calibration (hardening laye
   return 0
 }
 
+# ─────────────────────────────────────────────────────────────────────────────
+# opened-tabs ledger (2026-08-16) — ~/.config/cc-stack/opened-tabs.tsv, CC_TABS_FILE overrides.
+# EVERY tab this stack opens is recorded here, keyed by the only stable identity a cmux tab has:
+# its surface UUID (short refs like surface:283 DRIFT as panes open and close — they are addresses,
+# never identities).
+#   surface-uuid <TAB> owner-surface-uuid <TAB> dir <TAB> session-uuid <TAB> ts
+# Empty owner / session fields are written as "-" ON PURPOSE: `read` collapses runs of TABs
+# (whitespace IFS), so an empty middle field would shift every later field for the reader
+# (docs/known-issues.md, "cc-board 读循环对空 caller 字段的 TAB 塌缩").
+#
+# WHY a SECOND ledger next to the board (worktree-tasks.tsv): the board only knows WORKTREE
+# sub-tasks. A leader that opens a helper tab — a runner in the primary checkout, a scratch-dir
+# tab — has no board row for it and therefore no recorded owner, so it could not even name, let
+# alone close, a tab it opened itself. The two ledgers answer different questions and are NEVER
+# deduped against each other: the board answers "whose SUB-TASK is this" (+ what to replay on
+# resume), opened-tabs answers "who OPENED this tab". Both are consulted, in that order, by
+# `cc-dispatch.sh close`.
+# Rows are pruned LAZILY on read: a row whose surface uuid no longer appears in the live cmux
+# surface map is dropped. Never prune off an EMPTY map — cmux being unreachable is not evidence
+# that every tab died.
+_cctabs_file(){ printf '%s' "${CC_TABS_FILE:-$HOME/.config/cc-stack/opened-tabs.tsv}"; }
+_cctabs_uc(){ printf '%s' "${1:-}" | tr 'abcdefghijklmnopqrstuvwxyz' 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'; }
+_cctabs_lock(){ # $1 = file — same atomic-mkdir discipline as the board's append (macOS lacks flock)
+  _tl="$1.lock"; _ti=0
+  while [ "$_ti" -lt 60 ]; do mkdir "$_tl" 2>/dev/null && return 0; sleep 0.05; _ti=$((_ti+1)); done
+  return 1
+}
+_cctabs_log(){ # $1 = surface uuid, $2 = owner surface uuid, $3 = dir, $4 = claude session uuid
+  _tu="$(_cctabs_uc "${1:-}")"; _to="$(_cctabs_uc "${2:-}")"
+  case "$_tu" in ''|*[!0-9A-F-]*) return 0 ;; esac        # only ever a plain uuid, never a ref
+  case "$_to" in *[!0-9A-F-]*) _to="" ;; esac
+  _tf="$(_cctabs_file)"
+  _td="$(printf '%s' "${3:-}" | tr '\t\n' '  ')"
+  _tsid="$(printf '%s' "${4:-}" | tr '\t\n' '  ')"
+  _tgot=""; _cctabs_lock "$_tf" && _tgot=1
+  printf '%s\t%s\t%s\t%s\t%s\n' "$_tu" "${_to:--}" "${_td:--}" "${_tsid:--}" "$(date '+%Y-%m-%d %H:%M:%S')" \
+    >> "$_tf" 2>/dev/null || true
+  [ -n "$_tgot" ] && rmdir "$_tf.lock" 2>/dev/null
+  return 0
+}
+_cctabs_livemap(){ # "short-ref <TAB> UPPERCASE-uuid" for every live surface ("" = cmux unreachable)
+  command -v cmux >/dev/null 2>&1 || return 0
+  cmux list-pane-surfaces --id-format both 2>/dev/null | sed 's/^\*//' \
+    | awk 'NF>=2{print $1 "\t" toupper($2)}'
+}
+_cctabs_prune(){ # $1 = live map (optional; probed when omitted) — drop rows whose surface is gone
+  _tf="$(_cctabs_file)"; [ -f "$_tf" ] || return 0
+  _tlm="${1:-$(_cctabs_livemap)}"
+  [ -n "$_tlm" ] || return 0                              # no map = no evidence = no pruning
+  _tgot=""; _cctabs_lock "$_tf" && _tgot=1
+  _ttmp="$_tf.tmp.$$"
+  printf '%s\n' "$_tlm" | awk -F'\t' 'NF>=2{print toupper($2)}' > "$_ttmp.live" 2>/dev/null
+  if awk -F'\t' 'NR==FNR{l[$1]=1; next} $1!="" && ($1 in l)' "$_ttmp.live" "$_tf" > "$_ttmp" 2>/dev/null; then
+    mv "$_ttmp" "$_tf" 2>/dev/null
+  fi
+  rm -f "$_ttmp" "$_ttmp.live" 2>/dev/null
+  [ -s "$_tf" ] || rm -f "$_tf" 2>/dev/null
+  [ -n "$_tgot" ] && rmdir "$_tf.lock" 2>/dev/null
+  return 0
+}
+_cctabs_owner(){ # $1 = surface uuid → the owner recorded for it (newest row; "" when none)
+  _tf="$(_cctabs_file)"; [ -f "$_tf" ] || return 0
+  awk -F'\t' -v u="$(_cctabs_uc "${1:-}")" \
+    '$1==u && $2!="" && $2!="-"{o=$2} END{if(o!="")print o}' "$_tf" 2>/dev/null
+}
+_cctabs_by_dir(){ # $1 = canonical dir, $2 = dir as given → "suuid<TAB>owner" of the newest row
+  _tf="$(_cctabs_file)"; [ -f "$_tf" ] || return 0
+  awk -F'\t' -v a="${1:-}" -v b="${2:-}" \
+    '($3==a || $3==b) && $1!=""{u=$1; o=$2} END{if(u!="") print u "\t" ((o=="-")?"":o)}' "$_tf" 2>/dev/null
+}
+
 case "${1:-}" in
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -372,7 +445,8 @@ fi
 # Caller (main task) surface / workspace — backchannel + target workspace.
 # csuuid: the caller's STABLE surface uuid. This process runs INSIDE the dispatching parent
 # session (hook path and gwt-claude path alike), so $CMUX_SURFACE_ID is that parent's surface —
-# the identity the tab-close gate (hooks/block-unsafe-close.sh) compares against. The short
+# the identity the close policy (`cc-dispatch.sh close`) compares against, on the board row and
+# on the opened-tabs ledger row alike. The short
 # caller_surface ref below stays what it always was: a backchannel address, not an identity.
 # CC_CALLER_SURFACE_UUID overrides it (tests; a caller that knows better).
 csuuid="${CC_CALLER_SURFACE_UUID:-${CMUX_SURFACE_ID:-}}"
@@ -447,7 +521,7 @@ fi
 full="$prompt"
 if [ -n "$prompt" ]; then
   full="$full
-——[Working agreement] $way1 (2) Follow this project's own CLAUDE.md and .claude config (harness) throughout; don't drift toward your own defaults. (3) After making changes, commit / rebase / merge / push / removing the worktree or branch ALL require human authorization — even if the finishing-a-development-branch skill prompts you, just stop at 'keep the branch'. (4) When you finish implementing and have reported back, run \`gwt-done\` to mark this branch ready; your merge target is already recorded, so you never choose where to merge, and you never merge without my authorization."
+——[Working agreement] $way1 (2) Follow this project's own CLAUDE.md and .claude config (harness) throughout; don't drift toward your own defaults. (3) After making changes, commit / rebase / merge / push / removing the worktree or branch ALL require human authorization — even if the finishing-a-development-branch skill prompts you, just stop at 'keep the branch'. (4) When you finish implementing and have reported back, run \`~/.config/cc-stack/gwt-done\` (the absolute path — \`gwt-done\` alone is a zsh function that does NOT exist in your non-interactive shell) to mark this branch ready; your merge target is already recorded, so you never choose where to merge, and you never merge without my authorization."
   [ -n "$caller_surface" ] && full="$full (5) To report back / ask the main task: ~/.config/cc-stack/cc-dispatch.sh send $caller_surface \"message\" — cc-send waits out any half-typed line instead of colliding; never use raw cmux send + Enter."
 fi
 
@@ -554,6 +628,19 @@ if [ -z "$rsmode" ]; then
     "$(git -C "${CC_CALLER_CWD:-$PWD}" symbolic-ref --short HEAD 2>/dev/null)" "${largs:-}"
 fi
 
+# ── Register into the opened-tabs ledger (who opened which tab) ──
+# Written on EVERY open, worktree sub-task or not, resume included (a reopened tab is a NEW
+# surface uuid). This is the ledger that lets a leader name — and close — a helper tab it opened
+# in a non-worktree directory; the board row above stays the sub-task record. Deliberately NOT
+# deduped against the board: different questions, different lifetimes (see the helper block at
+# the top of this file).
+# In resume mode nothing was minted — the session being resumed is the one inside the replayed
+# launch command, so read it back off `--resume <uuid>` rather than record the unused fresh id.
+tabsid="$sid"
+[ -n "$rsmode" ] && tabsid="$(printf '%s' "$CC_WT_LAUNCH_CMD" \
+  | awk '{for(i=1;i<NF;i++) if ($i=="--resume") {print $(i+1); exit}}')"
+_cctabs_log "$suuid" "$csuuid" "$abspath" "$tabsid"
+
 echo "✔ new tab : $ref  ${suuid:+uuid=$suuid  }cwd=$abspath  $(if [ -n "$rsmode" ]; then echo '(resume launch sent)'; elif [ -n "$prompt" ]; then echo '(initial prompt sent)'; else echo '(idle ccteam)'; fi)"
 [ -n "$caller_surface" ] && echo "✔ backchannel: the new claude can report back via cc-dispatch.sh send $caller_surface \"<message>\""
 exit 0
@@ -603,25 +690,35 @@ fi
 ;;
 
 # ─────────────────────────────────────────────────────────────────────────────
-# close — THE sanctioned way to close a sub-task tab from automation (the counterpart of the
-#   PreToolUse gate in hooks/block-unsafe-close.sh, which blocks every hand-written cmux close-*).
-#   Takes a DIRECTORY, never a surface ref: the board is the ledger, and the only stable
-#   identities in it are the surface UUIDs recorded at dispatch.
-#     ① resolve dir → live surface: board row suuid first (the only source that covers ccteam
-#        sub-tasks — the cmux agent session store never sees them), then the store's newest
-#        session in that cwd; a recorded SHORT ref is never used as a fallback (short refs drift,
-#        which is precisely how the 2026-08-16 incident closed the parent itself)
+# close — THE sanctioned way to close a sub-task tab from automation. Takes a DIRECTORY, never a
+#   surface ref: the ledgers are keyed by directory, and the only stable identities in them are
+#   the surface UUIDs recorded at open time (short refs DRIFT — that is how the 2026-08-16
+#   incident closed the parent session itself).
+#     ① resolve dir → live surface, in ledger order:
+#          1. the board row's suuid (worktree-tasks.tsv — the sub-task record, the only source
+#             that covers ccteam sub-tasks: the cmux agent session store never sees them),
+#          2. the opened-tabs ledger by dir (opened-tabs.tsv — every tab this stack opened).
+#             This one survives `gwt-rm`, which DROPS the board row: a leader that removed a
+#             worktree first and only then went to close its tab used to be told "no live tab
+#             resolves to this directory" and had to close it by hand (live incident). The
+#             opened-tabs row is only ever dropped by the lazy prune, i.e. once the surface
+#             itself is gone,
+#          3. the cmux agent session store's newest session in that cwd.
+#        A recorded SHORT ref is never a fallback — an address is not an identity.
 #     ② PRINT the resolution (short ref + stable uuid + cwd) before touching anything
-#     ③ enforce the same policy as the hook: never the caller's own surface, never a non-worktree
-#        checkout, and — for AUTOMATED callers — only a child whose recorded csuuid is this very
-#        session. "Automated" is decided by PROCESS ANCESTRY (a claude binary in the PPID chain),
-#        never by an env var a caller could strip; a human shell is the UI path in shell form, so
-#        there the ownership check reports instead of refusing.
+#     ③ policy: never the caller's own surface; a non-worktree directory only when the
+#        opened-tabs ledger records THIS session as the tab's opener (one may close what one
+#        opened); and — for AUTOMATED callers — only a child whose recorded csuuid is this very
+#        session OR whose branch is marked ready (gwt-done: a finished sub-task's tab is
+#        collectible by any automated caller). "Automated" is decided by PROCESS ANCESTRY (a
+#        claude binary in the PPID chain), never by an env var a caller could strip; a human
+#        shell is the UI path in shell form, so there the ownership check reports instead of
+#        refusing.
 #     ④ close by the STABLE uuid
 #   No live tab for that dir = nothing to do (rc 0): gwt-rm --close must stay idempotent.
 # Usage: cc-dispatch.sh close <worktree-dir>
-# Related env: CC_TASKS_FILE (board), CC_CMUX_SESSIONS (session store), CC_CALLER_SURFACE_UUID
-#   (override for $CMUX_SURFACE_ID)
+# Related env: CC_TASKS_FILE (board), CC_TABS_FILE (opened-tabs ledger), CC_CMUX_SESSIONS
+#   (session store), CC_CALLER_SURFACE_UUID (override for $CMUX_SURFACE_ID)
 close)
 shift
 cdir="${1:-}"
@@ -650,6 +747,24 @@ _cc_automated(){ # rc 0 = an AGENT is driving this call, rc 1 = a human shell is
   done
   return 1
 }
+_cc_repo_of(){ # $1 = a worktree dir (which may already be GONE) → its MAIN repo root
+  _r="$(git -C "${1:-}" rev-parse --git-common-dir 2>/dev/null)" \
+    && _r="$(cd "$_r/.." 2>/dev/null && pwd -P)" && [ -n "$_r" ] && { printf '%s' "$_r"; return 0; }
+  case "${1:-}" in                                  # dir removed: the layout convention still holds
+    */.claude/worktrees/*) printf '%s' "${1%%/.claude/worktrees/*}"; return 0 ;;
+    */.worktrees/*)        printf '%s' "${1%%/.worktrees/*}"; return 0 ;;
+  esac
+  _r="$(git rev-parse --git-common-dir 2>/dev/null)" \
+    && _r="$(cd "$_r/.." 2>/dev/null && pwd -P)" && printf '%s' "$_r"   # last resort: the caller's repo
+}
+_cc_rowdone(){ # rc 0 = this row's branch is marked ready (gwt-done → branch.<b>.ccDone)
+  [ -n "${bbranch:-}" ] || return 1
+  _rp="$(_cc_repo_of "$ccan")"; [ -n "$_rp" ] || return 1
+  _mg="$(cd "$(dirname "$0")" 2>/dev/null && pwd -P)/cc-merge.sh"
+  [ -f "$_mg" ] || _mg="$HOME/.config/cc-stack/cc-merge.sh"
+  [ -f "$_mg" ] || return 1
+  bash "$_mg" is-done "$_rp" "$bbranch" >/dev/null 2>&1
+}
 _ccpick(){ # $1 = launch-args field, $2 = key → value ("" when absent); model is composed LAST
   _v=""; _pre="$1"
   case "$1" in *model=*) _pre="${1%%model=*}" ;; esac
@@ -665,22 +780,46 @@ cstore="${CC_CMUX_SESSIONS:-$HOME/.cmuxterm/claude-hook-sessions.json}"
 self_uuid="$(_ccuc "${CC_CALLER_SURFACE_UUID:-${CMUX_SURFACE_ID:-}}")"
 
 # ── ① board row (newest for this dir) → recorded identities ──
-brow=""
+# The pair is emitted as "branch<TAB>launch-args" with a "-" placeholder for an empty branch:
+# `read` collapses runs of TABs, so an empty leading field would shift the launch-args field
+# (docs/known-issues.md, the TAB-collapse entry).
+brow=""; bbranch=""
 if [ -f "$tasks" ]; then
-  brow="$(awk -F'\t' '{print $4 "\t" $8}' "$tasks" 2>/dev/null | while IFS=$'\t' read -r _bd _la; do
+  brow="$(awk -F'\t' '$4!=""{print ($2==""?"-":$2) "\t" $4 "\t" $8}' "$tasks" 2>/dev/null \
+    | while IFS=$'\t' read -r _bb _bd _la; do
       [ -n "$_bd" ] || continue
       _bc="$(ccb_canon "$_bd")"; [ -n "$_bc" ] || _bc="$_bd"
       { [ "$_bc" = "$ccan" ] || [ "$_bd" = "$cdir" ]; } || continue
-      printf '%s\n' "$_la"
+      printf '%s\t%s\n' "$_bb" "$_la"
     done | tail -1)"
+  if [ -n "$brow" ]; then
+    bbranch="${brow%%$'\t'*}"; [ "$bbranch" = "-" ] && bbranch=""
+    brow="${brow#*$'\t'}"
+  fi
 fi
 tuuid="$(_ccuc "$(_ccpick "$brow" suuid)")"
 owner="$(_ccuc "$(_ccpick "$brow" csuuid)")"
 case "$tuuid" in *[!0-9A-F-]*) tuuid="" ;; esac
 
-live="$(cmux list-pane-surfaces --id-format both 2>/dev/null | sed 's/^\*//' | awk 'NF>=2{print $1 "\t" toupper($2)}')"
+live="$(_cctabs_livemap)"
+_cctabs_prune "$live"                    # lazy pruning: rows whose surface is gone (live map only)
 tref=""
 [ -n "$tuuid" ] && tref="$(printf '%s\n' "$live" | awk -F'\t' -v u="$tuuid" '$2==u{print $1; exit}')"
+
+# ── ①b opened-tabs ledger — the SECOND ledger, consulted whenever the board comes up short ──
+# Transition case hit in the first live use of this primitive: a child dispatched BEFORE the
+# board carried suuid has a task row with no recorded surface identity at all, so the board
+# resolution above yields nothing. The opened-tabs ledger records every tab this stack opened
+# (worktree or not) keyed by dir, and carries the owner too — so it fills in BOTH gaps. Both
+# ledgers are consulted, board first; they are never deduped against each other.
+tabrow="$(_cctabs_by_dir "$ccan" "$cdir")"
+tabuuid="$(_cctabs_uc "${tabrow%%$'\t'*}")"; tabowner=""
+[ -n "$tabrow" ] && tabowner="$(_cctabs_uc "${tabrow#*$'\t'}")"
+case "$tabuuid" in *[!0-9A-F-]*) tabuuid=""; tabowner="" ;; esac
+if [ -z "$tref" ] && [ -n "$tabuuid" ]; then
+  tref="$(printf '%s\n' "$live" | awk -F'\t' -v u="$tabuuid" '$2==u{print $1; exit}')"
+  [ -n "$tref" ] && tuuid="$tabuuid"
+fi
 if [ -z "$tref" ]; then
   # fallback: cmux agent session store — newest session whose cwd IS this dir (covers tabs the
   # board predates, i.e. rows written before suuid existed)
@@ -714,6 +853,12 @@ PY
   fi
 fi
 
+# Owner: the board's csuuid is the sub-task record; when it has none (pre-ledger row, or a tab
+# that is not a sub-task at all) the opened-tabs ledger's owner for THIS surface stands in.
+tabowner_u=""
+[ -n "$tuuid" ] && tabowner_u="$(_cctabs_uc "$(_cctabs_owner "$tuuid")")"
+[ -n "$owner" ] || owner="$tabowner_u"
+
 # ── ② print the resolution BEFORE acting (never close something you did not name out loud) ──
 echo "── close: $cdir ──"
 if [ -z "$tuuid" ] || [ -z "$tref" ]; then
@@ -723,20 +868,35 @@ fi
 echo "  resolved : $tref  uuid=$tuuid  cwd=$ccan"
 echo "  recorded : parent=${owner:-<none>}  this-session=${self_uuid:-<no CMUX_SURFACE_ID>}"
 
-# ── ③ policy (same rules as hooks/block-unsafe-close.sh) ──
+# ── ③ policy ──
+# A non-worktree directory is a parent / primary-checkout / helper tab. Default: the human's, in
+# the cmux UI. ONE exception, and it is the whole point of the opened-tabs ledger: a tab THIS
+# session opened itself (a runner in the primary checkout, a scratch-dir tab) is closable by the
+# session that opened it — one may close what one opened, worktree or not. Anything without a
+# ledger row from this very session keeps the old refusal.
 case "$ccan" in
   */.claude/worktrees/*|*/.worktrees/*) ;;
-  *) echo "✗ refusing: $ccan is not a worktree checkout — parent / primary-checkout tabs are closed by the human in the cmux UI" >&2; exit 1 ;;
+  *) if [ -n "$self_uuid" ] && [ -n "$tabowner_u" ] && [ "$tabowner_u" = "$self_uuid" ]; then
+       echo "  (helper tab: not a worktree checkout, but the opened-tabs ledger records THIS session as its opener)"
+     else
+       echo "✗ refusing: $ccan is not a worktree checkout — parent / primary-checkout tabs are closed by the human in the cmux UI" >&2; exit 1
+     fi ;;
 esac
 if [ -n "$self_uuid" ] && [ "$tuuid" = "$self_uuid" ]; then
   echo "✗ refusing: that surface is THIS session — no automated self-close (2026-08-16 incident)" >&2; exit 1
 fi
 if _cc_automated; then
-  # automated caller (decided by process ancestry, not by an env var): ownership is the whole
-  # point of the ledger
-  [ -n "$owner" ] || { echo "✗ refusing: no dispatching parent recorded for this dir — treat it as human-opened" >&2; exit 1; }
-  [ "$owner" = "$self_uuid" ] || {
-    echo "✗ refusing: this tab was dispatched by $owner, not by this session — a sub-task tab is closable by ITS OWN parent only" >&2; exit 1; }
+  # automated caller (decided by process ancestry, not by an env var). Ownership is the point of
+  # the ledger — with ONE unlock: a sub-task whose branch is marked ready (gwt-done) is FINISHED,
+  # and a finished sub-task's tab is collectible by any automated caller, not only the session
+  # that dispatched it (campaign cleanup routinely outlives the dispatching parent).
+  if _cc_rowdone; then
+    echo "  (branch $bbranch is marked ready (gwt-done) — a finished sub-task's tab is collectible by any automated caller)"
+  else
+    [ -n "$owner" ] || { echo "✗ refusing: no dispatching parent recorded for this dir and the branch is not marked ready — treat it as human-opened" >&2; exit 1; }
+    [ "$owner" = "$self_uuid" ] || {
+      echo "✗ refusing: this tab was dispatched by $owner, not by this session, and its branch is not marked ready (gwt-done) — a live sub-task tab is closable by ITS OWN parent only" >&2; exit 1; }
+  fi
 else
   [ -n "$owner" ] && [ "$owner" != "$self_uuid" ] && \
     echo "  (human shell: closing a tab dispatched by $owner — ownership check reported, not enforced)"
@@ -749,6 +909,51 @@ if cmux close-surface --surface "$tuuid" >/dev/null 2>&1; then
 fi
 echo "✗ cmux close-surface failed for uuid $tuuid" >&2
 exit 1
+;;
+
+# ─────────────────────────────────────────────────────────────────────────────
+# tabs — the opened-tabs inventory: every tab this stack opened, joined with live cmux
+#   resolution. Answers the question a leader could not answer before ("which tabs did I open,
+#   and are they still there?") in the only identity that survives a pane opening or closing.
+#   Columns: REF (current short ref, "-" when the tab is gone) | UUID (the stable identity) |
+#   STATE (alive/dead) | OWNER (the surface uuid that opened it, "self" marked) | DIR.
+#   Reading prunes: rows whose surface no longer resolves are dropped — unless cmux is
+#   unreachable, in which case nothing is pruned and every row prints as "dead?" .
+# Usage: cc-dispatch.sh tabs [--all]
+#   (default) only rows this session opened;  --all  every row in the ledger
+# Related env: CC_TABS_FILE (ledger), CC_CALLER_SURFACE_UUID (override for $CMUX_SURFACE_ID)
+tabs)
+shift
+tabs_all=""
+if [ "${1:-}" = "--all" ]; then tabs_all=1; shift; fi
+[ $# -eq 0 ] || { echo "usage: cc-dispatch.sh tabs [--all]" >&2; exit 2; }
+
+tabs_f="$(_cctabs_file)"
+tabs_live="$(_cctabs_livemap)"
+_cctabs_prune "$tabs_live"
+tabs_self="$(_cctabs_uc "${CC_CALLER_SURFACE_UUID:-${CMUX_SURFACE_ID:-}}")"
+echo "── opened tabs ($tabs_f) ──"
+[ -f "$tabs_f" ] || { echo "  (no tabs recorded)"; exit 0; }
+[ -n "$tabs_live" ] || echo "  ⚠ cmux unreachable — liveness unknown, nothing pruned"
+printf '%-12s  %-36s  %-6s  %-36s  %s\n' REF UUID STATE OWNER DIR
+tabs_n=0
+while IFS=$'\t' read -r t_u t_o t_d t_s t_ts; do
+  [ -n "$t_u" ] || continue
+  [ "$t_o" = "-" ] && t_o=""
+  if [ -z "$tabs_all" ] && [ -n "$tabs_self" ] && [ "$t_o" != "$tabs_self" ]; then continue; fi
+  t_ref="$(printf '%s\n' "$tabs_live" | awk -F'\t' -v u="$t_u" '$2==u{print $1; exit}')"
+  if [ -n "$t_ref" ]; then t_state="alive"; else t_ref="-"; t_state="dead"; fi
+  [ -n "$tabs_live" ] || t_state="dead?"
+  t_own="${t_o:--}"
+  [ -n "$tabs_self" ] && [ "$t_o" = "$tabs_self" ] && t_own="$t_o (self)"
+  printf '%-12s  %-36s  %-6s  %-36s  %s\n' "$t_ref" "$t_u" "$t_state" "$t_own" "$t_d"
+  tabs_n=$((tabs_n+1))
+done < "$tabs_f"
+if [ "$tabs_n" -eq 0 ]; then
+  if [ -n "$tabs_all" ]; then echo "  (no tabs recorded)"
+  else echo "  (no tabs opened by this session — cc-dispatch.sh tabs --all shows every row)"; fi
+fi
+exit 0
 ;;
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1082,9 +1287,31 @@ if cmux list-workspaces 2>/dev/null | grep -qF "$abspath"; then
   exit 0
 fi
 
-exec cmux new-workspace --name "$name" --cwd "$abspath" --focus "$focus"
+# --id-format both makes the receipt carry the STABLE surface uuid of the workspace's first tab
+# next to its short ref, which is what the opened-tabs ledger records (a workspace opened for a
+# directory IS a tab this stack opened, so it belongs in the ledger exactly like a `surface` open).
+# Older cmux builds that reject the flag simply get the call again without it; a receipt we cannot
+# parse means no ledger row and NO behaviour change — the workspace still opens.
+# (No `exec` any more: the receipt has to be read before this process may leave.)
+wsout="$(cmux new-workspace --name "$name" --cwd "$abspath" --focus "$focus" --id-format both 2>/dev/null)"
+wsrc=$?
+if [ "$wsrc" != 0 ] || [ -z "$wsout" ]; then
+  wsout="$(cmux new-workspace --name "$name" --cwd "$abspath" --focus "$focus" 2>&1)"; wsrc=$?
+fi
+[ -n "$wsout" ] && printf '%s\n' "$wsout"
+[ "$wsrc" = 0 ] || exit "$wsrc"
+
+# Same FIELD-position parse as the surface path (never a sed pattern mixing literal parens with
+# wildcards — docs/known-issues.md, BSD sed), with a list-pane-surfaces join as the fallback.
+wsuuid="$(printf '%s\n' "$wsout" | awk '{for(i=1;i<NF;i++) if ($i ~ /^surface:[0-9]+$/) {u=$(i+1); gsub(/[()]/,"",u); if (u ~ /^[0-9A-Fa-f-]+$/ && length(u) >= 30) {print u; exit}}}')"
+if [ -z "$wsuuid" ]; then
+  wsref="$(printf '%s\n' "$wsout" | grep -oE 'surface:[0-9]+' | head -1)"
+  [ -n "$wsref" ] && wsuuid="$(_cctabs_livemap | awk -F'\t' -v r="$wsref" '$1==r{print $2; exit}')"
+fi
+_cctabs_log "$wsuuid" "${CC_CALLER_SURFACE_UUID:-${CMUX_SURFACE_ID:-}}" "$abspath" ""
+exit 0
 ;;
 
 *)
-  echo "usage: cc-dispatch.sh wt-claude <name> <prompt> [--prefix <p>] [--base <b>] | surface <path> [prompt] | send <surface-ref> \"<text>\" | calibrate <surface-ref> [label] | resume [--all] | workspace <path> [name] [focus]" >&2; exit 2 ;;
+  echo "usage: cc-dispatch.sh wt-claude <name> <prompt> [--prefix <p>] [--base <b>] | surface <path> [prompt] | send <surface-ref> \"<text>\" | calibrate <surface-ref> [label] | close <worktree-dir> | tabs [--all] | resume [--all] | workspace <path> [name] [focus]" >&2; exit 2 ;;
 esac

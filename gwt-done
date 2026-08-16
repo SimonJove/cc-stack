@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# cc-stack · gwt-done — mark THIS worktree's branch ready for merge (a harmless annotation:
+# branch.<b>.ccDone=true, which gwt-tree lights green and gwt-merge's preflight checks).
+#
+# WHY THIS EXISTS AS A FILE (incident 2026-08-16): `gwt-done` was only a zsh FUNCTION in
+# worktree.zsh. zsh functions do not survive into a non-interactive shell — a sub-task that ran
+# `gwt-done` from its Bash tool got "_gwt_root: command not found" and could not report ready.
+# Whether the function happened to be in scope was pure luck, so every dispatch's working
+# agreement now teaches the deterministic form instead:
+#     ~/.config/cc-stack/gwt-done
+# This script is shell-agnostic (bash/sh, nothing zsh about it), takes no arguments and prints
+# exactly what the zsh function printed. The zsh function stays for interactive users and now
+# delegates here, so there is ONE implementation.
+#
+# Usage: gwt-done            (from anywhere inside the worktree)
+#        gwt-done --undone   (the gwt-undone form: clear the ready flag)
+set -u
+
+CC="$(cd "$(dirname "$0")" 2>/dev/null && pwd -P)"
+[ -n "$CC" ] || CC="$HOME/.config/cc-stack"
+MERGE="$CC/cc-merge.sh"
+[ -f "$MERGE" ] || MERGE="$HOME/.config/cc-stack/cc-merge.sh"
+
+val=true
+case "${1:-}" in
+  ""|--done) ;;
+  --undone)  val=false ;;
+  *) echo "usage: gwt-done [--undone]" >&2; exit 2 ;;
+esac
+
+# Same two facts the zsh function resolved, resolved the same way: the MAIN repo root (a worktree
+# reports the shared .git dir via --git-common-dir, so this works from the worktree AND from the
+# primary checkout) and the branch checked out right here.
+g="$(git rev-parse --git-common-dir 2>/dev/null)" || { echo "✗ not inside a git repo" >&2; exit 1; }
+root="$(cd "$g/.." 2>/dev/null && pwd -P)" || { echo "✗ not inside a git repo" >&2; exit 1; }
+b="$(git symbolic-ref --short HEAD 2>/dev/null)" || { echo "✗ detached HEAD" >&2; exit 1; }
+[ -n "$b" ] || { echo "✗ detached HEAD" >&2; exit 1; }
+
+[ -f "$MERGE" ] || { echo "✗ cc-merge.sh not found (looked in $CC and ~/.config/cc-stack)" >&2; exit 1; }
+bash "$MERGE" done "$root" "$b" "$val" || exit 1
+if [ "$val" = true ]; then echo "✔ $b marked ready (gwt-done)"; else echo "✔ $b marked not-ready"; fi
