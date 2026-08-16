@@ -421,6 +421,60 @@ eq "gwt-merge --message exit0"  "$zrc" "0"
 eq "gwt-merge passes --message" "$(git -C "$MR3" log -1 --format=%s feat/T)" "chore(zsh): flag through gwt-merge"
 rm -rf "$MR3" "$FH"; rm -f "$TF8" "$SF8" "$AF8"
 
+echo "== 8c. do-merge temp-worktree lifecycle (target checked out NOWHERE) =="
+# 8b always gives the target a real worktree; here feat/camp exists only as a ref, so do-merge
+# must mint a temporary worktree and clean it up correctly on every path except commit-rejected.
+MR4=$(mktemp -d); ( cd "$MR4" || exit 1; git init -q; git config user.email t@t; git config user.name t
+  git commit -q --allow-empty -m i; git branch -M main
+  git branch feat/camp main                                # target branch, never checked out
+  git worktree add -q wtC1 -b feat/C1 feat/camp >/dev/null
+  cd wtC1; printf 'c1\n' > c1.txt; git add c1.txt; git commit -q -m 'chore: c1' )
+cat > "$MR4/.git/hooks/commit-msg" <<'HOOK'
+#!/usr/bin/env bash
+head -1 "$1" | grep -qE '^(feat|fix|refactor|test|docs|chore|perf|build|ci|style)(\([a-z0-9/-]+\))?: .' || {
+  echo "subject must follow Conventional Commits: <type>(<scope>): <subject>" >&2; exit 1; }
+HOOK
+chmod +x "$MR4/.git/hooks/commit-msg"
+# (a) SUCCESS: temp worktree minted, merge lands, registration count unchanged afterwards
+wtc="$(git -C "$MR4" worktree list --porcelain | grep -c '^worktree ')"
+OUT="$("$CC/cc-merge.sh" do-merge "$MR4" feat/C1 squash feat/camp)"; rc=$?
+eq "temp-path squash exit0"          "$rc" "0"
+eq "temp-path squash subject"        "$(git -C "$MR4" log -1 --format=%s feat/camp)" "chore: merge feat/C1 into feat/camp (squash)"
+eq "temp-path Child-Tip trailer"     "$(git -C "$MR4" log -1 --format=%B feat/camp | grep -c "Child-Tip: $(git -C "$MR4" rev-parse feat/C1)")" "1"
+eq "temp-path content landed"        "$(git -C "$MR4" show feat/camp:c1.txt 2>/dev/null)" "c1"
+eq "temp wt deregistered on success" "$(git -C "$MR4" worktree list --porcelain | grep -c '^worktree ')" "$wtc"
+# (b) COMMIT-REJECTED: the temp worktree is deliberately KEPT, its dir printed, manual finish works
+git -C "$MR4" worktree add -q wtC2 -b feat/C2 feat/camp >/dev/null
+( cd "$MR4/wtC2" || exit 1; printf 'c2\n' > c2.txt; git add c2.txt; git commit -q -m 'chore: c2' )
+OUT="$($CC/cc-merge.sh do-merge "$MR4" feat/C2 squash feat/camp --message 'not a conventional subject at all' 2>&1)"; rc=$?
+# NB: parse with bash string ops, NOT sed — macOS BSD sed mis-matches BREs whose literal "(" +
+# ".*" must cross a ")" in the subject before anchoring "$" (see docs/known-issues.md)
+presline="$(echo "$OUT" | grep 'staged merge PRESERVED in:')"
+kept="${presline#*PRESERVED in: }"
+kept="${kept%% (branch*}"
+eq "temp-path reject exit3"          "$rc" "3"
+eq "temp-path reject keeps wt"       "$(git -C "$MR4" worktree list --porcelain | grep -c '^worktree ')" "$((wtc + 2))"   # +wtC2 +kept temp
+eq "temp-path reject prints dir"     "$( [ -n "$kept" ] && [ -d "$kept" ] && echo yes || echo no)" "yes"
+eq "temp-path reject temp hint"      "$(echo "$OUT" | grep -c 'is a temporary worktree')" "1"
+eq "temp-path staged preserved"      "$(git -C "$kept" diff --cached --name-only 2>/dev/null | grep -c c2.txt)" "1"
+git -C "$kept" commit -q -m 'chore: finish by hand'; eq "manual finish commits" "$?" "0"
+eq "manual finish lands content"     "$(git -C "$MR4" show feat/camp:c2.txt 2>/dev/null)" "c2"
+git -C "$MR4" worktree remove "$kept" >/dev/null 2>&1
+eq "kept wt removable after finish"  "$(git -C "$MR4" worktree list --porcelain | grep -c '^worktree ')" "$((wtc + 1))" # +wtC2 only
+# (c) REAL CONFLICT via the temp path: aborted, deregistered, output visible.
+# Child MUST branch before the target advances, otherwise it contains the target side (no conflict).
+git -C "$MR4" worktree add -q wtC3 -b feat/C3 feat/camp >/dev/null
+( cd "$MR4/wtC3" || exit 1; printf 'child-side\n' > clash.txt; git add clash.txt; git commit -q -m 'chore: child side' )
+git -C "$MR4" worktree add -q wtX feat/camp >/dev/null
+( cd "$MR4/wtX" || exit 1; printf 'target-side\n' > clash.txt; git add clash.txt; git commit -q -m 'chore: target side' )
+git -C "$MR4" worktree remove --force wtX >/dev/null 2>&1        # feat/camp is nowhere again
+OUT="$($CC/cc-merge.sh do-merge "$MR4" feat/C3 no-ff feat/camp 2>&1)"; rc=$?
+eq "temp-path conflict exit1"        "$rc" "1"
+eq "temp-path conflict label"        "$(echo "$OUT" | grep -c '^conflict:')" "1"
+eq "temp-path conflict output"       "$(echo "$OUT" | grep -c 'CONFLICT')" "1"
+eq "temp wt deregistered on conflict" "$(git -C "$MR4" worktree list --porcelain | grep -c '^worktree ')" "$((wtc + 2))" # +wtC2 +wtC3
+rm -rf "$MR4"
+
 echo "== 9. cc-merge capture =="
 # caller is on feat/A (wtA) → new branch feat/Ax should capture parent feat/A
 git -C "$MR" worktree add -q wtAx -b feat/Ax feat/A >/dev/null
