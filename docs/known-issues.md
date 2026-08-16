@@ -57,7 +57,9 @@
 **实现参照**(模式列表 + 兜底都在 `cc-dispatch.sh` 顶部的 cc-send 块):
 - 默认模式列表 `^❯:^>`(冒号分隔 ERE,自动锚定行首);`CC_SEND_INPUT_PATTERNS` **整体替换**默认列表;
 - 空白判定把 NBSP(UTF-8 字节 c2 a0)视为空白——若新版光标占位换成别的字符,空态会被误判 busy(超时→通知→死等),同样是本条目的排查对象;
-- 面包屑写 cc-failures.log(`CC_SEND_FAILLOG` 可覆盖):fail-open 与校准失配各写一行,gwt-status 可见。
+- 持有通知非一次性:`CC_SEND_TIMEOUT`(默认 60s)首发,此后每 `CC_SEND_HEARTBEAT_SEC`(默认 300s,0=只发一次)重发,正文带 blocked-by 预览(`CC_SEND_PREVIEW_CHARS`,默认 40,0=关)——placeholder 类无限 hold 至少持续可见;
+- busy 快路径:捕获里出现工作指示行(旋转 glyph + 时长括号,实测 6 帧 `· ✢ ✳ ✶ ✻ ✽`,形如 `✻ Befuddling… (10m 12s · ↓ 34.0k tokens)`;`CC_SEND_BUSY_PATTERNS` 整体替换)即**跳过等待直接发送**——cmux 对工作 pane 的 send 会入队并被消费,输入框里的队列文本不值得等。pattern 失配只是退化回等待,方向安全;
+- 面包屑写 cc-failures.log(`CC_SEND_FAILLOG` 可覆盖):fail-open、校准失配、发送后 park 各写一行,gwt-status 可见。
 
 **排查三步**:
 1. 任意 idle claude tab 跑 `cmux read-screen --surface <ref> --lines 8`,看输入行现在的形态(空态),必要时 hexdump(`| od -An -tx1`)确认 ❯ 后面的字节;
@@ -74,7 +76,7 @@
 - cc-send 的出口固定是 `cmux send` + `send-key Enter` **成对**——Enter 是该缺陷的 flush 手段,但**成对不等于必达**(见下方现场数据);
 - 若输入框里已有**历史残留的 parked 消息**(旧裸 send / busy 队列留下),❯ 行非空 → cc-send 判 busy,持有 + 桌面通知而非追加堆叠(安全的失败方向);清掉残留后正常投递;
 - 同文档观察 #1(首字符在传输中被吞)对 cc-send 同样成立——报告消息开头几个字符可能丢失,关键路径用文件传递。
-- **现场数据(2026-08-15,父→子长指令)**:`cmux send` + `send-key Enter` 双双返回 OK,长文本被 TUI 折叠为 `[Pasted text #1]` 后**紧随的 Enter 被吞**,消息在输入框停了 ~15 分钟、claude 全程不知情,手动再补一个 Enter 才送达。教训:发长指令后用 read-screen 复核输入行已清,非空则补按一次 Enter;给 cc-send 加"发送后确认 + 补按"属后续增强(现设计只检查发送前)。
+- **现场数据(2026-08-15,父→子长指令)**:`cmux send` + `send-key Enter` 双双返回 OK,长文本被 TUI 折叠为 `[Pasted text #1]` 后**紧随的 Enter 被吞**,消息在输入框停了 ~15 分钟、claude 全程不知情,手动再补一个 Enter 才送达。教训:发长指令后用 read-screen 复核输入行已清,非空则补按一次 Enter;"发送后确认 + 补按"已实现(2026-08-15,feat/ccsend-delivery-impl):cc-send 空态投递后复读输入行,非空即补按**一次** Enter,再非空则响亮失败(stderr + 面包屑 + rc≠0),绝不假装成功;busy 快路径投递跳过复核(队列文本留在输入框是合法终态)。
 
 ## macOS BSD sed:BRE 里字面括号 + `.*` 跨过文本 `)` 再锚 `$` 会静默失配
 

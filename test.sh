@@ -604,14 +604,22 @@ echo "== 16. cc-send (roadmap 2b: collision-safe send primitive) =="
 # fake-cmux harness: a fake `cmux` on PATH records send/send-key/notify into $CC_FAKE_LOG and
 # serves $CC_FAKE_SCREEN from read-screen. CC_FAKE_CLEAR_AT=N flips the screen to the empty
 # input line on the Nth read (the human submits their draft); CC_FAKE_FAIL=1 makes read-screen
-# fail (cmux hiccup). CC_SEND_FAILLOG keeps breadcrumbs off the live cc-failures.log.
+# fail (cmux hiccup). CC_FAKE_ON_SEND=<file> swaps the screen in right after a `send` (the text
+# PARKS in the composer); CC_FAKE_FLUSH_AT=N flips it back to the empty line on the Nth Enter
+# (the retry submits the parked text). CC_SEND_FAILLOG keeps breadcrumbs off the live
+# cc-failures.log. CC_SEND_VERIFY_SEC=0.2 shrinks the post-send verify delays for speed.
 FS=$(mktemp -d); export CC_FAKE_LOG="$FS/log"; export CC_FAKE_SCREEN="$FS/screen"
 cat > "$FS/cmux" <<'CMUX'
 #!/usr/bin/env bash
 case "$1" in
   ping) exit 0 ;;
-  send)     shift; printf 'SEND|%s\n'  "$*" >> "$CC_FAKE_LOG" ;;
-  send-key) shift; printf 'KEY|%s\n'   "$*">> "$CC_FAKE_LOG" ;;
+  send)     shift; printf 'SEND|%s\n'  "$*" >> "$CC_FAKE_LOG"
+            [ -n "${CC_FAKE_ON_SEND:-}" ] && cp "$CC_FAKE_ON_SEND" "$CC_FAKE_SCREEN" 2>/dev/null ;;
+  send-key) shift; printf 'KEY|%s\n'   "$*">> "$CC_FAKE_LOG"
+            case "$*" in *Enter*)
+              [ -n "${CC_FAKE_FLUSH_AT:-}" ] && {
+                n=$(grep -c 'Enter$' "$CC_FAKE_LOG" 2>/dev/null); n=${n:-0}
+                [ "$n" -ge "$CC_FAKE_FLUSH_AT" ] && printf '\xe2\x9d\xaf\xc2\xa0\n' > "$CC_FAKE_SCREEN"; } ;; esac ;;
   notify)   shift; printf 'NOTIFY|%s\n' "$*" >> "$CC_FAKE_LOG" ;;
   read-screen)
     [ -n "${CC_FAKE_FAIL:-}" ] && exit 1
@@ -626,7 +634,7 @@ CMUX
 chmod +x "$FS/cmux"
 FL="$FS/failures.log"
 csend_reset(){ : > "$CC_FAKE_LOG"; rm -f "${CC_FAKE_LOG}.cnt"; rm -f "$FL"; cp "$1" "$CC_FAKE_SCREEN"; }
-OPATH="$PATH"; PATH="$FS:$PATH"
+OPATH="$PATH"; PATH="$FS:$PATH"; export CC_SEND_VERIFY_SEC=0.2
 # byte-exact fixtures from the 2026-08-15 live probes (claude 2.1.233, BOTH renderers):
 # empty input line = prompt glyph + U+00A0 NBSP cursor placeholder; composing = + draft; the
 # transcript echoes submitted messages as prompt + ASCII space + text (ABOVE the live box).
@@ -637,14 +645,25 @@ fw(){ echo ""; echo "$R20"; printf '%s%s\n' "$P" "$NB"; echo "$R20"; echo "  glm
 { echo "$R20"; printf '%s%s%s\n' "$P" "$NB" 'user typing draft text 123'; echo "$R20"; echo "  status"; } > "$FS/scr-busy"
 { echo ""; printf '%s %s\n' "$P" 'fullscreen draft xyzparked draft for smoke2'; fw; } > "$FS/scr-echo"   # transcript echo ABOVE empty live box
 { echo "$ last login"; echo "PROMPT> "; }                          > "$FS/scr-prompt"     # no claude TUI at all
+# busy-indicator fixtures — byte-exact from the 2026-08-15 live probe (own tab mid-turn, claude
+# 2.1.233): working line at column 0, "<spinner> <gerund>… (<dur> · <stats>)"; spinner rotates
+# through 6 glyphs (· ✢ ✳ ✶ ✻ ✽ — ✻ here = e2 9c bb, … = e2 80 a6, · = c2 b7, ↓ = e2 86 93)
+SP="$(printf '\xe2\x9c\xbb')"
+spun(){ printf '%s Befuddling\xe2\x80\xa6 (2m 26s \xc2\xb7 \xe2\x86\x93 14.2k tokens)\n' "$1"; }
+{ spun "$SP"; echo "$R20"; printf '%s%s%s\n' "$P" "$NB" 'queued msg text'; echo "$R20"; } > "$FS/scr-spin-queued"
+{ spun "$SP"; echo "$R20"; printf '%s%s\n'    "$P" "$NB";               echo "$R20"; } > "$FS/scr-spin-empty"
+{ echo "WORKING hard now (always)"; echo "$R20"; printf '%s%s%s\n' "$P" "$NB" 'queued msg text'; } > "$FS/scr-custom-busy"
+printf '%s%s%s\n' "$P" "$NB" '[Pasted text +1]'                    > "$FS/scr-parked"     # text parked in the composer after send
+{ echo "$R20"; printf '%s%s%s\n' "$P" "$NB" 'user is drafting 0123456789ABCDEFGHIJ'; echo "$R20"; } > "$FS/scr-longdraft"
 # 1) empty input line → immediate send (both renderer fixtures), no notify, no crumb
 csend_reset "$FS/scr-full-empty"
-CC_SEND_FAILLOG="$FL" bash "$CC/cc-dispatch.sh" send surface:1 "hello gate" >/dev/null 2>&1; rcs=$?
+CC_SEND_FAILLOG="$FL" bash "$CC/cc-dispatch.sh" send surface:1 "hello gate" >"$FS/out" 2>&1; rcs=$?
 eq "fullscreen empty rc0"       "$rcs" "0"
 eq "fullscreen empty sends"     "$(grep -cF 'hello gate' "$CC_FAKE_LOG")" "1"
 eq "fullscreen empty Enter"     "$(grep -c 'KEY|.*Enter' "$CC_FAKE_LOG")" "1"
 eq "fullscreen empty no notify" "$(grep -c 'NOTIFY|' "$CC_FAKE_LOG")" "0"
 eq "fullscreen empty no crumb"  "$([ -f "$FL" ] && echo yes || echo no)" "no"
+eq "empty path not the fast-path" "$(grep -cF '(queued' "$FS/out")" "0"
 csend_reset "$FS/scr-def-empty"
 CC_SEND_FAILLOG="$FL" bash "$CC/cc-dispatch.sh" send surface:1 "hi default" >/dev/null 2>&1
 eq "default empty sends"        "$(grep -cF 'hi default' "$CC_FAKE_LOG")" "1"
@@ -672,6 +691,27 @@ eq "timeout kept waiting (≥2s)" "$(( t1 - t0 >= 2 ))" "1"
 eq "timeout never drops"        "$(grep -cF 'held msg' "$CC_FAKE_LOG")" "1"
 nline=$(grep -n 'NOTIFY|' "$CC_FAKE_LOG" | cut -d: -f1); sline=$(grep -n 'SEND|' "$CC_FAKE_LOG" | head -1 | cut -d: -f1)
 [ "$nline" -lt "$sline" ] && ok "notify precedes send" || no "notify precedes send" "$nline" "< $sline"
+# 4b) heartbeat: while still holding, re-notify every CC_SEND_HEARTBEAT_SEC (short override for
+# speed), each carrying the held duration + the blocked-by preview of the blocking line
+csend_reset "$FS/scr-busy"
+CC_SEND_TIMEOUT=1 CC_SEND_HEARTBEAT_SEC=1 CC_SEND_FAILLOG="$FL" \
+  CC_FAKE_CLEAR_AT=9 bash "$CC/cc-dispatch.sh" send surface:1 "hb msg" >/dev/null 2>&1
+nhb=$(grep -c 'NOTIFY|' "$CC_FAKE_LOG")
+eq "heartbeat re-fires (≥2)"    "$(( nhb >= 2 && nhb <= 8 ))" "1"
+eq "heartbeat still delivers"   "$(grep -cF 'hb msg' "$CC_FAKE_LOG")" "1"
+eq "heartbeat carries duration" "$(grep -cE 'held the message for [0-9]+s' "$CC_FAKE_LOG")" "$nhb"
+eq "heartbeat carries preview"  "$(grep -cF 'blocked by: "user typing draft text 123"' "$CC_FAKE_LOG")" "$nhb"
+# 4c) preview truncates at CC_SEND_PREVIEW_CHARS; 0 disables it (notify still fires)
+csend_reset "$FS/scr-longdraft"
+CC_SEND_TIMEOUT=1 CC_SEND_PREVIEW_CHARS=10 CC_SEND_FAILLOG="$FL" \
+  CC_FAKE_CLEAR_AT=4 bash "$CC/cc-dispatch.sh" send surface:1 "trunc msg" >/dev/null 2>&1
+eq "preview truncates at limit" "$(grep -cF 'blocked by: "user is dr"' "$CC_FAKE_LOG")" "1"
+eq "preview drops the tail"     "$(grep -cF 'ABCDEFGHIJ' "$CC_FAKE_LOG")" "0"
+csend_reset "$FS/scr-longdraft"
+CC_SEND_TIMEOUT=1 CC_SEND_PREVIEW_CHARS=0 CC_SEND_FAILLOG="$FL" \
+  CC_FAKE_CLEAR_AT=4 bash "$CC/cc-dispatch.sh" send surface:1 "noprev msg" >/dev/null 2>&1
+eq "preview off still notifies" "$(grep -c 'NOTIFY|' "$CC_FAKE_LOG")" "1"
+eq "preview off omits preview"  "$(grep -c 'blocked by' "$CC_FAKE_LOG")" "0"
 # 5) read-screen failure → fail-open raw send + breadcrumb; CC_SEND_QUIET suppresses the crumb
 csend_reset "$FS/scr-busy"
 CC_FAKE_FAIL=1 CC_SEND_FAILLOG="$FL" bash "$CC/cc-dispatch.sh" send surface:1 "failopen" >/dev/null 2>&1; rcs=$?
@@ -704,6 +744,63 @@ csend_reset "$FS/scr-full-empty"
 CC_SEND_INPUT_PATTERNS='^❯::^>' CC_SEND_FAILLOG="$FL" bash "$CC/cc-dispatch.sh" send surface:1 "dblcolon" >/dev/null 2>&1
 eq "double-colon still sends"    "$(grep -cF 'dblcolon' "$CC_FAKE_LOG")" "1"
 eq "double-colon no crumb"       "$([ -f "$FL" ] && echo yes || echo no)" "no"
+# 6c) busy fast-path: a working-indicator line (probed spinner form) sends IMMEDIATELY — no hold
+# (even with QUEUED text in the input box), no notify, no post-send verify (one Enter only).
+# CC_SEND_TIMEOUT/CC_FAKE_CLEAR_AT are the SAFETY NET: if the fast-path ever regresses, the case
+# degrades to the normal hold→clear→send path and the "(queued" asserts catch it instead of hanging.
+csend_reset "$FS/scr-spin-queued"
+CC_SEND_TIMEOUT=1 CC_FAKE_CLEAR_AT=4 CC_SEND_FAILLOG="$FL" \
+  bash "$CC/cc-dispatch.sh" send surface:1 "fastpath" >"$FS/out" 2>&1; rcs=$?
+eq "fastpath queued-input rc0"   "$rcs" "0"
+eq "fastpath sends now"          "$(grep -cF 'fastpath' "$CC_FAKE_LOG")" "1"
+eq "fastpath no notify"          "$(grep -c 'NOTIFY|' "$CC_FAKE_LOG")" "0"
+eq "fastpath one Enter (no verify)" "$(grep -c 'KEY|.*Enter' "$CC_FAKE_LOG")" "1"
+eq "fastpath says queued"        "$(grep -cF '(queued' "$FS/out")" "1"
+eq "fastpath no crumb"           "$([ -f "$FL" ] && echo yes || echo no)" "no"
+# the scan runs BEFORE the empty/busy verdict — a spinner over an EMPTY input line fast-paths too
+# (distinguishable from the normal empty-path only by the output line + the missing verify re-read)
+csend_reset "$FS/scr-spin-empty"
+CC_SEND_TIMEOUT=1 CC_FAKE_CLEAR_AT=4 CC_SEND_FAILLOG="$FL" \
+  bash "$CC/cc-dispatch.sh" send surface:1 "spinempty" >"$FS/out" 2>&1
+eq "fastpath fires before verdict" "$(grep -cF '(queued' "$FS/out")" "1"
+eq "fastpath empty-input no verify" "$(grep -c 'KEY|.*Enter' "$CC_FAKE_LOG")" "1"
+# CC_SEND_BUSY_PATTERNS REPLACES the defaults (no union) and skips empty entries
+# (an empty ERE matches every line → would fast-path every send)
+csend_reset "$FS/scr-custom-busy"
+CC_SEND_TIMEOUT=1 CC_FAKE_CLEAR_AT=4 CC_SEND_BUSY_PATTERNS='^WORKING' CC_SEND_FAILLOG="$FL" \
+  bash "$CC/cc-dispatch.sh" send surface:1 "custom busy" >"$FS/out" 2>&1
+eq "busy override matches custom" "$(grep -cF 'custom busy' "$CC_FAKE_LOG")" "1"
+eq "busy override says queued"    "$(grep -cF '(queued' "$FS/out")" "1"
+eq "busy override no notify"      "$(grep -c 'NOTIFY|' "$CC_FAKE_LOG")" "0"
+csend_reset "$FS/scr-spin-queued"
+CC_SEND_TIMEOUT=1 CC_FAKE_CLEAR_AT=4 CC_SEND_BUSY_PATTERNS='^WORKING' CC_SEND_FAILLOG="$FL" \
+  bash "$CC/cc-dispatch.sh" send surface:1 "norepl" >"$FS/out" 2>&1
+eq "busy override replaces defaults" "$(grep -cF '(queued' "$FS/out")" "0"
+eq "busy override still delivers"    "$(grep -cF 'norepl' "$CC_FAKE_LOG")" "1"
+csend_reset "$FS/scr-spin-queued"
+CC_SEND_TIMEOUT=1 CC_FAKE_CLEAR_AT=4 CC_SEND_BUSY_PATTERNS=':' CC_SEND_FAILLOG="$FL" \
+  bash "$CC/cc-dispatch.sh" send surface:1 "emptyentry" >"$FS/out" 2>&1
+eq "busy empty-entry skipped"     "$(grep -cF '(queued' "$FS/out")" "0"
+eq "busy empty-entry delivers"    "$(grep -cF 'emptyentry' "$CC_FAKE_LOG")" "1"
+# 6d) post-send verify (empty path): the text PARKS after send (Enter swallowed) → exactly ONE
+# Enter retry, then success; the retry is swallowed too → loud failure (rc≠0 + breadcrumb + stderr),
+# never a silent success
+csend_reset "$FS/scr-full-empty"
+CC_FAKE_ON_SEND="$FS/scr-parked" CC_FAKE_FLUSH_AT=2 CC_SEND_FAILLOG="$FL" \
+  bash "$CC/cc-dispatch.sh" send surface:1 "parked once" >"$FS/out" 2>&1; rcs=$?
+eq "verify retry rc0"            "$rcs" "0"
+eq "verify retry sends once"     "$(grep -cF 'parked once' "$CC_FAKE_LOG")" "1"
+eq "verify retry Enter twice"    "$(grep -c 'KEY|.*Enter' "$CC_FAKE_LOG")" "2"
+eq "verify retry success line"   "$(grep -c '✔ cc-send: delivered' "$FS/out")" "1"
+eq "verify retry no crumb"       "$([ -f "$FL" ] && echo yes || echo no)" "no"
+csend_reset "$FS/scr-full-empty"
+CC_FAKE_ON_SEND="$FS/scr-parked" CC_SEND_FAILLOG="$FL" \
+  bash "$CC/cc-dispatch.sh" send surface:1 "parked twice" >"$FS/out" 2>&1; rcs=$?
+eq "verify park-fail rc1"        "$rcs" "1"
+eq "verify park-fail one retry"  "$(grep -c 'KEY|.*Enter' "$CC_FAKE_LOG")" "2"
+eq "verify park-fail no success" "$(grep -c '✔ cc-send: delivered' "$FS/out")" "0"
+eq "verify park-fail loud msg"   "$(grep -c '✗ cc-send: sent' "$FS/out")" "1"
+eq "verify park-fail crumb"      "$(grep -c 'parked after send' "$FL" 2>/dev/null)" "1"
 # 7) calibration: breadcrumb on pattern miss; hit stays silent; read-fail is not drift
 csend_reset "$FS/scr-prompt"
 CC_SEND_FAILLOG="$FL" bash "$CC/cc-dispatch.sh" calibrate surface:9 /tmp/cal-x >/dev/null 2>&1; rcs=$?
@@ -722,7 +819,7 @@ bash "$CC/cc-dispatch.sh" send >/dev/null 2>&1; eq "send usage rc2" "$?" "2"
 eq "raw cmux send sites = RDY + raw-exit" "$(grep -cE '^[[:space:]]*cmux send ' "$CC/cc-dispatch.sh")" "2"
 eq "cc-hooks.sh has no send site"         "$(grep -c 'cmux send' "$CC/cc-hooks.sh")" "0"
 grep -q 'cc-dispatch.sh send \$caller_surface' "$CC/cc-dispatch.sh" && ok "backchannel teaches cc-send" || no "backchannel teaches cc-send" missing present
-PATH="$OPATH"; unset CC_FAKE_LOG CC_FAKE_SCREEN; rm -rf "$FS"
+PATH="$OPATH"; unset CC_FAKE_LOG CC_FAKE_SCREEN CC_SEND_VERIFY_SEC; rm -rf "$FS"
 
 echo ""
 echo "== syntax =="

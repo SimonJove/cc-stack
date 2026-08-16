@@ -93,6 +93,7 @@ CC_WT_PROMPT='the full first instruction for the task (may be multi-line)' git w
 - **Respect the project harness**: works per the **sub-task's own project** `CLAUDE.md`/`.claude`, no going rogue;
 - **Don't land changes**: `commit` / `rebase` / `merge` / `push` / remove worktree / delete branch **all require your authorization**, defaulting to "keep the branch";
 - **Backchannel**: the sub-task reports back via `cc-dispatch.sh send <caller-surface> "<message>"` (the cc-send primitive — it waits out any half-typed line in the target tab instead of colliding with it; raw `cmux send` + Enter is never used).
+- **cc-send can legitimately wait minutes**: a held message re-notifies on a heartbeat (`CC_SEND_HEARTBEAT_SEC`, default 300s) and sends the moment the line clears — when calling it from a claude Bash tool use, run it with `run_in_background` or raise `CC_SEND_TIMEOUT`; a killed loop loses the message (no queue, no persistence).
 
 ### The ways to create a worktree
 
