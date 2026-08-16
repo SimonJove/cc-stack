@@ -48,9 +48,11 @@
 
 ## cc-send 门卫失效(claude TUI 升级后)——排查锚点
 
-**症状**:cc-send 不再等待正在输入的用户(恒直达),或恒走 fail-open 面包屑;开 tab 自校准报模式不命中。
+**症状**:cc-send 不再等待正在输入的用户(恒直达),或恒走 fail-open 面包屑;开 tab 自校准报模式不命中;或反之——**无人输入却 hold 死等**(60s 通知后无限等)。
 
 **根因**:cc-send(`cc-dispatch.sh send`)靠 read-screen 解析 claude TUI 输入行的"❯ 提示符 + 行内是否已有未提交文本"判断撞车。该形态由 TUI 渲染器(`tui: fullscreen|default`)和 claude 版本决定——**claude TUI 改版输入区后,模式列表失配,门卫失明**。已实测(2026-08-15,claude 2.1.233):两种渲染器的输入行**字节级一致**——空态 = `❯` + U+00A0 不换行空格(光标占位,不是 ASCII 空格!),输入态 = `❯` + NBSP + 草稿;transcript 会以 `❯` + ASCII 空格回显已提交消息(在活输入框**上方**,故 cc-send 自底向上取最后一条命中行)。
+
+**根因变体——上下文建议 placeholder 中毒(2026-08-15 晚实弹)**:输入框空态下的**建议型 placeholder**(TUI 按会话上下文生成的跟进提示,如"继续,L10 三条做完就发令牌合并")会**渲染进 pane 文本缓冲**——read-screen 捕获到 `❯ + 建议文案`,cc-send 判 busy → hold。placeholder 本身就是空态、永远不会"清空",没有人工干预即**无限 hold**(现场:子任务汇报被扣 6 分钟,直到人工发消息解堵)。与草稿无法用文本区分(本质差异是颜色:placeholder 恒暗灰、输入恒正常色,而 read-screen/capture-pane 均不保留转义码)。**已应用规避:`~/.claude/settings.json` 设 `"promptSuggestionEnabled": false`**(schema 原文:When false, prompt suggestions are disabled;env 替代 `CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION`)——只对新会话生效。辅助判别(editorMode=vim 时):有字但模式行无 `-- INSERT --`/`-- NORMAL --` 标记 = placeholder 态;该标记是 vim 专属,非 vim 配置无此信号。
 
 **实现参照**(模式列表 + 兜底都在 `cc-dispatch.sh` 顶部的 cc-send 块):
 - 默认模式列表 `^❯:^>`(冒号分隔 ERE,自动锚定行首);`CC_SEND_INPUT_PATTERNS` **整体替换**默认列表;
@@ -61,6 +63,8 @@
 1. 任意 idle claude tab 跑 `cmux read-screen --surface <ref> --lines 8`,看输入行现在的形态(空态),必要时 hexdump(`| od -An -tx1`)确认 ❯ 后面的字节;
 2. 跑 `~/.config/cc-stack/cc-dispatch.sh calibrate <ref>`(对已知空输入框复检模式命中;miss 会写面包屑并 exit 1),对照模式列表是否匹配新形态;
 3. 不匹配 → `CC_SEND_INPUT_PATTERNS` 一行改配置先恢复,或跟进新版式;更新后用"注入文本不按 Enter + read-screen"复检(设计验证手法,2026-08-15 已用此法实证过)。
+
+**hold 类症状的排查前缀**:先确认非空行是不是 placeholder(肉眼看灰字,或 vim 配置看无编辑标记)——是则先查 `promptSuggestionEnabled` 是否被版本改版重新默认开启,而不是调模式列表。
 
 **兜底语义**:模式失配时 fail-open 退回裸 send——行为=本功能出现之前,不会丢消息、不会扣死,只是失去防撞保护。开 tab 自校准(cc-dispatch.sh surface 在 TUI 起来后跑一次)的面包屑是第一报警线。
 
