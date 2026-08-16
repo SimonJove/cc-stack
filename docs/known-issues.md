@@ -85,3 +85,14 @@
 **根因**:`/usr/bin/sed`(BSD,darwin 25)的 BRE 匹配怪癖,~20 组探针定界:模式含**字面 `(`**、其后的 `.*` 需要**跨过主体文本中的 `)`**、再锚 `$` 时失配;去掉任一条件(`(` 或 `$` 或跨 `)`)即恢复正常。`\(…\)` 分组、无括号 `.*$`、`).*$` 均正常。LC_ALL=C 无济于事。
 
 **规则**:在本仓库(darwin + bash 3.2)里,**解析含括号的行一律不用 sed 模式混排字面括号与通配**——用 bash 参数展开(`${v#*prefix}` / `${v%% (suffix*}`)或 awk。先例:test.sh 8c 的 `kept` 提取(注释里有指向本条)。
+
+## cc-board 读循环对空 caller 字段的 TAB 塌缩(存量,未修)
+
+**现象**:任务 TSV 第 5 字段(caller surface)为空时,bash/zsh 的 `read` 连续 TAB 塌缩导致后续字段左移一位——render 显示错列、prune 可能误删。live 数据 0 行受影响(实际派发都会写 caller)。
+**根因**:`read a b c` 语义对空字段不保位;写侧未做防塌缩(test.sh 的字段数断言因此恒非空)。
+**处置**:后续 sweep——写侧对空 caller 写占位符(如 `-`)或读侧换 `IFS=$'\t' read -r` 数组式解析(注意 bash 3.2 无 `read -a` 于 zsh 差异)。关联:8 字段 launch-args 落地时已确认新字段写侧有 tab 消毒,不会加重本条。
+
+## block-worktree-commit.sh 未入库(运行态孤儿文件)
+
+**风险**:`~/.claude/hooks/block-worktree-commit.sh`(v2,命令有效目录判定)是 commit 门卫的唯一实现,**不在 cc-stack 仓库**——机器迁移/重装即丢,且无测试覆盖(8 项手测 2026-08-16 全过后未固化)。
+**处置建议**:收编进仓库(hooks/ 目录)+ install.sh 分发 + test.sh 加合成 stdin 断言。v2 语义:命令有效目录(commit 前最后一个 `cd X`/`-C X`)优先,解析失败回退会话 cwd;哨兵一次一 commit 原样。
