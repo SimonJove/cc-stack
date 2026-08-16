@@ -8,7 +8,7 @@ cc-* 脚本 10→6 收拢重构(install 自动迁移)、审计修复 P1-P4、hoo
 
 任务 #6 的遗留:重构前**原生长简报派发两次静默失败**(无触发词也失败;提取器单测正常、管道重放正常、注册正确、无面包屑,根因未明)。hook 已被重构整体重写——下次在任何项目里真实派发一个子任务,确认 tab 正常打开即关闭此项;若复现,用临时探针抓 hook 的原生 stdin/input 对比管道输入。相关:docs/known-issues.md 的非规范引号角落。
 
-## 2. Feature C · gwt-resume(断线重建)— 设计定稿 2026-08-15(已研究已验证)
+## 2. ~~Feature C · gwt-resume(断线重建)~~ 已实施(2026-08-15,feat/gwt-resume-impl)— 设计定稿 2026-08-15(已研究已验证)
 
 **研究结论:**
 - `claude --session-id <uuid>`:调用方预铸 UUID 传入(我们用 `uuidgen`),不依赖事后捕获——已实证会话文件落在铸的 UUID 下;
@@ -24,6 +24,8 @@ cc-* 脚本 10→6 收拢重构(install 自动迁移)、审计修复 P1-P4、hoo
 3. 交互:先列清单(BRANCH|摘要|dir|tab 态)再 y/N 确认;
 4. **硬不变量:恢复必须用板上记录的原样 canonical 路径启动,不许重新解析**——claude 按路径字符串索引项目身份/trust/CLAUDE.md,`/Users` vs `/private` 差一个前缀就是另一个项目(已实证)。cc-dispatch.sh surface 的 `--working-directory <记录的dir>` 原样复用;
 5. 无会话可恢复时降级为 idle ccteam,失败可见。
+
+**实施注记(2026-08-15,feat/gwt-resume-impl)**:落地为 `cc-dispatch.sh resume`(zsh `gwt-resume` 薄包装)。实测补充:原生恢复入口是 `cmux restore-session`(整会话);恢复 tab 与板行的匹配键用 cmux 会话库 `~/.cmuxterm/claude-hook-sessions.json`(key=claude 会话 UUID,含 surfaceId+cwd)join `cmux list-pane-surfaces --id-format both`(surface UUID→短 ref)——**记录的 uuid 直连会话库键**,比 cwd 匹配更强,cwd canonical 兜底。板上 TSV 第 8 字段 launch-args(`uuid=…:provider=…:pm=…[:model=…]`,model 恒排末位故可含冒号);旧 7 字段行原样兼容(read 末变量吸收 TAB,归档行随之 9 字段)。surface 新增 `--session-id <uuidgen 铸号>`、`CC_WT_MODEL` 钉选、resume 模式(`CC_WT_LAUNCH_CMD` 透传,跳过 dedup 标记/铸号/落板)。已知缝隙如实标注:原生恢复 provider 盲(恢复的 kimi/glm tab env 丢失),受影响行在清单里带 ⚠,关掉重跑 gwt-resume 即可。坑两枚:awk `NR==FNR` 在 match 文件为空时永不翻转(会清空整个文件,改 getline-in-BEGIN);bash/zsh `read` 连续 TAB 塌缩,行解析一律走 awk。测试 299 → 340。
 
 ## 2b. #7 · 输入框撞车 — 设计定稿 2026-08-15(cc-send 方案,用户拍板)
 

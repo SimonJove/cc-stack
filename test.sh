@@ -41,16 +41,27 @@ rm -rf "$R1" "$R2" /tmp/cctest-ep.py
 
 echo "== 2. cc-board.sh log (task registration) =="
 export CC_TASKS_FILE=$(mktemp -u)
-"$CC/cc-board.sh" log "/tmp/nodir_A" "surface:1" "surface:9" "task	with tab|pipe" "feat/par"
-eq "writes 7 fields"        "$(awk -F'\t' 'NR==1{print NF}' "$CC_TASKS_FILE")" "7"
-eq "7th field is parent"    "$(awk -F'\t' 'NR==1{print $7}' "$CC_TASKS_FILE")" "feat/par"
-eq "task sanitized (no tab)" "$(awk -F'\t' 'NR==1{print ($6 ~ /\t/)?"bad":"ok"}' "$CC_TASKS_FILE")" "ok"
+"$CC/cc-board.sh" log "/tmp/nodir_A" "surface:1" "surface:9" "task	with tab|pipe" "feat/par" "uuid=11111111-2222-3333-4444-555555555555:provider=kimi:pm=plan:model=glm-4.6"
+eq "writes 8 fields"          "$(awk -F'\t' 'NR==1{print NF}' "$CC_TASKS_FILE")" "8"
+eq "7th field is parent"      "$(awk -F'\t' 'NR==1{print $7}' "$CC_TASKS_FILE")" "feat/par"
+eq "8th field is launch-args" "$(awk -F'\t' 'NR==1{print $8}' "$CC_TASKS_FILE")" "uuid=11111111-2222-3333-4444-555555555555:provider=kimi:pm=plan:model=glm-4.6"
+eq "task sanitized (no tab)"  "$(awk -F'\t' 'NR==1{print ($6 ~ /\t/)?"bad":"ok"}' "$CC_TASKS_FILE")" "ok"
+# launch-args sanitization: a TAB inside the value must never split the row
+"$CC/cc-board.sh" log "/tmp/nodir_B" "surface:2" "surface:9" "t2" "feat/p2" "uuid=u1:provider=kimi:pm=auto	mod"
+eq "launch-args sanitized"    "$(awk -F'\t' 'NR==2{print NF}' "$CC_TASKS_FILE")" "8"
 # round-trip: a logged row renders on the board (dir must exist — prune-on-read drops dead dirs;
 # --all so the repo filter can't hide the foreign row)
 RT=$(mktemp -d)
 "$CC/cc-board.sh" log "$RT" "surface:2" "surface:1" "round trip task" "feat/rt"
 eq "log→board round-trip" "$(CC_TASKS_FILE="$CC_TASKS_FILE" CC_STATUS_FILE=/dev/null bash "$CC/cc-board.sh" --all 2>/dev/null | grep -c 'round trip task')" "1"
-rm -rf "$RT"; rm -f "$CC_TASKS_FILE"; unset CC_TASKS_FILE
+# pre-feature 7-field rows: survive the prune-on-read rewrite VERBATIM (bash read gives the last
+# variable the remainder with its TABs, so nothing shifts) and still render
+RT2=$(mktemp -d); CRT2="$(cd "$RT2" && pwd -P)"
+printf '2026-01-01 00:00:00\tfeat/OLD\tsurface:7\t%s\tsurface:1\told row task\tmain\n' "$CRT2" >> "$CC_TASKS_FILE"
+CC_STATUS_FILE=/dev/null bash "$CC/cc-board.sh" --all >/dev/null 2>&1
+eq "old 7-field row kept"     "$(awk -F'\t' -v d="$CRT2" '$4==d{print NF}' "$CC_TASKS_FILE" | sort -u)" "7"
+eq "old row still renders"    "$(CC_TASKS_FILE="$CC_TASKS_FILE" CC_STATUS_FILE=/dev/null bash "$CC/cc-board.sh" --all 2>/dev/null | grep -c 'old row task')" "1"
+rm -rf "$RT" "$RT2"; rm -f "$CC_TASKS_FILE"; unset CC_TASKS_FILE
 
 echo "== 2b. cc-hooks.sh status: agent-state sidecar =="
 # Board rows must hold pwd -P-canonical dirs — exactly what cc-board.sh log writes in production
@@ -196,13 +207,17 @@ export CC_TASKS_FILE="$TF" CC_STATUS_FILE="$SF" CC_ARCHIVE_FILE="$AF"
 printf '2026-01-01 00:00:01\tfeat/W\tsurface:41\t%s\tsurface:1\tarch task W1\tmain\n' "$BW"  > "$TF"
 printf '2026-01-01 00:00:02\tfeat/W\tsurface:42\t%s\tsurface:1\tarch task W2\tmain\n' "$BRD" >> "$TF"
 printf '2026-01-01 00:00:03\tfeat/W1\tsurface:43\t%s\tsurface:1\tarch task W1b\tfeat/W\n' "$BW1" >> "$TF"
+# new-format row (8 live fields incl. launch-args) → archive must gain 9 fields, args intact
+printf '2026-01-01 00:00:04\tfeat/W\tsurface:47\t%s\tsurface:1\tarch task W3\tmain\tuuid=99999999-8888-7777-6666-555555555555:provider=glm:pm=auto:model=g1\n' "$BRD" >> "$TF"
 printf '%s\tidle\t%s\n' "$BW" "$now" > "$SF"; printf '%s\tidle\t%s\n' "$BRD" "$now" >> "$SF"; printf '%s\tidle\t%s\n' "$BW1" "$now" >> "$SF"
 zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; CC_TASKS_FILE='$TF' CC_STATUS_FILE='$SF' CC_ARCHIVE_FILE='$AF' _gwt_archive_branch feat/W" >/dev/null 2>&1
 eq "archive moves ALL branch rows"   "$(awk -F'\t' '$2=="feat/W"' "$TF" | wc -l | tr -d ' ')" "0"
 eq "other branch stays"              "$(awk -F'\t' '$2=="feat/W1"' "$TF" | wc -l | tr -d ' ')" "1"
-eq "archive gained both rows"        "$(awk -F'\t' '$2=="feat/W"' "$AF" | wc -l | tr -d ' ')" "2"
-eq "archive rows have 8 fields"      "$(awk -F'\t' 'NR==1{print NF}' "$AF")" "8"
-eq "merged-at is a unix ts"          "$(awk -F'\t' '$2=="feat/W"{print ($8 ~ /^[0-9]+$/)?"ok":"no"}' "$AF" | sort -u)" "ok"
+eq "archive gained all rows"         "$(awk -F'\t' '$2=="feat/W"' "$AF" | wc -l | tr -d ' ')" "3"
+eq "archive old rows have 8 fields"  "$(awk -F'\t' 'NR==1{print NF}' "$AF")" "8"
+eq "archive new row has 9 fields"    "$(awk -F'\t' '$2=="feat/W" && $6=="arch task W3"{print NF}' "$AF")" "9"
+eq "archive keeps launch-args"       "$(awk -F'\t' '$2=="feat/W" && $8 ~ /^uuid=/{c++} END{print c+0}' "$AF")" "1"
+eq "merged-at is a unix ts"          "$(awk -F'\t' '$2=="feat/W"{print ($NF ~ /^[0-9]+$/)?"ok":"no"}' "$AF" | sort -u)" "ok"
 eq "moved status rows dropped"       "$(awk -F'\t' -v a="$BW" -v b="$BRD" '$1==a||$1==b{c++} END{print c+0}' "$SF")" "0"
 eq "other status row kept"           "$(awk -F'\t' -v d="$BW1" '$1==d{c++} END{print c+0}' "$SF")" "1"
 # gwt-merge archives on success (and on skipped-already-merged, same rc 0 path)
@@ -822,13 +837,160 @@ grep -q 'cc-dispatch.sh send \$caller_surface' "$CC/cc-dispatch.sh" && ok "backc
 PATH="$OPATH"; unset CC_FAKE_LOG CC_FAKE_SCREEN CC_SEND_VERIFY_SEC; rm -rf "$FS"
 
 echo ""
+echo "== 17. gwt-resume (roadmap 2: recorded-args session resume) =="
+# fake cmux (PATH shim): every call lands in $RF/log; list-pane-surfaces serves $RF/live,
+# new-surface mints surface:101+ recording its args, read-screen serves a screen that is a
+# shell whose claude TUI is already up (RDY22 for the shell probe, ❯+NBSP input line + shortcuts
+# hint for cc-send / the trust scrape / calibration) — surface runs at full speed, zero cmux.
+# The resume subcommand re-invokes surface via $HOME → a fake HOME holding a copy of THIS
+# checkout (never the live install), TSVs pinned to scratch files, CC_RESUME_SETTLE=0.
+RF=$(mktemp -d); export CC_FAKE_LOG="$RF/log"; export CC_FAKE_SCREEN="$RF/screen"
+cat > "$RF/cmux" <<'CMUX'
+#!/usr/bin/env bash
+case "$1" in
+  ping) exit 0 ;;
+  identify) echo '{ "caller": {} }' ;;
+  restore-session) printf 'RESTORE-SESSION\n' >> "$CC_FAKE_LOG"; echo "(fake) session restored" ;;
+  list-pane-surfaces) printf 'LIST\n' >> "$CC_FAKE_LOG"; cat "${CC_FAKE_LIVE:-/dev/null}" 2>/dev/null ;;
+  new-surface)
+    n=$(cat "${CC_FAKE_LOG}.nscnt" 2>/dev/null || echo 100); n=$((n+1)); echo "$n" > "${CC_FAKE_LOG}.nscnt"
+    printf 'NEWSURF|surface:%s|%s\n' "$n" "$*" >> "$CC_FAKE_LOG"
+    echo "opened surface:$n" ;;
+  send)     shift; printf 'SEND|%s\n' "$*" >> "$CC_FAKE_LOG" ;;
+  send-key) shift; printf 'KEY|%s\n'   "$*" >> "$CC_FAKE_LOG" ;;
+  notify)   shift; printf 'NOTIFY|%s\n' "$*" >> "$CC_FAKE_LOG" ;;
+  read-screen) cat "$CC_FAKE_SCREEN" 2>/dev/null ;;
+esac
+exit 0
+CMUX
+chmod +x "$RF/cmux"
+NB17="$(printf '\xc2\xa0')"
+{ echo "RDY22"; printf '\xe2\x9d\xaf%s\n' "$NB17"; echo "? for shortcuts"; } > "$CC_FAKE_SCREEN"
+FH17=$(mktemp -d); mkdir -p "$FH17/.config"; cp -R "$CC" "$FH17/.config/cc-stack"
+OP17="$PATH"
+# fixture: a repo with three sub-task dirs (+ a dead-dir row + a foreign-repo row), a session
+# store where D2's recorded session sits on the LIVE surface:55, stale agent-state rows
+cn17(){ CDPATH= cd -- "$1" >/dev/null 2>&1 && pwd -P; }
+REPO17=$(mktemp -d); ( cd "$REPO17"; git init -q; git config user.email t@t; git config user.name t; git commit -q --allow-empty -m i )
+mkdir "$REPO17/wt1" "$REPO17/wt2" "$REPO17/wt3"
+D1="$(cn17 "$REPO17/wt1")"; D2="$(cn17 "$REPO17/wt2")"; D3="$(cn17 "$REPO17/wt3")"
+OTH17="$(cn17 "$(mktemp -d)")"; UNREL17="$(cn17 "$(mktemp -d)")"
+U1="11111111-1111-1111-1111-111111111111"; SESS2="22222222-2222-2222-2222-222222222222"
+SURF2="33333333-3333-3333-3333-333333333333"; U4="44444444-4444-4444-4444-444444444444"
+TF17=$(mktemp -u); SF17=$(mktemp -u)
+printf '2026-01-01 00:00:01\tfeat/R2\tsurface:8\t%s\tsurface:1\tD2 older\tmain\tuuid=%s:provider=anthropic:pm=auto\n' "$D2" "$SESS2"  > "$TF17"
+printf '2026-01-01 00:00:02\tfeat/R1\tsurface:9\t%s\tsurface:1\tD1 kimi task\tmain\tuuid=%s:provider=kimi:pm=plan:model=glm-4.6\n' "$D1" "$U1" >> "$TF17"
+printf '2026-01-01 00:00:03\tfeat/R2\tsurface:9\t%s\tsurface:1\tD2 plain task\tmain\tuuid=%s:provider=anthropic:pm=auto\n' "$D2" "$SESS2" >> "$TF17"
+printf '2026-01-01 00:00:04\tfeat/R3\tsurface:10\t%s\tsurface:1\tD3 old row\tmain\n' "$D3" >> "$TF17"
+printf '2026-01-01 00:00:05\tfeat/R4\tsurface:11\t%s/gone\tsurface:1\tdead dir row\tmain\tuuid=%s:provider=kimi:pm=auto\n' "$REPO17" "$U1" >> "$TF17"
+printf '2026-01-01 00:00:06\tfeat/R5\tsurface:12\t%s\tsurface:1\tforeign repo row\tmain\tuuid=%s:provider=glm:pm=auto\n' "$OTH17" "$U4" >> "$TF17"
+printf '%s\tblocked\t%s\n' "$D1" 100 >  "$SF17"
+printf '%s\tidle\t%s\n'    "$D2" 100 >> "$SF17"
+printf '%s\tidle\t%s\n'    "$UNREL17" 100 >> "$SF17"
+# agent session store fixture in the REAL nested shape (probed live 2026-08-15): the per-session
+# records live under "sessions"; the top level also carries activeSessionsBySurface /
+# activeSessionsByWorkspace and an INT version. A parser that iterates the top level crashes on
+# that int and emits nothing → every row would fall through to reopen (duplicate-tab bug), so
+# scenario A asserts below are the regression net for the descent.
+python3 - "$SESS2" "$SURF2" "$D2" > "$RF/store.json" <<'PY'
+import json, sys
+sess, surf, cwd = sys.argv[1], sys.argv[2], sys.argv[3]
+json.dump({
+  "activeSessionsBySurface": {surf: sess},
+  "activeSessionsByWorkspace": {"77F86A0A-7F57-48E9-A08A-42B2A6BC7A33": [sess]},
+  "sessions": {sess: {"surfaceId": surf, "cwd": cwd, "updatedAt": 200,
+                      "agentLifecycle": "idle", "isRestorable": True}},
+  "version": 3,
+}, sys.stdout)
+PY
+printf '* surface:55\t%s\tD2 tab\n  surface:60\t99999999-9999-9999-9999-999999999999\tunrelated\n' "$SURF2" > "$RF/live"
+renv17(){ # resume runner: fake HOME (copy of this checkout) + fake cmux + scratch TSVs
+  ( cd "$REPO17" && env HOME="$FH17" PATH="$RF:$OP17" CC_TASKS_FILE="$TF17" CC_STATUS_FILE="$SF17" \
+      CC_CMUX_SESSIONS="$RF/store.json" CC_RESUME_SETTLE=0 CC_SEND_VERIFY_SEC=0.1 \
+      CC_SEND_FAILLOG="$RF/fail" CC_FAKE_LIVE="$RF/live" bash "$CC/cc-dispatch.sh" resume "$@" )
+}
+# A) default run, confirmed: D2 restored natively (store uuid → live surface:55), D1 reopened
+# with the EXACT recorded cld command, D3 degraded to idle, foreign/dead rows untouched
+: > "$CC_FAKE_LOG"
+ROUT="$(printf 'y\n' | renv17 2>&1)"; rrc=$?
+eq "resume exit0"            "$rrc" "0"
+eq "native restore invoked"  "$(grep -c 'RESTORE-SESSION' "$CC_FAKE_LOG")" "1"
+eq "restored row ref refreshed" "$(awk -F'\t' -v d="$D2" '$4==d{print $3}' "$TF17" | sort -u)" "surface:55"
+eq "ALL rows of dir refreshed"  "$(awk -F'\t' -v d="$D2" '$4==d{print $3}' "$TF17" | wc -l | tr -d ' ')" "2"
+eq "reopened exact cld cmd"  "$(grep -cF "cld kimi --resume $U1 --permission-mode plan --model glm-4.6" "$CC_FAKE_LOG")" "1"
+eq "reopen dir VERBATIM"     "$(grep "NEWSURF" "$CC_FAKE_LOG" | grep -cF -- "--working-directory $D1")" "1"
+eq "idle degrade bare ccteam" "$(grep -cE "^SEND\|--surface surface:[0-9]+ ccteam$" "$CC_FAKE_LOG")" "1"
+eq "listing shows idle note" "$(echo "$ROUT" | grep -c 'no recorded session')" "1"
+eq "listing header"          "$(echo "$ROUT" | grep -c 'BRANCH')" "1"
+eq "no board row appended"   "$(awk -F'\t' -v d="$D1" '$4==d' "$TF17" | wc -l | tr -d ' ')" "1"
+eq "reopen ref recorded"     "$(awk -F'\t' -v d="$D1" '$4==d{print $3}' "$TF17")" \
+                             "$(grep -F -- "--working-directory $D1" "$CC_FAKE_LOG" | grep -oE 'surface:[0-9]+' | head -1)"
+eq "stale status D1 cleared" "$(grep -cF "$D1" "$SF17")" "0"
+eq "stale status D2 cleared" "$(grep -cF "$D2" "$SF17")" "0"
+eq "unrelated status kept"   "$(grep -cF "$UNREL17" "$SF17")" "1"
+eq "foreign row not touched" "$(grep -cF -- "--working-directory $OTH17" "$CC_FAKE_LOG")" "0"
+eq "exactly 2 tabs opened"   "$(grep -c 'NEWSURF' "$CC_FAKE_LOG")" "2"
+eq "dead dir never opened"   "$(grep -cF -- "--working-directory $REPO17/gone" "$CC_FAKE_LOG")" "0"
+# B) declined confirm: nothing reopens (native restores above stand), rc 1, refs untouched
+: > "$CC_FAKE_LOG"
+BREF="$(awk -F'\t' -v d="$D1" '$4==d{print $3}' "$TF17")"
+ROUT="$(printf 'n\n' | renv17 2>&1)"; rrc=$?
+eq "decline exit1"           "$rrc" "1"
+eq "decline opens nothing"   "$(grep -c 'NEWSURF' "$CC_FAKE_LOG")" "0"
+eq "decline keeps refs"      "$(awk -F'\t' -v d="$D1" '$4==d{print $3}' "$TF17")" "$BREF"
+# B2) immediate re-run on the SAME dirs must not be eaten by the 120s dedup marker (resume mode
+# skips it) — the marker from run A is minutes fresh here
+: > "$CC_FAKE_LOG"
+ROUT="$(printf 'y\n' | renv17 2>&1)"; rrc=$?
+eq "re-run not marker-blocked" "$(grep -c 'NEWSURF' "$CC_FAKE_LOG")" "2"
+# C) repo filter vs --all: a board holding ONLY a foreign-repo row
+TF17C=$(mktemp -u); printf '2026-01-01 00:00:01\tfeat/C1\tsurface:70\t%s\tsurface:1\tforeign only\tmain\tuuid=%s:provider=glm:pm=auto\n' "$OTH17" "$U4" > "$TF17C"
+: > "$CC_FAKE_LOG"
+ROUT="$(printf 'y\n' | ( cd "$REPO17" && env HOME="$FH17" PATH="$RF:$OP17" CC_TASKS_FILE="$TF17C" CC_STATUS_FILE="$(mktemp -u)" \
+      CC_CMUX_SESSIONS="$RF/store.json" CC_RESUME_SETTLE=0 CC_SEND_FAILLOG="$RF/fail" CC_FAKE_LIVE="$RF/live" \
+      bash "$CC/cc-dispatch.sh" resume) 2>&1)"; rrc=$?
+eq "filter: nothing in repo" "$rrc" "0"
+eq "filter says try --all"   "$(echo "$ROUT" | grep -c 'no resumable board rows')" "1"
+eq "filter opens nothing"    "$(grep -c 'NEWSURF' "$CC_FAKE_LOG")" "0"
+ROUT="$(printf 'y\n' | ( cd "$REPO17" && env HOME="$FH17" PATH="$RF:$OP17" CC_TASKS_FILE="$TF17C" CC_STATUS_FILE="$(mktemp -u)" \
+      CC_CMUX_SESSIONS="$RF/store.json" CC_RESUME_SETTLE=0 CC_SEND_FAILLOG="$RF/fail" CC_FAKE_LIVE="$RF/live" \
+      bash "$CC/cc-dispatch.sh" resume --all) 2>&1)"; rrc=$?
+eq "--all reopens foreign"   "$rrc" "0"
+eq "--all exact cmd (omit unrecorded)" "$(grep -cF "cld glm --resume $U4 --permission-mode auto" "$CC_FAKE_LOG")" "1"
+eq "no --model when unrecorded" "$(grep -c -- '--model' "$CC_FAKE_LOG")" "0"
+# D) dispatch records the minted uuid: surface (fresh mode) puts --session-id on the launch AND
+# the composed launch-args on the log row; a non-whitelisted model is dropped, never interpolated
+TF17D=$(mktemp -u); D0="$(cn17 "$(mktemp -d)")"
+: > "$CC_FAKE_LOG"
+env HOME="$FH17" PATH="$RF:$OP17" CC_TASKS_FILE="$TF17D" CC_SEND_FAILLOG="$RF/fail" \
+  CC_SEND_VERIFY_SEC=0.1 CC_LAUNCH_FILE="$RF/launch" CC_WT_PERMISSION_MODE=plan CC_WT_MODEL='glm-4.6[1m]' \
+  bash "$CC/cc-dispatch.sh" surface "$D0" "mint test brief" >/dev/null 2>&1
+MINT="$(grep -oE -- '--session-id [0-9a-f-]+' "$CC_FAKE_LOG" | head -1 | cut -d' ' -f2)"
+eq "surface mints a uuid"    "$(printf '%s' "$MINT" | grep -cE '^[0-9a-f-]{30,}$')" "1"
+eq "minted id on launch"     "$(grep -cF -- "ccteam --session-id $MINT --permission-mode plan --model glm-4.6[1m]" "$CC_FAKE_LOG")" "1"
+eq "minted id on log row"    "$(awk -F'\t' -v d="$D0" '$4==d{print $8}' "$TF17D")" "uuid=$MINT:provider=anthropic:pm=plan:model=glm-4.6[1m]"
+eq "mint row has 8 fields"   "$(awk -F'\t' -v d="$D0" '$4==d{print NF}' "$TF17D")" "8"
+D0B="$(cn17 "$(mktemp -d)")"
+: > "$CC_FAKE_LOG"
+env HOME="$FH17" PATH="$RF:$OP17" CC_TASKS_FILE="$TF17D" CC_SEND_FAILLOG="$RF/fail" \
+  CC_SEND_VERIFY_SEC=0.1 CC_LAUNCH_FILE="$RF/launch" CC_WT_MODEL='bad model;rm -rf' \
+  bash "$CC/cc-dispatch.sh" surface "$D0B" "model guard" >/dev/null 2>&1
+eq "bad model never launched" "$(grep -c -- '--model' "$CC_FAKE_LOG")" "0"
+eq "bad model not recorded"   "$(awk -F'\t' -v d="$D0B" '$4==d{print ($8 ~ /model=/)?"bad":"ok"}' "$TF17D")" "ok"
+rm -rf "$RF" "$FH17" "$REPO17" "$OTH17" "$UNREL17" "$D0" "$D0B"; rm -f "$TF17" "$SF17" "$TF17C" "$TF17D"
+# fresh-mode surface leaves dedup markers in the real TMPDIR (hash-keyed, contentless) — sweep ours
+rm -f "${TMPDIR:-/tmp}/cc-cmux-tabs/$(printf '%s' "$D0"  | shasum -a 1 | cut -d' ' -f1)" \
+      "${TMPDIR:-/tmp}/cc-cmux-tabs/$(printf '%s' "$D0B" | shasum -a 1 | cut -d' ' -f1)" 2>/dev/null
+unset CC_FAKE_LOG CC_FAKE_SCREEN
+
+echo ""
 echo "== syntax =="
 for s in "$CC"/*.sh; do bash -n "$s" && : || { echo "  ✗ syntax $s"; fail=$((fail+1)); }; done
 zsh -n "$CC/worktree.zsh" && ok "worktree.zsh syntax" || { no "worktree.zsh syntax" x x; }
 
 echo ""
 echo "== 10. zsh commands present =="
-for fn in gwt-tree gwt-done gwt-undone gwt-merge gwt-collect gwt-adopt gwt-log; do
+for fn in gwt-tree gwt-done gwt-undone gwt-merge gwt-collect gwt-adopt gwt-log gwt-resume; do
   grep -q "^$fn()" "$CC/worktree.zsh" && ok "$fn defined" || no "$fn defined" missing present
 done
 
@@ -838,6 +1000,7 @@ grep -q "gwt-merge" "$CC/worktree.zsh" && grep -q "gwt-merge" "$CC/README.md" \
 grep -q "gwt-done" "$CC/README.md" && ok "gwt-done documented" || no "gwt-done documented" missing present
 grep -q "gwt-adopt" "$CC/README.md" && ok "gwt-adopt documented" || no "gwt-adopt documented" missing present
 grep -q "gwt-log" "$CC/README.md" && ok "gwt-log documented" || no "gwt-log documented" missing present
+grep -q "gwt-resume" "$CC/README.md" && ok "gwt-resume documented" || no "gwt-resume documented" missing present
 grep -q "cc-board.sh" "$CC/README.md" && ok "cc-board.sh documented" || no "cc-board.sh documented" missing present
 
 echo ""

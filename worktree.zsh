@@ -236,7 +236,8 @@ gwt-ls() { git worktree list }
 #   Bash included — the old zsh-only render silently printed nothing there). Args are forwarded
 #   (--all: rows from every repo, not just the current one).
 #   data source 1: $CC_TASKS_FILE, appended by cc-dispatch.sh surface whenever it opens a tab
-#     fields: time \t branch \t surface \t dir \t caller-tab \t task-summary \t parent-branch
+#     fields: time \t branch \t surface \t dir \t caller-tab \t task-summary \t parent-branch \t
+#             launch-args (uuid/provider/pm/model — what gwt-resume replays; empty on old rows)
 #   data source 2: $CC_STATUS_FILE sidecar (dir \t state \t unix-ts), written by cc-hooks.sh status on
 #     UserPromptSubmit/Stop/permission-Notification → STATUS column, joined on dir. idle = not-running,
 #     NOT done — "ready" still comes only from gwt-done + a clean tree (gwt-tree), never from here.
@@ -259,6 +260,28 @@ gwt-status() {
 gwt-log() {
   emulate -L zsh
   bash "$(_gwt_board_script)" --archive "$@"
+  return $?
+}
+
+# gwt-resume [--all] — bring sub-task tabs back after cmux died/restarted (roadmap 2). Thin
+#   wrapper; the engine is cc-dispatch.sh resume:
+#   ① cmux native restore-session first (fail-soft), ② board rows matched to the tabs that came
+#   back (recorded session uuid → cmux session store → live surface ref; canonical-cwd fallback)
+#   get their surface refs refreshed + stale agent-state rows cleared, ③ rows still without a tab
+#   are re-opened in the RECORDED dir (verbatim — claude keys project identity on the exact path
+#   string) replaying the RECORDED launch args: cld <provider> --resume <uuid> --permission-mode
+#   <pm> [--model <m>]; plain rows resume without cld, flags not recorded are omitted. Rows with
+#   no recorded session (pre-feature) degrade to an idle ccteam tab — visible, never silent.
+#   Lists BRANCH|SUMMARY|DIR|disposition first, then ONE y/N; --all skips the confirm AND shows
+#   every repo (default: current repo's rows only, like gwt-status).
+_gwt_dispatch_script() {
+  local d="${_gwt_src_dir:-}"
+  [[ -n "$d" && -f "$d/cc-dispatch.sh" ]] && { echo "$d/cc-dispatch.sh"; return 0 }
+  echo "$HOME/.config/cc-stack/cc-dispatch.sh"
+}
+gwt-resume() {
+  emulate -L zsh
+  bash "$(_gwt_dispatch_script)" resume "$@"
   return $?
 }
 
@@ -444,6 +467,8 @@ cc-stack · worktree sub-task commands
   gwt-collect <parent>                   run one gated gwt-merge per ready child of <parent>
   gwt-status                             board: TAB liveness + branch + parent + agent state (working/idle/blocked + age) + dir + task
                                          current repo only; --all shows every repo (works from any shell — it wraps cc-board.sh)
+  gwt-resume [--all]                     after a cmux restart: native restore first, then re-open still-missing sub-task tabs
+                                         replaying the RECORDED session uuid + provider + mode (lists first, asks y/N; --all = every repo, no confirm)
   gwt-log                                the merged-task archive, same columns/filter (rows moved there by gwt-merge)
   gwt-rm <name> [--branch]               remove worktree (+ clear task record + pre-trust; optionally the branch)
   gwt-prune                              compact the task list (drop dead records + keep newest per dir)

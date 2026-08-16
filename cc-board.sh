@@ -4,7 +4,7 @@
 #   Bash tool invokes it directly (`bash ~/.config/cc-stack/cc-board.sh [--all]`) because the
 #   old zsh-only render silently printed nothing there (the cmux tree + capture-pane
 #   workaround is retired).
-# Usage: cc-board.sh log <worktree-dir> <surface_ref> <caller_surface> <initial-prompt> [parent-branch]
+# Usage: cc-board.sh log <worktree-dir> <surface_ref> <caller_surface> <initial-prompt> [parent-branch] [launch-args]
 #          append one worktree sub-task record (the single write point; absorbs cc-tasks-log.sh)
 # Usage: cc-board.sh [--all] [--archive]
 #   (default)  live board: worktree-tasks.tsv joined with the worktree-status.tsv sidecar
@@ -31,12 +31,21 @@ set -u
 # ── log subcommand: append one worktree sub-task record (absorbs cc-tasks-log.sh) ─────────
 # The single write point, keeping the TSV format consistent with the render below.
 # Called by cc-dispatch.sh surface (hook path and gwt-claude path both land there).
-# Fields (TAB-separated): time \t branch \t surface \t dir \t caller-tab \t task-summary \t parent-branch
+# Fields (TAB-separated): time \t branch \t surface \t dir \t caller-tab \t task-summary \t parent-branch \t launch-args
 #   (parent = the caller's branch at dispatch; the board's PARENT column falls back to it
 #    once the branch's branch.<b>.ccMergeInto git config is gone, e.g. deleted after merge)
+#   launch-args (8th field, roadmap 2 gwt-resume) = compact k=v:... record of the dispatch-time
+#   launch: uuid=<claude session id> provider=<cld name|anthropic> pm=<permission-mode> model=<id>,
+#   empty parts omitted (model is composed LAST so a model id may itself contain colons).
+#   POSITION: appended AFTER parent-branch, i.e. the LAST live-board field — every positional
+#   reader keys on fields 1-7 (cc-hooks.sh status matches $4 = dir; the PARENT fallback reads the
+#   7th), and the archive appends merged-at after it (live 8 fields → archive 9). Old 7-field rows
+#   stay valid: bash/zsh `read` gives the LAST variable the remainder WITH its TABs, so the rewriters
+#   below and in worktree.zsh round-trip the extra field untouched. Rows before this feature carry
+#   no uuid → gwt-resume degrades them to an idle ccteam tab (visible, never silent).
 if [ "${1:-}" = "log" ]; then
   shift
-  dir="${1:-}"; ref="${2:-?}"; caller="${3:-}"; prompt="${4:-}"; parent="${5:-}"
+  dir="${1:-}"; ref="${2:-?}"; caller="${3:-}"; prompt="${4:-}"; parent="${5:-}"; largs="${6:-}"
   [ -n "$dir" ] || exit 0
   f="${CC_TASKS_FILE:-$HOME/.config/cc-stack/worktree-tasks.tsv}"
 
@@ -44,6 +53,8 @@ if [ "${1:-}" = "log" ]; then
   # Task summary: collapse to one line, strip TAB/pipe, truncate — keeps TSV and `column` display intact
   summary="$(printf '%s' "$prompt" | tr '\t\n' '  ' | tr '|' '/' | cut -c1-140)"
   [ -n "$summary" ] || summary='(idle ccteam, no initial prompt)'
+  # launch-args: composed by cc-dispatch.sh surface; sanitize the same way (one line, no TAB)
+  largs="$(printf '%s' "$largs" | tr '\t\n' '  ' | cut -c1-200)"
 
   # Locked append (avoid losing lines racing with the prune rewrite below). mkdir is atomic; macOS lacks flock.
   lock="$f.lock"
@@ -51,8 +62,8 @@ if [ "${1:-}" = "log" ]; then
     if mkdir "$lock" 2>/dev/null; then trap 'rmdir "$lock" 2>/dev/null' EXIT; break; fi
     sleep 0.05
   done
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-    "$(date '+%Y-%m-%d %H:%M:%S')" "$branch" "$ref" "$dir" "$caller" "$summary" "$parent" \
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$(date '+%Y-%m-%d %H:%M:%S')" "$branch" "$ref" "$dir" "$caller" "$summary" "$parent" "$largs" \
     >> "$f" 2>/dev/null || true
   exit 0
 fi
@@ -153,8 +164,9 @@ ccb_parent(){ # <dir> <branch> <7th-field> → merge target (see header for the 
 # ── render ─────────────────────────────────────────────────────────────────────────────
 # Live board reads the file bottom-up so the FIRST time a dir appears is its newest record;
 # the archive keeps every row in file order (it's a history). `merged` consumes the archive's
-# 8th field (merged-at, not displayed) — without it the trailing field would be absorbed into
-# `parent` and shift the PARENT column.
+# trailing field(s) (merged-at, not displayed; launch-args rides in front of it on 9-field rows)
+# — without that last variable the trailing fields would be absorbed into `parent` and shift
+# the PARENT column.
 seen=""; n=0; out=""
 while IFS=$'\t' read -r ts br ref dir caller task parent merged; do
   [ -n "$dir" ] || continue
