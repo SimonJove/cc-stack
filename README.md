@@ -161,13 +161,23 @@ back up the tree — each stops at a confirmation gate.
 
     gwt-tree                 # see the whole tree: A ⊃ {A1,A2,A3}, ready state, tabs
     gwt-done                 # (run inside A1) mark A1 ready when it's finished
-    gwt-merge A1             # gated merge A1 → feat/A (asks strategy [default: squash] + confirmation)
+    gwt-merge A1             # gated merge A1 → feat/A (asks strategy [default: squash] + confirmation;
+                             #   --message <text> overrides the merge commit message)
     gwt-collect A            # merge every ready child of A into A, one gate each
     gwt-merge A              # finally merge A → main (its recorded/def target)
 
 `gwt-merge` never merges without an explicit `y`. Readiness = clean working
 tree **and** `gwt-done`; otherwise it warns and needs `--force`. Cleanup
 (`gwt-rm`) stays a separate, explicit step.
+
+Merge commits default to a Conventional-Commits-safe message
+(`chore: merge <child> into <target>`, plus a `Child-Tip: <sha>` trailer on squash so the
+retired child ref stays verifiable) — override per call with `--message` or repo-wide with
+`CC_MERGE_MESSAGE` (some repos cap the subject at 72 chars). Failures are triaged, never
+lumped as "conflict": a real content conflict aborts and reports `conflict:`, while a commit
+refused by a hook reports `commit-rejected:` with the hook's output and **preserves the staged
+merge** in the target worktree so you can finish it by hand; `--rebase` rebases inside the
+child's own worktree (refusing cleanly only while that tree is dirty).
 
 ---
 
@@ -234,6 +244,7 @@ Every sub-task still launches in **team mode** (`cmux claude-teams`) regardless 
 | `CC_STATUS_FILE` | `~/.config/cc-stack/worktree-status.tsv` | Agent-state sidecar written by `cc-hooks.sh status`, read by the board's STATUS column (override for tests). |
 | `CC_ARCHIVE_FILE` | `~/.config/cc-stack/worktree-tasks-archive.tsv` | Merged-task archive written on `gwt-merge`, rendered by `gwt-log` / `cc-board.sh --archive` (override for tests). |
 | `CC_LAUNCH_FILE` | `~/.config/cc-stack/launch` | Written by `gwt-provider`; the provider name for NEW sub-tasks (`kimi`, `glm`, or `anthropic`/empty=default). Override path for tests. |
+| `CC_MERGE_MESSAGE` | (conventional default) | Merge commit message for `gwt-merge` / `do-merge` (`--message` flag wins over this over the `chore: merge <child> into <target>` default — use it in repos that cap the subject, e.g. at 72 chars). |
 
 ---
 
@@ -296,7 +307,7 @@ cc-claude                    # claude/cld launch router (in cmux → team-ready,
 cc-hooks.sh                  # ALL Claude Code hook entries: worktree (PostToolUse tab opener) + status (agent-state sidecar writer)
 cc-dispatch.sh               # the dispatch pipeline: wt-claude (gwt-claude) | surface ([single source of truth] open tab + copy .env + pre-trust + start ccteam + send prompt + register, with retries/failure breadcrumb) | send (cc-send: the collision-safe text+Enter primitive, the only sanctioned injection exit into a running claude tab) | calibrate (re-probe the cc-send patterns on a known-empty tab) | workspace (empty workspace for a dir, used by gwt-new)
 cc-board.sh                  # [the board] renders gwt-status/gwt-log from any shell (bash): tasks+status join, repo filter, tab liveness, prune-on-read; `log` subcommand = single task-registration write point
-cc-merge.sh                  # branch tree: set/get-parent, preflight, do-merge (squash/no-ff), capture, tree (backs gwt-merge/gwt-collect/gwt-tree)
+cc-merge.sh                  # branch tree: set/get-parent, preflight, do-merge (squash/no-ff/rebase, conventional message + triaged failures), capture, tree (backs gwt-merge/gwt-collect/gwt-tree)
 cc-worktree-shared.sh        # shared test corpus (CC_WT_SHARE): seed into a new worktree, collect back on merge
 cc-trust.sh                  # pre-authorize/revoke trust for a dir (edits ~/.claude.json, atomic write, only adds/removes pure-trust signatures)
 claude-rules.md              # single source of the global CLAUDE.md worktree rules (install syncs it into the managed block)

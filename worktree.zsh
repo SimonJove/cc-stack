@@ -354,21 +354,21 @@ gwt-undone() {
   ~/.config/cc-stack/cc-merge.sh done "$root" "$b" false && echo "✔ $b marked not-ready"
 }
 
-# gwt-merge <name-or-branch> [--squash|--no-ff|--rebase] [--into <b>] [--force] — GATED merge
+# gwt-merge <name-or-branch> [--squash|--no-ff|--rebase] [--into <b>] [--message <text>] [--force] — GATED merge
 gwt-merge() {
   emulate -L zsh
   local root; root="$(_gwt_root)" || { echo "✗ not inside a git repo"; return 1 }
   local arg="$1"; shift 2>/dev/null
-  [[ -n "$arg" ]] || { echo "usage: gwt-merge <name|branch> [--squash|--no-ff|--rebase] [--into <b>] [--force]"; return 1 }
+  [[ -n "$arg" ]] || { echo "usage: gwt-merge <name|branch> [--squash|--no-ff|--rebase] [--into <b>] [--message <text>] [--force]"; return 1 }
   # accept a bare name (feat/<name>) or a full branch
   local child="$arg"
   git -C "$root" show-ref --verify --quiet "refs/heads/$child" || child="feat/$arg"
   git -C "$root" show-ref --verify --quiet "refs/heads/$child" || { echo "✗ no such branch: $arg"; return 1 }
-  local strategy="" target="" force=""
+  local strategy="" target="" force="" message=""
   while (( $# )); do
     case "$1" in
       --squash) strategy=squash ;; --no-ff) strategy=no-ff ;; --rebase) strategy=rebase ;;
-      --into) shift; target="$1" ;; --force) force=1 ;;
+      --into) shift; target="$1" ;; --message) shift; message="$1" ;; --force) force=1 ;;
       *) echo "unknown flag: $1"; return 1 ;;
     esac; shift
   done
@@ -382,7 +382,8 @@ gwt-merge() {
   if (( rc != 0 )) && [[ -z "$force" ]]; then
     echo "✗ preflight not clean. Re-run with --force to override, or fix the flagged items."; return 1
   fi
-  # strategy prompt (default squash)
+  # strategy prompt (default squash). Squash collapses the child's history but stamps a
+  # Child-Tip: <sha> trailer so the retired ref stays verifiable; no-ff keeps full history.
   if [[ -z "$strategy" ]]; then
     printf "strategy? [S]quash / [n]o-ff / [r]ebase (default squash): "
     local ans; read -r ans
@@ -392,7 +393,12 @@ gwt-merge() {
   printf "About to merge \033[1m%s\033[0m --%s into \033[1m%s\033[0m. Proceed? [y/N] " "$child" "$strategy" "$target"
   local ok; read -r ok
   [[ "$ok" == y || "$ok" == Y ]] || { echo "aborted."; return 1 }
-  ~/.config/cc-stack/cc-merge.sh do-merge "$root" "$child" "$strategy" "$target"
+  # merge message: --message here beats CC_MERGE_MESSAGE beats the conventional default
+  if [[ -n "$message" ]]; then
+    ~/.config/cc-stack/cc-merge.sh do-merge "$root" "$child" "$strategy" "$target" --message "$message"
+  else
+    ~/.config/cc-stack/cc-merge.sh do-merge "$root" "$child" "$strategy" "$target"
+  fi
   local mrc=$?
   if (( mrc == 0 )); then
     _gwt_archive_branch "$child"     # merged (or skipped-already-merged) → off the live board, into gwt-log
@@ -430,8 +436,11 @@ cc-stack · worktree sub-task commands
   gwt-ls                                 git worktree list
   gwt-tree                               hierarchical board: branch tree, merge target, ready state, tab liveness
   gwt-done / gwt-undone                  (inside a sub-task) mark this branch ready / not-ready for merge
-  gwt-merge <name> [--squash|--no-ff|--rebase] [--into <b>] [--force]
-                                         GATED merge into its recorded parent (asks strategy [default: squash] + confirms first)
+  gwt-merge <name> [--squash|--no-ff|--rebase] [--into <b>] [--message <text>] [--force]
+                                         GATED merge into its recorded parent (asks strategy [default: squash] + confirms first);
+                                         message defaults to "chore: merge <child> into <target>" (--message / CC_MERGE_MESSAGE override,
+                                         e.g. for repos capping the subject at 72 chars); a refused commit leaves the staged merge
+                                         in place for a manual finish, reported as commit-rejected — never as a conflict
   gwt-collect <parent>                   run one gated gwt-merge per ready child of <parent>
   gwt-status                             board: TAB liveness + branch + parent + agent state (working/idle/blocked + age) + dir + task
                                          current repo only; --all shows every repo (works from any shell — it wraps cc-board.sh)

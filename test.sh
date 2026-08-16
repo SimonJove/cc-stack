@@ -326,10 +326,100 @@ eq "already-merged reports skipped" "$(echo "$OUT2" | grep -c 'skipped:')" "1"
 b4=$(git -C "$MR2" rev-list --count feat/P)
 "$CC/cc-merge.sh" do-merge "$MR2" feat/P1 squash feat/P >/dev/null 2>&1
 eq "already-merged adds no commit" "$(( $(git -C "$MR2" rev-list --count feat/P) - b4 ))" "0"
-# Fix B: rebase of a child checked out in its own worktree is refused with a clear message
-"$CC/cc-merge.sh" do-merge "$MR2" feat/P2 rebase feat/P > /tmp/cctest-rb.txt 2>&1; eq "rebase-unsupported exit4" "$?" "4"
-eq "rebase-unsupported message" "$(grep -c 'rebase-unsupported:' /tmp/cctest-rb.txt)" "1"
+# Defect 1/rebase: a child checked out in its own (clean) worktree is rebased THERE, not refused
+git -C "$MR2" worktree add -q wtR -b feat/R feat/P >/dev/null
+git -C "$MR2" worktree add -q wtR1 -b feat/R1 feat/R >/dev/null
+( cd "$MR2/wtR1"; printf 'r1\n' > r1.txt; git add r1.txt; git commit -q -m r1 )
+( cd "$MR2/wtR";  printf 'rr\n' > r.txt;  git add r.txt;  git commit -q -m r )   # target moves after R1 forked
+"$CC/cc-merge.sh" do-merge "$MR2" feat/R1 rebase feat/R >/dev/null 2>&1; eq "rebase-in-worktree exit0" "$?" "0"
+eq "rebase lands child tip on target" "$(git -C "$MR2" rev-parse feat/R)" "$(git -C "$MR2" rev-parse feat/R1)"
+eq "rebase brought the file"          "$(git -C "$MR2" show feat/R:r1.txt 2>/dev/null)" "r1"
+# no worktree holds the child → the rebase still runs from the repo itself
+git -C "$MR2" worktree add -q wtR2 -b feat/R2 feat/R >/dev/null
+( cd "$MR2/wtR2"; printf 'r2\n' > r2.txt; git add r2.txt; git commit -q -m r2 )
+git -C "$MR2" worktree remove wtR2 >/dev/null 2>&1     # branch survives, checked out nowhere
+"$CC/cc-merge.sh" do-merge "$MR2" feat/R2 rebase feat/R >/dev/null 2>&1; eq "rebase no-worktree exit0" "$?" "0"
+eq "no-worktree rebase fast-forwards" "$(git -C "$MR2" rev-parse feat/R)" "$(git -C "$MR2" rev-parse feat/R2)"
+# a DIRTY child worktree is refused cleanly (new rc) before anything moves
+git -C "$MR2" worktree add -q wtR3 -b feat/R3 feat/R >/dev/null
+( cd "$MR2/wtR3"; printf 'r3\n' > r3.txt; git add r3.txt; git commit -q -m r3; printf 'dirt\n' > dirty.txt )
+"$CC/cc-merge.sh" do-merge "$MR2" feat/R3 rebase feat/R > /tmp/cctest-rb.txt 2>&1; eq "rebase-dirty exit5" "$?" "5"
+eq "rebase-dirty message"    "$(grep -c 'rebase-dirty:' /tmp/cctest-rb.txt)" "1"
+eq "rebase-dirty target unmoved" "$(git -C "$MR2" rev-parse feat/R)" "$(git -C "$MR2" rev-parse feat/R2)"
 rm -f /tmp/cctest-rb.txt
+
+echo "== 8b. do-merge × commit-msg hook (Defect 1: conventional defaults + failure triage) =="
+MR3=$(mktemp -d); ( cd "$MR3"; git init -q; git config user.email t@t; git config user.name t
+  git commit -q --allow-empty -m i; git branch -M main
+  git worktree add -q wtT -b feat/T >/dev/null
+  git -C wtT commit -q --allow-empty -m t
+  git worktree add -q wtT1 -b feat/T1 feat/T >/dev/null
+  cd wtT1; printf 'one\n' > f1.txt; git add f1.txt; git commit -q -m 'chore: t1' )
+"$CC/cc-merge.sh" set-parent "$MR3" feat/T1 feat/T
+# commit-msg hook enforcing Conventional Commits on the subject (like the downstream monorepo)
+cat > "$MR3/.git/hooks/commit-msg" <<'HOOK'
+#!/usr/bin/env bash
+head -1 "$1" | grep -qE '^(feat|fix|refactor|test|docs|chore|perf|build|ci|style)(\([a-z0-9/-]+\))?: .' || {
+  echo "subject must follow Conventional Commits: <type>(<scope>): <subject>" >&2; exit 1; }
+HOOK
+chmod +x "$MR3/.git/hooks/commit-msg"
+# (a) default message passes the hook and merges; content asserted (+ (g) Child-Tip trailer)
+OUT="$("$CC/cc-merge.sh" do-merge "$MR3" feat/T1 squash feat/T)"; rc=$?
+eq "hooked squash exit0" "$rc" "0"
+eq "squash default subject" "$(git -C "$MR3" log -1 --format=%s feat/T)" "chore: merge feat/T1 into feat/T (squash)"
+want_tip="$(git -C "$MR3" rev-parse feat/T1)"
+eq "squash Child-Tip trailer" "$(git -C "$MR3" log -1 --format=%B feat/T | grep -c "Child-Tip: $want_tip")" "1"
+git -C "$MR3" worktree add -q wtT2 -b feat/T2 feat/T >/dev/null
+( cd "$MR3/wtT2"; printf 'two\n' > f2.txt; git add f2.txt; git commit -q -m 'chore: t2' )
+"$CC/cc-merge.sh" do-merge "$MR3" feat/T2 no-ff feat/T >/dev/null; eq "hooked no-ff exit0" "$?" "0"
+eq "no-ff default subject" "$(git -C "$MR3" log -1 --format=%s feat/T)" "chore: merge feat/T2 into feat/T"
+# (b) overrides: --message flag > CC_MERGE_MESSAGE env > default (override is used verbatim)
+git -C "$MR3" worktree add -q wtT3 -b feat/T3 feat/T >/dev/null
+( cd "$MR3/wtT3"; printf 'three\n' > f3.txt; git add f3.txt; git commit -q -m 'chore: t3' )
+CC_MERGE_MESSAGE='chore(env): env beats default' "$CC/cc-merge.sh" do-merge "$MR3" feat/T3 squash feat/T >/dev/null
+eq "CC_MERGE_MESSAGE override" "$(git -C "$MR3" log -1 --format=%s feat/T)" "chore(env): env beats default"
+git -C "$MR3" worktree add -q wtT4 -b feat/T4 feat/T >/dev/null
+( cd "$MR3/wtT4"; printf 'four\n' > f4.txt; git add f4.txt; git commit -q -m 'chore: t4' )
+CC_MERGE_MESSAGE='chore(env): should lose' "$CC/cc-merge.sh" do-merge "$MR3" feat/T4 squash feat/T --message 'fix(flag): flag beats env' >/dev/null
+eq "--message beats env" "$(git -C "$MR3" log -1 --format=%s feat/T)" "fix(flag): flag beats env"
+# (c) hook rejection → commit-rejected (NOT conflict), hook text printed, staged state preserved
+git -C "$MR3" worktree add -q wtT5 -b feat/T5 feat/T >/dev/null
+( cd "$MR3/wtT5"; printf 'five\n' > f5.txt; git add f5.txt; git commit -q -m 'chore: t5' )
+OUT="$($CC/cc-merge.sh do-merge "$MR3" feat/T5 squash feat/T --message 'not a conventional subject at all' 2>&1)"; rc=$?
+eq "squash hook-reject exit3"     "$rc" "3"
+eq "squash reject says commit-rejected" "$(echo "$OUT" | grep -c 'commit-rejected:')" "1"
+eq "squash reject never says conflict"   "$(echo "$OUT" | grep -c '^conflict:')" "0"
+eq "squash reject prints hook text"      "$(echo "$OUT" | grep -c 'Conventional Commits')" "1"
+eq "squash reject preserves staged"      "$(git -C "$MR3/wtT" diff --cached --name-only | grep -c f5.txt)" "1"
+git -C "$MR3/wtT" reset --hard HEAD >/dev/null 2>&1        # clean the preserved state for the next case
+OUT="$($CC/cc-merge.sh do-merge "$MR3" feat/T5 no-ff feat/T --message 'still not conventional' 2>&1)"; rc=$?
+eq "no-ff hook-reject exit3"       "$rc" "3"
+eq "no-ff reject says commit-rejected" "$(echo "$OUT" | grep -c 'commit-rejected:')" "1"
+eq "no-ff reject never says conflict"   "$(echo "$OUT" | grep -c '^conflict:')" "0"
+eq "no-ff reject prints hook text"      "$(echo "$OUT" | grep -c 'Conventional Commits')" "1"
+eq "no-ff reject preserves MERGE_HEAD"  "$(git -C "$MR3/wtT" rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1 && echo yes || echo no)" "yes"
+git -C "$MR3/wtT" merge --abort >/dev/null 2>&1
+# (d) a REAL content conflict still reports conflict, prints git output, leaves a clean tree
+( cd "$MR3/wtT";  printf 'T-side\n'  > clash5.txt; git add clash5.txt; git commit -q -m 'chore: t side' )
+( cd "$MR3/wtT5"; printf 'T5-side\n' > clash5.txt; git add clash5.txt; git commit -q -m 'chore: t5 side' )
+OUT="$($CC/cc-merge.sh do-merge "$MR3" feat/T5 no-ff feat/T 2>&1)"; rc=$?
+eq "no-ff real conflict exit1"     "$rc" "1"
+eq "real conflict says conflict"   "$(echo "$OUT" | grep -c '^conflict:')" "1"
+eq "conflict prints git output"    "$(echo "$OUT" | grep -c 'CONFLICT')" "1"
+eq "conflict leaves clean tree"    "$(git -C "$MR3/wtT" status --porcelain | wc -l | tr -d ' ')" "0"
+# zsh layer: --message flows through gwt-merge to do-merge (fake HOME so ~/.config/cc-stack
+# resolves to THIS checkout's cc-merge.sh, never the live install; TSVs pinned to scratch files)
+FH=$(mktemp -d); mkdir -p "$FH/.config/cc-stack"; cp "$CC/cc-merge.sh" "$FH/.config/cc-stack/"
+TF8=$(mktemp -u); SF8=$(mktemp -u); AF8=$(mktemp -u)
+git -C "$MR3" worktree add -q wtT6 -b feat/T6 feat/T >/dev/null
+( cd "$MR3/wtT6"; printf 'six\n' > f6.txt; git add f6.txt; git commit -q -m 'chore: t6' )
+"$CC/cc-merge.sh" set-parent "$MR3" feat/T6 feat/T
+"$CC/cc-merge.sh" done "$MR3" feat/T6 true
+printf '\ny\n' | HOME="$FH" CC_TASKS_FILE="$TF8" CC_STATUS_FILE="$SF8" CC_ARCHIVE_FILE="$AF8" \
+  zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; cd '$MR3'; gwt-merge feat/T6 --message 'chore(zsh): flag through gwt-merge'" >/dev/null 2>&1; zrc=$?
+eq "gwt-merge --message exit0"  "$zrc" "0"
+eq "gwt-merge passes --message" "$(git -C "$MR3" log -1 --format=%s feat/T)" "chore(zsh): flag through gwt-merge"
+rm -rf "$MR3" "$FH"; rm -f "$TF8" "$SF8" "$AF8"
 
 echo "== 9. cc-merge capture =="
 # caller is on feat/A (wtA) → new branch feat/Ax should capture parent feat/A
