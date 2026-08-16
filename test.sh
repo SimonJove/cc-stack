@@ -1414,6 +1414,30 @@ eq "clause 4 teaches the absolute path" "$(printf '%s' "$W4" | grep -c '~/.confi
 eq "clause 4 warns the bare name is zsh-only" "$(printf '%s' "$W4" | grep -c 'zsh function')" "1"
 rm -rf "$GD"
 echo ""
+echo "== 19b. fail-closed path guards (partial-shell incident 2026-08-16) =="
+# Real incident: a partially-loaded shell had gwt-rm but not _gwt_dir → wtpath="/<name>" (fs ROOT)
+# fed to `git worktree remove`. Every _gwt_dir-built path must now fail closed via _gwt_wt_path.
+GT2=$(mktemp -d); GT2="$(cd "$GT2" && pwd -P)"; ( cd "$GT2"; git init -q; git config user.email t@t; git config user.name t; git commit -q --allow-empty -m i; git branch -M main
+  mkdir -p .claude; git worktree add -q .claude/worktrees/wtguard -b feat/guard >/dev/null )
+gsrc(){ zsh -c '
+  source "'"$CC"'/worktree.zsh" >/dev/null 2>&1
+  unfunction _gwt_dir _gwt_root 2>/dev/null          # simulate the partially-loaded shell
+  cd "'"$GT2"'"; gwt-rm wtguard' 2>&1; }
+grc="$(gsrc)"; grc_rc=$?
+eq "gwt-rm partial-shell exit!=0" "$([ "$grc_rc" -ne 0 ] && echo y || echo n)" "y"
+eq "gwt-rm partial-shell says why" "$(echo "$grc" | grep -c 'source ~/.config/cc-stack/worktree.zsh')" "1"
+eq "gwt-rm partial-shell touches NOTHING" "$(git -C "$GT2" worktree list --porcelain | grep -c wtguard)" "1"   # worktree still there
+gout="$(zsh -c '
+  source "'"$CC"'/worktree.zsh" >/dev/null 2>&1
+  unfunction _gwt_dir 2>/dev/null
+  cd "'"$GT2"'"; gwt-new newguard' 2>&1)"; grc2=$?
+eq "gwt-new partial-shell exit!=0" "$([ "$grc2" -ne 0 ] && echo y || echo n)" "y"
+eq "gwt-new partial-shell creates nothing" "$(git -C "$GT2" branch --list 'feat/newguard' | wc -l | tr -d ' ')" "0"
+eq "_gwt_wt_path healthy echoes dir/name" "$(zsh -c 'source "'"$CC"'/worktree.zsh" >/dev/null 2>&1; cd "'"$GT2"'"; _gwt_wt_path foo' 2>/dev/null)" "$GT2/.claude/worktrees/foo"
+zsh -c 'source "'"$CC"'/worktree.zsh" >/dev/null 2>&1; cd "'"$GT2"'"; gwt-rm wtguard --branch' >/dev/null 2>&1
+eq "gwt-rm healthy path still works" "$(git -C "$GT2" worktree list --porcelain | grep -c wtguard)" "0"
+rm -rf "$GT2"
+
 echo "== syntax =="
 for s in "$CC"/*.sh "$CC"/hooks/*.sh; do bash -n "$s" && : || { echo "  ✗ syntax $s"; fail=$((fail+1)); }; done
 zsh -n "$CC/worktree.zsh" && ok "worktree.zsh syntax" || { no "worktree.zsh syntax" x x; }

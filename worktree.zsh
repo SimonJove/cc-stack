@@ -31,6 +31,16 @@ _gwt_dir() {
   local root; root="$(_gwt_root)" || return 1
   if [[ -d "$root/.claude" ]]; then echo "$root/.claude/worktrees"; else echo "$root/.worktrees"; fi
 }
+_gwt_wt_path() {   # <name> → echoes <worktrees-dir>/<name>; FAIL-CLOSED when helpers or dir are unavailable.
+                   # Real incident 2026-08-16: in a partially-loaded shell _gwt_dir was missing, gwt-rm
+                   # continued with wtpath="/<name>" (fs ROOT!) and fed it to `git worktree remove`.
+                   # Every path built from _gwt_dir must resolve through this guard.
+  emulate -L zsh
+  local d
+  d="$(_gwt_dir 2>/dev/null)" || { echo "✗ worktree helpers unavailable — source ~/.config/cc-stack/worktree.zsh first" >&2; return 1; }
+  [[ -n "$d" ]] || { echo "✗ worktrees dir unresolvable (helper returned empty)" >&2; return 1; }
+  echo "$d/$1"
+}
 
 # Ensure a path is ignored by the project .gitignore (idempotent)
 _gwt_ensure_ignore() {
@@ -175,7 +185,7 @@ gwt-new() {
   local name="$1" prefix="${2:-feat}" base="${3:-HEAD}"
   [[ -n "$name" ]] || { echo "usage: gwt-new <name> [branch-prefix=feat] [base=HEAD]"; return 1 }
   local root; root="$(_gwt_root)" || { echo "✗ not inside a git repo"; return 1 }
-  local wtpath="$(_gwt_dir)/$name" branch="$prefix/$name"
+  local wtpath branch="$prefix/$name"; wtpath="$(_gwt_wt_path "$name")" || return 1
   _gwt_bootstrap_wt "$root" "$wtpath" "$branch" "$base" || return 1
   echo "✔ worktree: $wtpath   branch: $branch"
   ~/.config/cc-stack/cc-merge.sh capture "$root" "$branch" "$PWD" >/dev/null 2>&1
@@ -221,7 +231,7 @@ gwt-adopt() {
     echo "  ↳ $branch already has a worktree; leaving it in place"; return 0
   fi
   local name="${branch//\//-}"                 # feature/x → feature-x (collision-free dir)
-  local wtpath="$(_gwt_dir)/$name"
+  local wtpath; wtpath="$(_gwt_wt_path "$name")" || return 1
   _gwt_bootstrap_wt "$root" "$wtpath" "$branch" || return 1
   echo "  ↳ worktree: $wtpath"
   # focus=false: enrolling a branch must not yank you out of what you're doing.
@@ -516,14 +526,15 @@ gwt-rm() {
       *) echo "usage: gwt-rm <name> [--branch] [--close]"; return 1 ;;
     esac
   done
-  local wtpath="$(_gwt_dir)/$name"
+  local wtpath; wtpath="$(_gwt_wt_path "$name")" || return 1
+  [[ -d "$wtpath" ]] || { echo "✗ no worktree named '$name' under the worktrees dir" >&2; return 1; }
   local wtabs; wtabs="$(cd "$wtpath" 2>/dev/null && pwd -P)"   # canonical path (before removal) for bookkeeping
   local wtbranch; wtbranch="$(git -C "$wtpath" symbolic-ref --short HEAD 2>/dev/null)"   # real branch, any prefix (captured before removal)
   # Merge the worktree's shared corpus (new e2e tests) back into the main repo BEFORE removal, so
   # nothing is lost. Same-name-different-content clashes are preserved as <name>.from-<branch>.<ext>.
   if [[ -n "$CC_WT_SHARE" && -d "$wtpath" ]]; then
     local _root _b _has=""
-    _root="$(_gwt_root)"
+    _root="$(_gwt_root 2>/dev/null)" || { echo "✗ cannot resolve repo root for the corpus merge-back" >&2; return 1; }
     for _b in ${(s: :)CC_WT_SHARE}; do [[ -d "$wtpath/${_b%/}" ]] && { _has=1; break }; done
     if [[ -n "$_has" ]]; then
       echo "  ↳ merging shared corpus back into main…"
