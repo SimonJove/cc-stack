@@ -572,23 +572,30 @@ AR=$(mktemp -d); ( cd "$AR"; git init -q; git config user.email t@t; git config 
   git commit -q --allow-empty -m i; git branch -M main
   mkdir .claude                        # so _gwt_dir resolves to .claude/worktrees
   git branch feature/orphan-x; git branch feature/orphan-y )
+# gwt-adopt opens a cmux WORKSPACE for the adopted worktree (worktree.zsh → cc-dispatch.sh
+# workspace). Unshimmed that reached the REAL cmux and leaked one "feature-orphan-y" workspace
+# per suite run (five swept by hand 2026-08-16 with `cmux workspace close --workspace <ref>`).
+# A no-op cmux on PATH keeps the suite from touching the live UI at all — the rule is that a test
+# never opens a surface or workspace it does not also close.
+AFK=$(mktemp -d); printf '#!/bin/sh\nexit 0\n' > "$AFK/cmux"; chmod +x "$AFK/cmux"
+azsh(){ PATH="$AFK:$PATH" zsh -c "$1"; }
 # register-only: sets parent to the trunk, makes NO worktree, appears in the tree
-zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; cd '$AR'; gwt-adopt feature/orphan-x --no-worktree" >/dev/null 2>&1
+azsh "source '$CC/worktree.zsh' >/dev/null 2>&1; cd '$AR'; gwt-adopt feature/orphan-x --no-worktree" >/dev/null 2>&1
 eq "adopt --no-worktree parent=trunk" "$(git -C "$AR" config branch.feature/orphan-x.ccMergeInto)" "main"
 eq "adopt --no-worktree makes no wt"  "$(git -C "$AR" worktree list | wc -l | tr -d ' ')" "1"
 # gwt-tree enumerates WORKTREES, so a register-only branch is intentionally not in it yet
 eq "no-worktree branch not in tree"   "$("$CC/cc-merge.sh" tree "$AR" | awk -F'\t' '$1=="feature/orphan-x"{print $2}')" ""
 # full adopt with --into a non-trunk parent: sets parent + creates a sanitized worktree
-zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; cd '$AR'; gwt-adopt feature/orphan-y --into feature/orphan-x" >/dev/null 2>&1
+azsh "source '$CC/worktree.zsh' >/dev/null 2>&1; cd '$AR'; gwt-adopt feature/orphan-y --into feature/orphan-x" >/dev/null 2>&1
 eq "adopt --into sets the parent"     "$(git -C "$AR" config branch.feature/orphan-y.ccMergeInto)" "feature/orphan-x"
 eq "adopt creates a worktree"         "$(git -C "$AR" worktree list | wc -l | tr -d ' ')" "2"
 eq "adopt worktree dir sanitized"     "$([ -d "$AR/.claude/worktrees/feature-orphan-y" ] && echo yes || echo no)" "yes"
 # a worktree'd adopt DOES appear in the tree, hung under the given parent
 eq "worktreed adopt is in the tree"   "$("$CC/cc-merge.sh" tree "$AR" | awk -F'\t' '$1=="feature/orphan-y"{print $2}')" "feature/orphan-x"
 # guards: a missing branch writes no config; the trunk cannot be adopted
-zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; cd '$AR'; gwt-adopt no/such" >/dev/null 2>&1
+azsh "source '$CC/worktree.zsh' >/dev/null 2>&1; cd '$AR'; gwt-adopt no/such" >/dev/null 2>&1
 eq "adopt rejects missing branch"     "$(git -C "$AR" config branch.no/such.ccMergeInto 2>/dev/null)" ""
-zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; cd '$AR'; gwt-adopt main" >/dev/null 2>&1; arc=$?
+azsh "source '$CC/worktree.zsh' >/dev/null 2>&1; cd '$AR'; gwt-adopt main" >/dev/null 2>&1; arc=$?
 eq "adopt rejects the trunk"          "$arc" "1"
 
 # gwt-rm --branch must resolve the REAL branch (any prefix) from the worktree, not assume feat/<name>
@@ -596,7 +603,7 @@ eq "adopt rejects the trunk"          "$arc" "1"
 CC_TASKS_FILE=/dev/null CC_STATUS_FILE=/dev/null zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; cd '$AR'; gwt-rm custom-pre --branch" >/dev/null 2>&1
 eq "gwt-rm removes the worktree"      "$([ -d "$AR/.claude/worktrees/custom-pre" ] && echo no || echo yes)" "yes"
 eq "gwt-rm deletes custom-prefix branch" "$(git -C "$AR" show-ref --verify --quiet refs/heads/fix/custom-pre && echo still-there || echo gone)" "gone"
-rm -rf "$AR"
+rm -rf "$AR" "$AFK"
 
 echo ""
 echo "== 15. gwt-provider (provider switch for new sub-tasks) =="
@@ -878,9 +885,13 @@ OTH17="$(cn17 "$(mktemp -d)")"; UNREL17="$(cn17 "$(mktemp -d)")"
 U1="11111111-1111-1111-1111-111111111111"; SESS2="22222222-2222-2222-2222-222222222222"
 SURF2="33333333-3333-3333-3333-333333333333"; U4="44444444-4444-4444-4444-444444444444"
 TF17=$(mktemp -u); SF17=$(mktemp -u)
-printf '2026-01-01 00:00:01\tfeat/R2\tsurface:8\t%s\tsurface:1\tD2 older\tmain\tuuid=%s:provider=anthropic:pm=auto\n' "$D2" "$SESS2"  > "$TF17"
+# D2's rows carry a STALE suuid (the surface uuid its tab had before the crash) plus a csuuid and
+# a model — the resume round must refresh suuid to the surface it was restored onto and leave the
+# rest of the record, including the model-goes-LAST ordering, exactly where it was.
+OLDS17="99999999-0000-0000-0000-000000000000"; CSU17R="AAAAAAAA-0000-0000-0000-000000000000"
+printf '2026-01-01 00:00:01\tfeat/R2\tsurface:8\t%s\tsurface:1\tD2 older\tmain\tuuid=%s:provider=anthropic:pm=auto:csuuid=%s:suuid=%s:model=m1\n' "$D2" "$SESS2" "$CSU17R" "$OLDS17"  > "$TF17"
 printf '2026-01-01 00:00:02\tfeat/R1\tsurface:9\t%s\tsurface:1\tD1 kimi task\tmain\tuuid=%s:provider=kimi:pm=plan:model=glm-4.6\n' "$D1" "$U1" >> "$TF17"
-printf '2026-01-01 00:00:03\tfeat/R2\tsurface:9\t%s\tsurface:1\tD2 plain task\tmain\tuuid=%s:provider=anthropic:pm=auto\n' "$D2" "$SESS2" >> "$TF17"
+printf '2026-01-01 00:00:03\tfeat/R2\tsurface:9\t%s\tsurface:1\tD2 plain task\tmain\tuuid=%s:provider=anthropic:pm=auto:csuuid=%s:suuid=%s:model=m1\n' "$D2" "$SESS2" "$CSU17R" "$OLDS17" >> "$TF17"
 printf '2026-01-01 00:00:04\tfeat/R3\tsurface:10\t%s\tsurface:1\tD3 old row\tmain\n' "$D3" >> "$TF17"
 printf '2026-01-01 00:00:05\tfeat/R4\tsurface:11\t%s/gone\tsurface:1\tdead dir row\tmain\tuuid=%s:provider=kimi:pm=auto\n' "$REPO17" "$U1" >> "$TF17"
 printf '2026-01-01 00:00:06\tfeat/R5\tsurface:12\t%s\tsurface:1\tforeign repo row\tmain\tuuid=%s:provider=glm:pm=auto\n' "$OTH17" "$U4" >> "$TF17"
@@ -917,6 +928,13 @@ eq "resume exit0"            "$rrc" "0"
 eq "native restore invoked"  "$(grep -c 'RESTORE-SESSION' "$CC_FAKE_LOG")" "1"
 eq "restored row ref refreshed" "$(awk -F'\t' -v d="$D2" '$4==d{print $3}' "$TF17" | sort -u)" "surface:55"
 eq "ALL rows of dir refreshed"  "$(awk -F'\t' -v d="$D2" '$4==d{print $3}' "$TF17" | wc -l | tr -d ' ')" "2"
+# a restored tab is a NEW surface: the recorded suuid must track it, or the close gate would go on
+# comparing against a dead uuid (and refuse the parent its own child forever)
+eq "suuid refreshed on restore" "$(awk -F'\t' -v d="$D2" '$4==d{print $8}' "$TF17" | sort -u)" \
+                                "uuid=$SESS2:provider=anthropic:pm=auto:csuuid=$CSU17R:suuid=$SURF2:model=m1"
+eq "stale suuid is gone"        "$(grep -cF "$OLDS17" "$TF17")" "0"
+eq "csuuid survived the rewrite" "$(awk -F'\t' -v d="$D2" '$4==d{print ($8 ~ /:csuuid=/)?"y":"n"}' "$TF17" | sort -u)" "y"
+eq "model still LAST after rewrite" "$(awk -F'\t' -v d="$D2" '$4==d{print ($8 ~ /:model=m1$/)?"y":"n"}' "$TF17" | sort -u)" "y"
 eq "reopened exact cld cmd"  "$(grep -cF "cld kimi --resume $U1 --permission-mode plan --model glm-4.6" "$CC_FAKE_LOG")" "1"
 eq "reopen dir VERBATIM"     "$(grep "NEWSURF" "$CC_FAKE_LOG" | grep -cF -- "--working-directory $D1")" "1"
 eq "idle degrade bare ccteam" "$(grep -cE "^SEND\|--surface surface:[0-9]+ ccteam$" "$CC_FAKE_LOG")" "1"
@@ -959,16 +977,20 @@ eq "--all reopens foreign"   "$rrc" "0"
 eq "--all exact cmd (omit unrecorded)" "$(grep -cF "cld glm --resume $U4 --permission-mode auto" "$CC_FAKE_LOG")" "1"
 eq "no --model when unrecorded" "$(grep -c -- '--model' "$CC_FAKE_LOG")" "0"
 # D) dispatch records the minted uuid: surface (fresh mode) puts --session-id on the launch AND
-# the composed launch-args on the log row; a non-whitelisted model is dropped, never interpolated
+# the composed launch-args on the log row; a non-whitelisted model is dropped, never interpolated.
+# CC_CALLER_SURFACE_UUID is pinned so the csuuid the dispatcher records (the PARENT surface, see
+# section 18) is deterministic instead of whatever cmux surface the suite happens to run in.
 TF17D=$(mktemp -u); D0="$(cn17 "$(mktemp -d)")"
+CSU17="EEEEEEEE-1111-2222-3333-444444444444"
 : > "$CC_FAKE_LOG"
 env HOME="$FH17" PATH="$RF:$OP17" CC_TASKS_FILE="$TF17D" CC_SEND_FAILLOG="$RF/fail" \
   CC_SEND_VERIFY_SEC=0.1 CC_LAUNCH_FILE="$RF/launch" CC_WT_PERMISSION_MODE=plan CC_WT_MODEL='glm-4.6[1m]' \
+  CC_CALLER_SURFACE_UUID="$CSU17" \
   bash "$CC/cc-dispatch.sh" surface "$D0" "mint test brief" >/dev/null 2>&1
 MINT="$(grep -oE -- '--session-id [0-9a-f-]+' "$CC_FAKE_LOG" | head -1 | cut -d' ' -f2)"
 eq "surface mints a uuid"    "$(printf '%s' "$MINT" | grep -cE '^[0-9a-f-]{30,}$')" "1"
 eq "minted id on launch"     "$(grep -cF -- "ccteam --session-id $MINT --permission-mode plan --model glm-4.6[1m]" "$CC_FAKE_LOG")" "1"
-eq "minted id on log row"    "$(awk -F'\t' -v d="$D0" '$4==d{print $8}' "$TF17D")" "uuid=$MINT:provider=anthropic:pm=plan:model=glm-4.6[1m]"
+eq "minted id on log row"    "$(awk -F'\t' -v d="$D0" '$4==d{print $8}' "$TF17D")" "uuid=$MINT:provider=anthropic:pm=plan:csuuid=$CSU17:model=glm-4.6[1m]"
 eq "mint row has 8 fields"   "$(awk -F'\t' -v d="$D0" '$4==d{print NF}' "$TF17D")" "8"
 D0B="$(cn17 "$(mktemp -d)")"
 : > "$CC_FAKE_LOG"
@@ -984,8 +1006,326 @@ rm -f "${TMPDIR:-/tmp}/cc-cmux-tabs/$(printf '%s' "$D0"  | shasum -a 1 | cut -d'
 unset CC_FAKE_LOG CC_FAKE_SCREEN
 
 echo ""
+echo "== 18. tab-close permission model (2026-08-16 incident) =="
+# fake cmux whose short refs DRIFT — `x-drift` renumbers every surface (surface:1xx/2xx/3xx climb)
+# while the UUIDs stay put, exactly what a pane open/close does live and what killed the parent
+# session on 2026-08-16. Refs are stable BETWEEN drifts, so a test can capture the current ref,
+# drift, and prove the uuid path survives what the ref path does not.
+# close-surface/new-surface record into $CC_FAKE_LOG.
+CF=$(mktemp -d); export CC_FAKE_LOG="$CF/log"
+cat > "$CF/cmux" <<'CMUX'
+#!/usr/bin/env bash
+case "$1" in
+  ping) exit 0 ;;
+  identify) echo '{ "caller": {} }' ;;
+  x-drift)
+    n=$(cat "${CC_FAKE_LOG}.drift" 2>/dev/null || echo 0); echo "$((n+1))" > "${CC_FAKE_LOG}.drift" ;;
+  list-pane-surfaces)
+    n=$(cat "${CC_FAKE_LOG}.drift" 2>/dev/null || echo 0)
+    printf '  surface:%s\tAAAAAAAA-1111-1111-1111-111111111111\tchild A\n' "$((100+n))"
+    printf '* surface:%s\tBBBBBBBB-2222-2222-2222-222222222222\tchild B\n' "$((200+n))"
+    printf '  surface:%s\tCCCCCCCC-3333-3333-3333-333333333333\tparent\n' "$((300+n))"
+    printf '  surface:%s\tFFFFFFFF-6666-6666-6666-666666666666\tprimary checkout\n' "$((400+n))"
+    ;;
+  new-surface)
+    n=$(cat "${CC_FAKE_LOG}.nscnt" 2>/dev/null || echo 500); n=$((n+1)); echo "$n" > "${CC_FAKE_LOG}.nscnt"
+    printf 'NEWSURF|surface:%s|%s\n' "$n" "$*" >> "$CC_FAKE_LOG"
+    printf 'OK surface:%s (99999999-7777-7777-7777-%012d) pane:1 (P) workspace:1 (W)\n' "$n" "$n" ;;
+  close-surface) shift; printf 'CLOSE|%s\n' "$*" >> "$CC_FAKE_LOG" ;;
+  send)     shift; printf 'SEND|%s\n' "$*" >> "$CC_FAKE_LOG" ;;
+  send-key) shift; printf 'KEY|%s\n'  "$*" >> "$CC_FAKE_LOG" ;;
+  read-screen) cat "$CF_SCREEN" 2>/dev/null ;;
+esac
+exit 0
+CMUX
+chmod +x "$CF/cmux"
+NB18="$(printf '\xc2\xa0')"; export CF_SCREEN="$CF/screen"
+{ echo "RDY22"; printf '\xe2\x9d\xaf%s\n' "$NB18"; echo "? for shortcuts"; } > "$CF_SCREEN"
+OP18="$PATH"
+UA="AAAAAAAA-1111-1111-1111-111111111111"   # child A, dispatched by PARENT
+UB="BBBBBBBB-2222-2222-2222-222222222222"   # child B, dispatched by SOMEONE ELSE
+UP="CCCCCCCC-3333-3333-3333-333333333333"   # PARENT (this session in these tests)
+UO="DDDDDDDD-4444-4444-4444-444444444444"   # the other parent
+UM="FFFFFFFF-6666-6666-6666-666666666666"   # the primary checkout tab (human-opened)
+cn18(){ CDPATH= cd -- "$1" >/dev/null 2>&1 && pwd -P; }
+R18="$(cn18 "$(mktemp -d)")"; mkdir -p "$R18/.claude/worktrees/wtA" "$R18/.claude/worktrees/wtB"
+WA="$R18/.claude/worktrees/wtA"; WB="$R18/.claude/worktrees/wtB"
+TF18=$(mktemp -u); ST18="$CF/store.json"; echo '{}' > "$ST18"
+la18(){ printf 'uuid=u%s:provider=anthropic:pm=auto:csuuid=%s:suuid=%s' "$1" "$2" "$3"; }
+printf '2026-01-01 00:00:01\tfeat/A\tsurface:101\t%s\tsurface:9\ttask A\tmain\t%s\n' "$WA"  "$(la18 1 "$UP" "$UA")" >  "$TF18"
+printf '2026-01-01 00:00:02\tfeat/B\tsurface:201\t%s\tsurface:9\ttask B\tmain\t%s\n' "$WB"  "$(la18 2 "$UO" "$UB")" >> "$TF18"
+printf '2026-01-01 00:00:03\tmain\tsurface:301\t%s\tsurface:9\tprimary checkout\tmain\t%s\n' "$R18" "$(la18 3 "$UP" "$UM")" >> "$TF18"
+# pre-feature row (no csuuid/suuid at all) — must still parse, and must never be closable
+R18OLD="$(cn18 "$(mktemp -d)")"; mkdir -p "$R18OLD/.claude/worktrees/wtOld"; WOLD="$R18OLD/.claude/worktrees/wtOld"
+printf '2026-01-01 00:00:04\tfeat/OLD\tsurface:401\t%s\tsurface:9\told row\tmain\tuuid=u4:provider=kimi:pm=auto:model=glm-4.6\n' "$WOLD" >> "$TF18"
+
+pay18(){ python3 -c "import json,sys;print(json.dumps({'tool_name':'Bash','tool_input':{'command':sys.argv[1]}}))" "$1"; }
+# hook runner: returns rc, block message on stdout (the hook writes it to stderr)
+hkrun(){ printf '%s' "$(pay18 "$1")" | env PATH="$CF:$OP18" CC_TASKS_FILE="$TF18" CC_CMUX_SESSIONS="$ST18" \
+    CC_CALLER_SURFACE_UUID="${2:-$UP}" CC_ALLOW_SELF_CLOSE= bash "$CC/hooks/block-unsafe-close.sh" 2>&1; }
+hkrc(){ printf '%s' "$(pay18 "$1")" | env PATH="$CF:$OP18" CC_TASKS_FILE="$TF18" CC_CMUX_SESSIONS="$ST18" \
+    CC_CALLER_SURFACE_UUID="${2:-$UP}" CC_ALLOW_SELF_CLOSE= bash "$CC/hooks/block-unsafe-close.sh" >/dev/null 2>&1; echo $?; }
+rule(){ hkrun "$1" "${2:-$UP}" | head -1 | grep -oE 'rule [a-f]' | head -1; }   # which rule fired
+
+# — allow: the parent closing ITS OWN child, by stable uuid and by whatever short ref is current —
+eq "hook allows own child (uuid)"    "$(hkrc "cmux close-surface --surface $UA")" "0"
+LREF="$(env PATH="$CF:$OP18" cmux list-pane-surfaces --id-format both | awk -v u="$UA" '$2==u{print $1}')"
+eq "hook allows own child (live ref)" "$(hkrc "cmux close-surface --surface $LREF")" "0"
+eq "hook allows --surface=<uuid>"    "$(hkrc "cmux close-surface --surface=$UA")" "0"
+# drift proof: one pane open/close renumbers everything — the ref captured a moment ago now points
+# nowhere (and could point at ANOTHER tab), while the recorded uuid keeps working
+env PATH="$CF:$OP18" cmux x-drift
+eq "stale short ref refused"         "$(rule "cmux close-surface --surface $LREF")" "rule e"
+eq "uuid survives the drift"         "$(hkrc "cmux close-surface --surface $UA")" "0"
+eq "the drifted ref allows again"    "$(hkrc "cmux close-surface --surface $(env PATH="$CF:$OP18" cmux list-pane-surfaces --id-format both | awk -v u="$UA" '$2==u{print $1}')")" "0"
+# — rule a: escape hatch, both as a command prefix and as an inherited env var —
+eq "rule a inline prefix allows"     "$(hkrc "CC_ALLOW_SELF_CLOSE=1 cmux close-surface --surface 283")" "0"
+eq "rule a env allows"               "$(printf '%s' "$(pay18 'cmux close-surface --surface 283')" \
+  | env PATH="$CF:$OP18" CC_TASKS_FILE="$TF18" CC_ALLOW_SELF_CLOSE=1 bash "$CC/hooks/block-unsafe-close.sh" >/dev/null 2>&1; echo $?)" "0"
+# — rule b: a bare number is a cmux INDEX (the incident's first failure) —
+eq "rule b bare numeric"             "$(rule 'cmux close-surface --surface 283')" "rule b"
+eq "rule b exits 2"                  "$(hkrc 'cmux close-surface --surface 283')" "2"
+# — rule c: no parseable explicit target. THE incident command is this case: cmux ignores a
+#   positional target and closes the CALLER's own surface (probed live 2026-08-16) —
+eq "rule c incident command"         "$(rule 'for s in 283 284 285; do cmux close-surface surface:$s; done')" "rule c"
+eq "rule c bare close-surface"       "$(rule 'cmux close-surface')" "rule c"
+eq "rule c positional ref"           "$(rule "cmux close-surface $UA")" "rule c"
+eq "rule c xargs form"               "$(rule 'cmux list-pane-surfaces | xargs -I{} cmux close-surface --surface {}')" "rule c"
+eq "rule c \$VAR target"             "$(rule 'cmux close-surface --surface surface:$s')" "rule c"
+eq "rule c names the primitive"      "$(hkrun 'cmux close-surface' | grep -c 'cc-dispatch.sh close')" "1"
+# — rule d: never the caller's own surface —
+eq "rule d self by uuid"             "$(rule "cmux close-surface --surface $UP")" "rule d"
+SREF="$(env PATH="$CF:$OP18" cmux list-pane-surfaces --id-format both | awk -v u="$UP" '$2==u{print $1}')"
+eq "rule d self by live ref"         "$(rule "cmux close-surface --surface $SREF" "$UP")" "rule d"
+eq "rule d fires for a child too"    "$(rule "cmux close-surface --surface $UA" "$UA")" "rule d"
+# — rule e: anything that is not a registered worktree tab is human-UI-only —
+eq "rule e primary checkout"         "$(rule "cmux close-surface --surface $UM")" "rule e"
+eq "rule e unknown surface"          "$(rule 'cmux close-surface --surface 55555555-5555-5555-5555-555555555555')" "rule e"
+eq "rule e close-window"             "$(rule 'cmux close-window --window window:1')" "rule e"
+eq "rule e close-window by index"    "$(rule 'cmux close-window --window 0')" "rule b"
+# — rule f: a worktree tab dispatched by someone else, or with no owner recorded —
+eq "rule f other parent's child"     "$(rule "cmux close-surface --surface $UB")" "rule f"
+eq "rule f names the recorded owner" "$(hkrun "cmux close-surface --surface $UB" | grep -c "$UO")" "1"
+eq "rule f pre-feature row"          "$(rule "cmux close-surface --surface $UA" "$UO")" "rule f"
+# — multi-target: EVERY target must pass —
+eq "multi allow (both own)"          "$(hkrc "cmux close-surface --surface $UA; cmux close-surface --surface $UA")" "0"
+eq "multi blocks on the second"      "$(rule "cmux close-surface --surface $UA && cmux close-surface --surface $UB")" "rule f"
+eq "multi blocks on a bare number"   "$(rule "cmux close-surface --surface $UA; cmux close-surface --surface 283")" "rule b"
+# — evasion family (gate review 2026-08-16: every one of these was live-verified to close a real
+#   tab while passing the first version of the parser). The shell hands cmux the same argv whether
+#   the words are quoted, escaped, wrapped or built from a variable —
+eq "evade: quoted subcommand ('')"   "$(rule "cmux 'close-surface' --surface $UB")" "rule f"
+eq "evade: quoted subcommand (\"\")" "$(rule "cmux \"close-surface\" --surface $UB")" "rule f"
+eq "evade: escaped hyphen"           "$(rule "cmux close\\-surface --surface $UB")" "rule f"
+eq "evade: escaped hyphen exits 2"   "$(hkrc "cmux close\\-surface --surface $UB")" "2"
+eq "evade: variable runner"          "$(rule "CMD=cmux; \$CMD close-surface --surface $UB")" "rule c"
+eq "evade: command-substitution runner" "$(rule "\`which cmux\` close-surface --surface $UB")" "rule c"
+eq "evade: bare verb (alias/function)"  "$(rule "close-surface --surface $UB")" "rule c"
+eq "evade: env -u strips nothing"    "$(rule "env -u CLAUDECODE cmux close-surface --surface $UB")" "rule f"
+eq "evade: env -u self-close"        "$(rule "env -u CLAUDECODE cmux close-surface --surface $UP")" "rule d"
+eq "evade: sudo wrapper"             "$(rule "sudo cmux close-surface --surface $UB")" "rule f"
+eq "evade: post-\`--\` positionals"  "$(rule "cmux close-surface -- --surface $UB")" "rule c"
+eq "evade: post-\`--\` exits 2"      "$(hkrc "cmux close-surface -- --surface $UB")" "2"
+eq "evade: escaped form of own child still allowed" "$(hkrc "cmux close\\-surface --surface $UA")" "0"
+# — gate round 2: three more TEXT-VISIBLE forms. N3 is not even adversarial — `cmux
+#   [global-options] <command>` is cmux's own documented grammar, so the verb is simply not
+#   adjacent to the command word; the other two splice the verb together out of shell syntax —
+eq "N3: --json + verb (self)"        "$(rule "cmux --json close-surface --surface $UP")" "rule d"
+eq "N3: --json + verb (other child)" "$(rule "cmux --json close-surface --surface $UB")" "rule f"
+eq "N3: --password <value> + verb (self)"  "$(rule "cmux --password pw close-surface --surface $UP")" "rule d"
+eq "N3: --password <value> + verb (other)" "$(rule "cmux --password pw close-surface --surface $UB")" "rule f"
+eq "N3: two flags in a row"          "$(rule "cmux --json --password pw close-surface --surface $UB")" "rule f"
+eq "N3: short flags"                 "$(rule "cmux -j -p pw close-surface --surface $UB")" "rule f"
+eq "N3: flag + harmless verb passes" "$(hkrc 'cmux --json list-pane-surfaces')" "0"
+eq "N3: flag + harmless verb + args" "$(hkrc 'cmux --json list-pane-surfaces --workspace workspace:1')" "0"
+eq "N1: ANSI-C quoted verb (self)"   "$(rule "cmux \$'close-surface' --surface $UP")" "rule d"
+eq "N1: ANSI-C quoted verb (other)"  "$(rule "cmux \$'close-surface' --surface $UB")" "rule f"
+eq "N1: ANSI-C quoted verb exits 2"  "$(hkrc "cmux \$'close-surface' --surface $UB")" "2"
+eq "N2: IFS splice (self)"           "$(rule "IFS=-; cmux close\${IFS}surface --surface $UP")" "rule d"
+eq "N2: IFS splice (other child)"    "$(rule "IFS=-; cmux close\${IFS}surface --surface $UB")" "rule f"
+eq "N2: unresolvable subcommand"     "$(rule "cmux \$VERB --surface $UB; cmux close-surface --surface $UB")" "rule c"
+# — no false positives: the verb only counts at COMMAND position —
+eq "quoted mention passes"           "$(hkrc 'cc-dispatch.sh send surface:9 "I ran cmux close-surface --surface 283 and died"')" "0"
+eq "prose about a closed window"     "$(hkrc 'echo "I closed window 3 by hand yesterday"')" "0"
+eq "unrelated command passes"        "$(hkrc 'git status')" "0"
+eq "our own primitive passes"        "$(hkrc "cc-dispatch.sh close $WA")" "0"
+
+# — the sanctioned primitive: resolves by RECORDED uuid, prints it, enforces the same policy —
+cl18(){ ( cd "$R18" && env PATH="$CF:$OP18" CC_TASKS_FILE="$TF18" CC_CMUX_SESSIONS="$ST18" \
+    CC_CALLER_SURFACE_UUID="${2:-$UP}" CLAUDECODE=1 bash "$CC/cc-dispatch.sh" close "$1" ) 2>&1; }
+: > "$CC_FAKE_LOG"
+CO="$(cl18 "$WA")"; crc=$?
+eq "close exit0 on own child"  "$crc" "0"
+eq "close prints the uuid"     "$(echo "$CO" | grep -c "uuid=$UA")" "1"
+eq "close prints a short ref"  "$(echo "$CO" | grep -cE 'resolved : surface:[0-9]+')" "1"
+eq "close prints the cwd"      "$(echo "$CO" | grep -cF "cwd=$WA")" "1"
+eq "close closes BY UUID"      "$(grep -cF "CLOSE|--surface $UA" "$CC_FAKE_LOG")" "1"
+eq "close never uses a ref"    "$(grep -c 'CLOSE|--surface surface:' "$CC_FAKE_LOG")" "0"
+: > "$CC_FAKE_LOG"
+CO="$(cl18 "$WB")"; crc=$?
+eq "close refuses another parent's child" "$crc" "1"
+eq "refusal names the owner"   "$(echo "$CO" | grep -c "dispatched by $UO")" "1"
+eq "refusal closes nothing"    "$(grep -c 'CLOSE|' "$CC_FAKE_LOG")" "0"
+: > "$CC_FAKE_LOG"
+CO="$(cl18 "$WA" "$UA")"; crc=$?
+eq "close refuses self-close"  "$crc" "1"
+eq "self refusal closes nothing" "$(grep -c 'CLOSE|' "$CC_FAKE_LOG")" "0"
+: > "$CC_FAKE_LOG"
+CO="$(cl18 "$R18")"; crc=$?
+eq "close refuses the primary checkout" "$crc" "1"
+eq "primary refusal says not a worktree" "$(echo "$CO" | grep -c 'not a worktree checkout')" "1"
+eq "primary refusal closes nothing" "$(grep -c 'CLOSE|' "$CC_FAKE_LOG")" "0"
+: > "$CC_FAKE_LOG"
+CO="$(cl18 "$WOLD")"; crc=$?
+eq "close refuses an unresolvable dir" "$crc" "0"
+eq "unresolvable says nothing to do"   "$(echo "$CO" | grep -c 'nothing to do')" "1"
+eq "unresolvable closes nothing"       "$(grep -c 'CLOSE|' "$CC_FAKE_LOG")" "0"
+# — automated vs human is decided by PROCESS ANCESTRY, not by an env var —
+# `env -u CLAUDECODE cc-dispatch.sh close <someone-elses-child>` really closed the tab under the
+# env-var discriminator (gate review 2026-08-16), because anything in the environment is strip-able
+# from the very command line being gated. A fake `ps` on the PATH shim drives both chains.
+cat > "$CF/ps" <<'PS'
+#!/usr/bin/env bash
+# fake ps: answers `-o ppid= -p N` / `-o comm= -p N` from $CC_FAKE_PSMAP ("pid ppid comm" lines).
+# A pid that is not in the map is the REAL process the walk starts from — it enters the synthetic
+# chain at its first row.
+want=""; pid=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) case "$2" in ppid*) want=ppid ;; comm*) want=comm ;; esac; shift 2 ;;
+    -p) pid="${2:-}"; shift 2 ;;
+    *)  shift ;;
+  esac
+done
+row="$(awk -v p="$pid" '$1==p{print; exit}' "$CC_FAKE_PSMAP" 2>/dev/null)"
+if [ -z "$row" ]; then
+  if [ "$want" = ppid ]; then awk 'NR==1{print $1}' "$CC_FAKE_PSMAP" 2>/dev/null; else echo "/bin/bash"; fi
+  exit 0
+fi
+set -- $row
+if [ "$want" = ppid ]; then echo "$2"; else echo "$3"; fi
+PS
+chmod +x "$CF/ps"
+printf '90001 90002 -/bin/zsh\n90002 90003 /usr/bin/login\n90003 1 /sbin/launchd\n' > "$CF/ps.human"
+printf '90001 90002 /bin/bash\n90002 90003 /opt/homebrew/bin/claude\n90003 1 /sbin/launchd\n' > "$CF/ps.agent"
+anc18(){ # $1 = chain fixture, $2 = dir  →  runs the primitive with CLAUDECODE stripped
+  ( cd "$R18" && env -u CLAUDECODE PATH="$CF:$OP18" CC_TASKS_FILE="$TF18" CC_CMUX_SESSIONS="$ST18" \
+      CC_FAKE_PSMAP="$CF/ps.$1" CC_CALLER_SURFACE_UUID="$UP" bash "$CC/cc-dispatch.sh" close "$2" ) 2>&1; }
+: > "$CC_FAKE_LOG"
+CO="$(anc18 agent "$WB")"; crc=$?
+eq "env -u CLAUDECODE cannot spoof human" "$crc" "1"
+eq "spoof attempt closes nothing"         "$(grep -c 'CLOSE|' "$CC_FAKE_LOG")" "0"
+eq "spoof refusal names the owner"        "$(echo "$CO" | grep -c "dispatched by $UO")" "1"
+: > "$CC_FAKE_LOG"
+CO="$(anc18 human "$WB")"
+eq "human shell may close another's child" "$(grep -cF "CLOSE|--surface $UB" "$CC_FAKE_LOG")" "1"
+eq "human shell still reports the owner"   "$(echo "$CO" | grep -c 'ownership check reported')" "1"
+# the ancestry walk never weakens the OTHER two rules
+: > "$CC_FAKE_LOG"
+CO="$(anc18 human "$R18")"
+eq "human shell still refused the primary checkout" "$(echo "$CO" | grep -c 'not a worktree checkout')" "1"
+: > "$CC_FAKE_LOG"
+CO="$( ( cd "$R18" && env -u CLAUDECODE PATH="$CF:$OP18" CC_TASKS_FILE="$TF18" CC_CMUX_SESSIONS="$ST18" \
+      CC_FAKE_PSMAP="$CF/ps.human" CC_CALLER_SURFACE_UUID="$UA" bash "$CC/cc-dispatch.sh" close "$WA" ) 2>&1 )"
+eq "human shell still refused a self-close" "$(echo "$CO" | grep -c 'no automated self-close')" "1"
+eq "self refusal closed nothing"            "$(grep -c 'CLOSE|' "$CC_FAKE_LOG")" "0"
+
+# — dispatch records BOTH stable identities on the board row —
+FH18=$(mktemp -d); mkdir -p "$FH18/.config"; cp -R "$CC" "$FH18/.config/cc-stack"
+TF18D=$(mktemp -u); DD="$(cn18 "$(mktemp -d)")"
+: > "$CC_FAKE_LOG"
+env HOME="$FH18" PATH="$CF:$OP18" CC_TASKS_FILE="$TF18D" CC_CMUX_SESSIONS="$ST18" \
+  CC_SEND_FAILLOG="$CF/fail" CC_SEND_VERIFY_SEC=0.1 CC_LAUNCH_FILE="$CF/launch" \
+  CC_CALLER_SURFACE_UUID="$UP" bash "$CC/cc-dispatch.sh" surface "$DD" "dispatch brief" >/dev/null 2>&1
+DLA="$(awk -F'\t' -v d="$DD" '$4==d{print $8}' "$TF18D")"
+NSU="$(grep -oE 'NEWSURF\|surface:[0-9]+' "$CC_FAKE_LOG" | head -1 | cut -d: -f2)"
+eq "dispatch asks for both ids" "$(grep -c -- '--id-format both' "$CC_FAKE_LOG")" "1"
+eq "row records the caller uuid" "$(printf '%s' "$DLA" | grep -c "csuuid=$UP")" "1"
+eq "row records the tab uuid"    "$(printf '%s' "$DLA" | grep -c "suuid=99999999-7777-7777-7777-$(printf '%012d' "$NSU")")" "1"
+eq "model still composed LAST"   "$(printf '%s' "$DLA" | grep -c 'suuid=[^:]*$')" "1"
+eq "dispatch row has 8 fields"   "$(awk -F'\t' -v d="$DD" '$4==d{print NF}' "$TF18D")" "8"
+# …and the row it just wrote is immediately closable BY ITS PARENT and nobody else
+eq "fresh row closable by parent" "$( ( cd "$DD" && env PATH="$CF:$OP18" CC_TASKS_FILE="$TF18D" CC_CMUX_SESSIONS="$ST18" \
+    CC_CALLER_SURFACE_UUID="$UP" CLAUDECODE=1 bash "$CC/cc-dispatch.sh" close "$DD" >/dev/null 2>&1; echo $? ) )" "0"
+rm -f "${TMPDIR:-/tmp}/cc-cmux-tabs/$(printf '%s' "$DD" | shasum -a 1 | cut -d' ' -f1)" 2>/dev/null
+
+# — old rows keep working: a 7-field row parses, renders and is simply never auto-closable —
+TF18O=$(mktemp -u); WO7="$(cn18 "$(mktemp -d)")"
+printf '2026-01-01 00:00:01\tfeat/O7\tsurface:101\t%s\tsurface:9\tseven fields\tmain\n' "$WO7" > "$TF18O"
+eq "7-field row still 7 fields" "$(awk -F'\t' 'NR==1{print NF}' "$TF18O")" "7"
+eq "7-field row blocks the close" "$(printf '%s' "$(pay18 "cmux close-surface --surface $UA")" \
+  | env PATH="$CF:$OP18" CC_TASKS_FILE="$TF18O" CC_CMUX_SESSIONS="$ST18" CC_CALLER_SURFACE_UUID="$UP" \
+    bash "$CC/hooks/block-unsafe-close.sh" 2>&1 | head -1 | grep -oE 'rule [a-f]')" "rule e"
+
+# — gwt-rm --close routes the tab close through the primitive (and only that way) —
+RM18="$(cn18 "$(mktemp -d)")"
+( cd "$RM18"; git init -q; git config user.email t@t; git config user.name t; git commit -q --allow-empty -m i
+  mkdir .claude; git worktree add -q .claude/worktrees/wtS -b feat/S >/dev/null )
+SW18="$(cn18 "$RM18/.claude/worktrees/wtS")"
+TF18R=$(mktemp -u); SF18R=$(mktemp -u)
+printf '2026-01-01 00:00:01\tfeat/S\tsurface:101\t%s\tsurface:9\trm close\tmain\t%s\n' "$SW18" "$(la18 5 "$UP" "$UA")" > "$TF18R"
+: > "$CC_FAKE_LOG"
+RMOUT="$(env HOME="$FH18" PATH="$CF:$OP18" CC_TASKS_FILE="$TF18R" CC_STATUS_FILE="$SF18R" CC_CMUX_SESSIONS="$ST18" \
+  CC_CALLER_SURFACE_UUID="$UP" zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; cd '$RM18'; gwt-rm wtS --close" 2>&1)"
+eq "gwt-rm --close removed the worktree" "$([ -d "$SW18" ] && echo yes || echo no)" "no"
+eq "gwt-rm --close closed BY UUID"       "$(grep -cF "CLOSE|--surface $UA" "$CC_FAKE_LOG")" "1"
+eq "gwt-rm --close printed the resolution" "$(echo "$RMOUT" | grep -c "uuid=$UA")" "1"
+eq "gwt-rm --close still drops the row"  "$(awk -F'\t' -v d="$SW18" '$4==d{c++} END{print c+0}' "$TF18R" 2>/dev/null || echo 0)" "0"
+# plain gwt-rm (no flag) touches no tab
+( cd "$RM18" && git worktree add -q .claude/worktrees/wtT -b feat/T >/dev/null )
+ST18B="$(cn18 "$RM18/.claude/worktrees/wtT")"
+printf '2026-01-01 00:00:02\tfeat/T\tsurface:102\t%s\tsurface:9\tno close\tmain\t%s\n' "$ST18B" "$(la18 6 "$UP" "$UA")" > "$TF18R"
+: > "$CC_FAKE_LOG"
+env HOME="$FH18" PATH="$CF:$OP18" CC_TASKS_FILE="$TF18R" CC_STATUS_FILE="$SF18R" CC_CMUX_SESSIONS="$ST18" \
+  CC_CALLER_SURFACE_UUID="$UP" zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; cd '$RM18'; gwt-rm wtT" >/dev/null 2>&1
+eq "plain gwt-rm closes no tab"          "$(grep -c 'CLOSE|' "$CC_FAKE_LOG")" "0"
+
+# — the adopted commit gate still behaves (synthetic stdin; it had install assertions but no
+#   behaviour ones, and it entered the repo verbatim from an unversioned runtime copy) —
+CH="$(cn18 "$(mktemp -d)")"; CHH=$(mktemp -d)
+( cd "$CH"; git init -q; git config user.email t@t; git config user.name t; git commit -q --allow-empty -m i
+  mkdir .claude; git worktree add -q .claude/worktrees/wtC -b feat/C >/dev/null )
+CHW="$(cn18 "$CH/.claude/worktrees/wtC")"
+chrun(){ printf '%s' "$(pay18 "$1")" \
+  | ( cd "$CH" && env HOME="$CHH" bash "$CC/hooks/block-worktree-commit.sh" >/dev/null 2>&1; echo $? ); }
+eq "commit gate blocks a worktree commit" "$(chrun "git -C $CHW commit -m x")" "2"
+touch "$CHW/.commit-authorized"
+eq "commit gate allows with the sentinel"  "$(chrun "git -C $CHW commit -m x")" "0"
+eq "sentinel consumed (one grant, one commit)" "$([ -f "$CHW/.commit-authorized" ] && echo yes || echo no)" "no"
+eq "commit gate re-blocks once spent"      "$(chrun "git -C $CHW commit -m x")" "2"
+eq "commit gate ignores the primary checkout" "$(chrun "git -C $CH commit -m x")" "0"
+eq "commit gate ignores non-commit git"    "$(chrun "git -C $CHW status")" "0"
+
+# — install distributes AND registers both PreToolUse hooks, strips the pre-repo registration —
+IH18=$(mktemp -d)
+HOME="$IH18" bash "$CC/install.sh" --yes --dir "$IH18/cc" >/dev/null 2>&1
+sn18(){ python3 -c 'import json,sys
+d=json.load(open(sys.argv[1]+"/.claude/settings.json"))
+print(sum(1 for g in d.get("hooks",{}).get("PreToolUse",[]) or [] for h in (g.get("hooks") or []) if sys.argv[2] in (h.get("command") or "")))' "$IH18" "$1"; }
+eq "install ships the close hook"   "$([ -x "$IH18/cc/hooks/block-unsafe-close.sh" ] && echo yes || echo no)" "yes"
+eq "install ships the commit hook"  "$([ -x "$IH18/cc/hooks/block-worktree-commit.sh" ] && echo yes || echo no)" "yes"
+eq "install registers the close hook"  "$(sn18 'hooks/block-unsafe-close.sh')" "1"
+eq "install registers the commit hook" "$(sn18 'hooks/block-worktree-commit.sh')" "1"
+eq "rules line reaches CLAUDE.md"   "$(grep -c 'cc-dispatch.sh close' "$IH18/.claude/CLAUDE.md")" "1"
+eq "rules line warns on short ids"  "$(grep -c 'NEVER hardcode a surface short id' "$IH18/.claude/CLAUDE.md")" "1"
+HOME="$IH18" bash "$CC/install.sh" --yes --dir "$IH18/cc" >/dev/null 2>&1
+eq "re-install adds no duplicate hook" "$(sn18 'hooks/block-unsafe-close.sh')+$(sn18 'hooks/block-worktree-commit.sh')" "1+1"
+# the pre-repo registration (unversioned ~/.claude/hooks/ copy) is swept, the new one survives
+python3 -c 'import json,sys
+p=sys.argv[1]+"/.claude/settings.json"
+d=json.load(open(p))
+d["hooks"].setdefault("PreToolUse",[]).append({"matcher":"Bash","hooks":[{"type":"command","command":"bash ~/.claude/hooks/block-worktree-commit.sh"}]})
+json.dump(d,open(p,"w"))' "$IH18"
+HOME="$IH18" bash "$CC/install.sh" --yes --dir "$IH18/cc" >/dev/null 2>&1
+eq "strip removes the orphan registration" "$(sn18 '.claude/hooks/block-worktree-commit.sh')" "0"
+eq "strip keeps the repo registrations"    "$(sn18 'hooks/block-unsafe-close.sh')+$(sn18 'hooks/block-worktree-commit.sh')" "1+1"
+rm -rf "$CF" "$R18" "$R18OLD" "$RM18" "$FH18" "$IH18" "$WO7" "$DD" "$CH" "$CHH"
+rm -f "$TF18" "$TF18D" "$TF18O" "$TF18R" "$SF18R"
+unset CC_FAKE_LOG CF_SCREEN
+
+echo ""
 echo "== syntax =="
-for s in "$CC"/*.sh; do bash -n "$s" && : || { echo "  ✗ syntax $s"; fail=$((fail+1)); }; done
+for s in "$CC"/*.sh "$CC"/hooks/*.sh; do bash -n "$s" && : || { echo "  ✗ syntax $s"; fail=$((fail+1)); }; done
 zsh -n "$CC/worktree.zsh" && ok "worktree.zsh syntax" || { no "worktree.zsh syntax" x x; }
 
 echo ""

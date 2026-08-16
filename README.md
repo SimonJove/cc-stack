@@ -310,6 +310,15 @@ after a cmux restart: gwt-resume (worktree.zsh) ──► cc-dispatch.sh resume
   │     (recorded uuid ─► ~/.cmuxterm/claude-hook-sessions.json ─► live surface UUID ─► short ref)
   │  ③ still-missing rows re-opened via surface (CC_WT_LAUNCH_CMD) replaying the recorded args
   │     in the recorded dir VERBATIM  ④ stale sidecar rows cleared for revived dirs
+
+closing tabs: any `cmux close-surface/close-window` via Bash ──►
+hooks/block-unsafe-close.sh   PreToolUse gate: positional/bare/targetless forms (the self-close
+  │                           incident vector: a positional target silently falls back to the
+  │                           CALLER's own surface), self-close, non-worktree targets, owner
+  ▼                           mismatch vs the board's csuuid — children only by their parent,
+cc-dispatch.sh close <dir>    parents/primary-checkout tabs only by the human (the cmux UI path
+gwt-rm --close                bypasses the hook). Sanctioned path: board lookup → suuid → same
+                              policy → close by stable UUID.
 ```
 
 **Key design choices:**
@@ -319,6 +328,7 @@ after a cmux restart: gwt-resume (worktree.zsh) ──► cc-dispatch.sh resume
 - **Reliability**: short retries during cmux hiccups; a hard failure leaves `cc-failures.log` (surfaced by `gwt-status`).
 - **Reliable status**: `gwt-status` judges tab liveness against cmux's live surface list; after a cmux restart, stale refs show `?old-session` rather than falsely "closed".
 - **Recorded-args resume**: dispatch mints the claude `--session-id` and records the full launch args on the board row, so `gwt-resume` replays exactly what was launched (provider env included — the thing cmux's own restore loses). The resume always launches in the **recorded dir string verbatim**: claude keys project identity on the exact path, so `/Users` vs `/private` is a different project.
+- **Close permission model**: tab identity lives on the board as stable UUIDs (`csuuid`/`suuid` inside launch-args, never drifting short refs). Automated closes are gated by `hooks/block-unsafe-close.sh` — a child tab is closable only by its dispatching parent (ancestry-decided, not env-decidable), and parent/primary-checkout tabs are closable only by the human in the cmux UI. `cc-dispatch.sh close <dir>` and `gwt-rm --close` are the sanctioned paths that satisfy the gate by construction.
 
 ---
 

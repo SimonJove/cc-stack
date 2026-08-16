@@ -470,7 +470,9 @@ cc-stack · worktree sub-task commands
   gwt-resume [--all]                     after a cmux restart: native restore first, then re-open still-missing sub-task tabs
                                          replaying the RECORDED session uuid + provider + mode (lists first, asks y/N; --all = every repo, no confirm)
   gwt-log                                the merged-task archive, same columns/filter (rows moved there by gwt-merge)
-  gwt-rm <name> [--branch]               remove worktree (+ clear task record + pre-trust; optionally the branch)
+  gwt-rm <name> [--branch] [--close]     remove worktree (+ clear task record + pre-trust; optionally the branch);
+                                         --close also closes its cmux tab through cc-dispatch.sh close (by the
+                                         RECORDED stable surface uuid — never a short ref, which drifts)
   gwt-prune                              compact the task list (drop dead records + keep newest per dir)
   gwt-clean                              git worktree prune + show current state
   gwt-provider <name>                    set which AI provider starts NEW sub-tasks: gwt-provider kimi|glm|anthropic (existing sub-tasks unchanged); no arg shows current + available
@@ -480,11 +482,20 @@ Note: telling the main Claude to "open a worktree / spin off a sub-task" auto-tr
 EOF
 }
 
-# gwt-rm <name> [--branch] — remove a worktree, optionally its branch too
+# gwt-rm <name> [--branch] [--close] — remove a worktree, optionally its branch and its cmux tab
 gwt-rm() {
   emulate -L zsh
   local name="$1"
-  [[ -n "$name" ]] || { echo "usage: gwt-rm <name> [--branch]"; return 1 }
+  [[ -n "$name" ]] || { echo "usage: gwt-rm <name> [--branch] [--close]"; return 1 }
+  # flags in any order (the legacy `gwt-rm <name> --branch` positional form still works)
+  local want_branch="" want_close="" _a
+  for _a in "${@:2}"; do
+    case "$_a" in
+      --branch) want_branch=1 ;;
+      --close)  want_close=1 ;;
+      *) echo "usage: gwt-rm <name> [--branch] [--close]"; return 1 ;;
+    esac
+  done
   local wtpath="$(_gwt_dir)/$name"
   local wtabs; wtabs="$(cd "$wtpath" 2>/dev/null && pwd -P)"   # canonical path (before removal) for bookkeeping
   local wtbranch; wtbranch="$(git -C "$wtpath" symbolic-ref --short HEAD 2>/dev/null)"   # real branch, any prefix (captured before removal)
@@ -501,10 +512,14 @@ gwt-rm() {
   fi
   git worktree remove "$wtpath" 2>/dev/null || git worktree remove --force "$wtpath" || return 1
   echo "✔ removed worktree: $wtpath"
+  # --close: route the tab close through the sanctioned primitive (resolves the dir to a live
+  # surface by its RECORDED stable uuid, prints the resolution, enforces the close policy).
+  # Runs BEFORE the task row is dropped — that row IS the ledger the primitive reads.
+  [[ -n "$want_close" ]] && ~/.config/cc-stack/cc-dispatch.sh close "${wtabs:-$wtpath}"
   _gwt_tasks_drop_dir "${wtabs:-$wtpath}" && echo "  ↳ removed from task list"
   _gwt_status_drop_dir "${wtabs:-$wtpath}"   # drop the agent-state row for the same canonical dir
   ~/.config/cc-stack/cc-trust.sh --remove "${wtabs:-$wtpath}" >/dev/null 2>&1   # clear the pre-trust entry (only pure-trust-signature ones)
-  if [[ "$2" == "--branch" ]]; then
+  if [[ -n "$want_branch" ]]; then
     local br="${wtbranch:-feat/$name}"   # real branch when readable; default prefix as fallback (dir without HEAD)
     if git branch -D "$br" 2>/dev/null; then echo "✔ deleted branch $br"
     else echo "⚠ could not delete branch $br (already gone / merged elsewhere?)"; fi

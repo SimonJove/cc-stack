@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# cc-dispatch.sh · THE dispatch pipeline — one script, five subcommands.
+# cc-dispatch.sh · THE dispatch pipeline — one script, seven subcommands.
 #   wt-claude <name> <prompt> [--prefix <p>] [--base <b>]   gwt-claude implementation: build/reuse
 #                                                             the worktree, then delegate to surface
 #                                                             [absorbs cc-worktree-claude.sh]
@@ -13,6 +13,12 @@
 #                                                             exit into a running claude tab (both ways)
 #   calibrate <surface-ref> [label]                           re-probe the cc-send input-line patterns
 #                                                             on a tab whose input box is known empty
+#   close     <worktree-dir>                                 THE sanctioned tab close: resolve the dir
+#                                                             to a live surface by its RECORDED stable
+#                                                             uuid, print the resolution, enforce the
+#                                                             close policy, then close (hand-written
+#                                                             cmux close-* is blocked by the
+#                                                             hooks/block-unsafe-close.sh PreToolUse gate)
 #   resume    [--all]                                        gwt-resume engine (roadmap 2): cmux native
 #                                                             restore-session first, then reopen board
 #                                                             rows whose tab is still gone, replaying
@@ -363,23 +369,44 @@ fi
 # Pre-authorize trust for this worktree, skipping claude's "Do you trust this folder?" prompt (more robust than screen-scraping; CC_WT_PRETRUST=0 disables)
 [ "${CC_WT_PRETRUST:-1}" != "0" ] && "$HOME/.config/cc-stack/cc-trust.sh" "$abspath" >/dev/null 2>&1
 
-# Caller (main task) surface / workspace — backchannel + target workspace
+# Caller (main task) surface / workspace — backchannel + target workspace.
+# csuuid: the caller's STABLE surface uuid. This process runs INSIDE the dispatching parent
+# session (hook path and gwt-claude path alike), so $CMUX_SURFACE_ID is that parent's surface —
+# the identity the tab-close gate (hooks/block-unsafe-close.sh) compares against. The short
+# caller_surface ref below stays what it always was: a backchannel address, not an identity.
+# CC_CALLER_SURFACE_UUID overrides it (tests; a caller that knows better).
+csuuid="${CC_CALLER_SURFACE_UUID:-${CMUX_SURFACE_ID:-}}"
+case "$csuuid" in *[!0-9A-Fa-f-]*) csuuid="" ;; esac
 ident="$(cmux identify 2>/dev/null)"
 caller_surface="$(printf '%s' "$ident" | python3 -c 'import json,sys; print((json.load(sys.stdin).get("caller") or {}).get("surface_ref",""))' 2>/dev/null)"
 caller_ws="$(printf '%s' "$ident" | python3 -c 'import json,sys; print((json.load(sys.stdin).get("caller") or {}).get("workspace_ref",""))' 2>/dev/null)"
 
 # Open the new surface (tab): in the caller's workspace, background, no focus steal. Short retry to ride out hiccups.
-ref=""
+# --id-format both makes new-surface print the STABLE surface uuid next to the short ref
+#   ("OK surface:291 (2FBF1942-…) pane:108 (…) workspace:108 (…)"), which is what the board records
+#   as suuid — short refs DRIFT (probed live 2026-08-16: a tab opened as surface:291 reported its
+#   own close as surface:292), so they can never be an identity. Older cmux builds that ignore the
+#   flag simply print the ref; the list-pane-surfaces join below fills the uuid in.
+ref=""; nsout=""
 for _ in 1 2 3 4 5; do
   if [ -n "$caller_ws" ]; then
-    ref="$(cmux new-surface --type terminal --working-directory "$abspath" --focus false --workspace "$caller_ws" 2>/dev/null | grep -oE 'surface:[0-9]+' | head -1)"
+    nsout="$(cmux new-surface --type terminal --working-directory "$abspath" --focus false --workspace "$caller_ws" --id-format both 2>/dev/null)"
   else
-    ref="$(cmux new-surface --type terminal --working-directory "$abspath" --focus false 2>/dev/null | grep -oE 'surface:[0-9]+' | head -1)"
+    nsout="$(cmux new-surface --type terminal --working-directory "$abspath" --focus false --id-format both 2>/dev/null)"
   fi
+  ref="$(printf '%s\n' "$nsout" | grep -oE 'surface:[0-9]+' | head -1)"
   [ -n "$ref" ] && break
   sleep 0.4
 done
 [ -n "$ref" ] || { _fail "cmux new-surface failed to open a tab"; exit 1; }
+
+# The child tab's own STABLE surface uuid (board field suuid; see cc-board.sh). Parsed off the
+# new-surface line by FIELD position (never a sed pattern mixing literal parens with wildcards —
+# see docs/known-issues.md, BSD sed), with a list-pane-surfaces join as the fallback.
+suuid="$(printf '%s\n' "$nsout" | awk '{for(i=1;i<NF;i++) if ($i ~ /^surface:[0-9]+$/) {u=$(i+1); gsub(/[()]/,"",u); if (u ~ /^[0-9A-Fa-f-]+$/ && length(u) >= 30) {print u; exit}}}')"
+[ -n "$suuid" ] || suuid="$(cmux list-pane-surfaces --id-format both 2>/dev/null | sed 's/^\*//' \
+  | awk -v r="$ref" 'NF>=2 && $1==r{print $2; exit}')"
+case "$suuid" in *[!0-9A-Fa-f-]*) suuid="" ;; esac    # never record anything but a plain uuid
 
 # Opened successfully; write the dedup marker now
 [ -n "$marker" ] && : > "$marker" 2>/dev/null || true
@@ -465,10 +492,14 @@ case "$_provider" in
   */*|*..*)             launch="ccteam" ;;     # path-traversal guard → safe default
   *)                    launch="cld $_provider"; prov_rec="$_provider" ;;
 esac
-# launch-args for the board's 8th TSV field — exactly what gwt-resume replays later. uuid omitted
-# when minting failed; model composed LAST (a model id may itself contain colons).
+# launch-args for the board's 8th TSV field — exactly what gwt-resume replays later, plus the two
+# STABLE surface identities the tab-close gate keys on. uuid omitted when minting failed;
+# csuuid = the DISPATCHING PARENT's surface (this process runs inside it), suuid = the child tab's
+# own surface; model stays composed LAST (a model id may itself contain colons).
 largs=""; [ -n "$sid" ] && largs="uuid=$sid"
 largs="${largs:+$largs:}provider=$prov_rec:pm=$pm"
+[ -n "$csuuid" ] && largs="$largs:csuuid=$csuuid"
+[ -n "$suuid" ]  && largs="$largs:suuid=$suuid"
 [ -n "$mdl" ] && largs="$largs:model=$mdl"
 pf=""
 if [ -n "$full" ]; then
@@ -523,7 +554,7 @@ if [ -z "$rsmode" ]; then
     "$(git -C "${CC_CALLER_CWD:-$PWD}" symbolic-ref --short HEAD 2>/dev/null)" "${largs:-}"
 fi
 
-echo "✔ new tab : $ref  cwd=$abspath  $(if [ -n "$rsmode" ]; then echo '(resume launch sent)'; elif [ -n "$prompt" ]; then echo '(initial prompt sent)'; else echo '(idle ccteam)'; fi)"
+echo "✔ new tab : $ref  ${suuid:+uuid=$suuid  }cwd=$abspath  $(if [ -n "$rsmode" ]; then echo '(resume launch sent)'; elif [ -n "$prompt" ]; then echo '(initial prompt sent)'; else echo '(idle ccteam)'; fi)"
 [ -n "$caller_surface" ] && echo "✔ backchannel: the new claude can report back via cc-dispatch.sh send $caller_surface \"<message>\""
 exit 0
 ;;
@@ -569,6 +600,155 @@ else
   echo "✗ cc-send calibration: pattern MISS on $ref (breadcrumb written) — see docs/known-issues.md" >&2
   exit 1
 fi
+;;
+
+# ─────────────────────────────────────────────────────────────────────────────
+# close — THE sanctioned way to close a sub-task tab from automation (the counterpart of the
+#   PreToolUse gate in hooks/block-unsafe-close.sh, which blocks every hand-written cmux close-*).
+#   Takes a DIRECTORY, never a surface ref: the board is the ledger, and the only stable
+#   identities in it are the surface UUIDs recorded at dispatch.
+#     ① resolve dir → live surface: board row suuid first (the only source that covers ccteam
+#        sub-tasks — the cmux agent session store never sees them), then the store's newest
+#        session in that cwd; a recorded SHORT ref is never used as a fallback (short refs drift,
+#        which is precisely how the 2026-08-16 incident closed the parent itself)
+#     ② PRINT the resolution (short ref + stable uuid + cwd) before touching anything
+#     ③ enforce the same policy as the hook: never the caller's own surface, never a non-worktree
+#        checkout, and — for AUTOMATED callers — only a child whose recorded csuuid is this very
+#        session. "Automated" is decided by PROCESS ANCESTRY (a claude binary in the PPID chain),
+#        never by an env var a caller could strip; a human shell is the UI path in shell form, so
+#        there the ownership check reports instead of refusing.
+#     ④ close by the STABLE uuid
+#   No live tab for that dir = nothing to do (rc 0): gwt-rm --close must stay idempotent.
+# Usage: cc-dispatch.sh close <worktree-dir>
+# Related env: CC_TASKS_FILE (board), CC_CMUX_SESSIONS (session store), CC_CALLER_SURFACE_UUID
+#   (override for $CMUX_SURFACE_ID)
+close)
+shift
+cdir="${1:-}"
+[ -n "$cdir" ] && [ $# -le 1 ] || { echo "usage: cc-dispatch.sh close <worktree-dir>" >&2; exit 2; }
+command -v cmux >/dev/null 2>&1 && cmux ping >/dev/null 2>&1 || {
+  echo "✗ can't reach cmux, aborting (nothing closed)" >&2; exit 1; }
+
+ccb_canon(){ CDPATH= cd -- "$1" >/dev/null 2>&1 && pwd -P; }
+_ccuc(){ printf '%s' "${1:-}" | tr 'abcdefghijklmnopqrstuvwxyz' 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'; }
+_cc_automated(){ # rc 0 = an AGENT is driving this call, rc 1 = a human shell is
+  # WHY ANCESTRY AND NOT AN ENV VAR (gate review 2026-08-16): the check gates who may close
+  # someone else's sub-task tab, and any env-based discriminator is strip-able from the very
+  # command line being gated — `env -u CLAUDECODE cc-dispatch.sh close <other-childs-dir>` was
+  # live-verified to demote enforcement to a printed note and really close the tab. The PPID
+  # chain is not writable from the command line. $CLAUDECODE stays a FAST-PATH HINT only: set =>
+  # certainly an agent; unset decides nothing and we walk.
+  case "${CLAUDECODE:-}" in "") ;; *) return 0 ;; esac
+  _p=$$; _d=0
+  while [ "$_d" -lt 12 ]; do
+    _pp="$(ps -o ppid= -p "$_p" 2>/dev/null | tr -d '[:space:]')"
+    case "$_pp" in ''|*[!0-9]*) return 1 ;; esac      # chain broken/unreadable → treat as human
+    [ "$_pp" -le 1 ] && return 1                      # reached init: a login shell, no agent
+    _cm="$(ps -o comm= -p "$_pp" 2>/dev/null)"        # full executable path on darwin
+    case "${_cm##*/}" in claude|claude-*|claude.*) return 0 ;; esac
+    _p="$_pp"; _d=$((_d+1))
+  done
+  return 1
+}
+_ccpick(){ # $1 = launch-args field, $2 = key → value ("" when absent); model is composed LAST
+  _v=""; _pre="$1"
+  case "$1" in *model=*) _pre="${1%%model=*}" ;; esac
+  _oifs="$IFS"; IFS=':'
+  for _seg in $_pre; do case "$_seg" in "$2"=*) _v="${_seg#$2=}" ;; esac; done
+  IFS="$_oifs"; printf '%s' "$_v"
+}
+# The dir may already be GONE (gwt-rm --close removes the worktree first) — canonicalize when we
+# still can, otherwise keep the string as given and compare both forms against the board.
+ccan="$(ccb_canon "$cdir")"; [ -n "$ccan" ] || ccan="$cdir"
+tasks="${CC_TASKS_FILE:-$HOME/.config/cc-stack/worktree-tasks.tsv}"
+cstore="${CC_CMUX_SESSIONS:-$HOME/.cmuxterm/claude-hook-sessions.json}"
+self_uuid="$(_ccuc "${CC_CALLER_SURFACE_UUID:-${CMUX_SURFACE_ID:-}}")"
+
+# ── ① board row (newest for this dir) → recorded identities ──
+brow=""
+if [ -f "$tasks" ]; then
+  brow="$(awk -F'\t' '{print $4 "\t" $8}' "$tasks" 2>/dev/null | while IFS=$'\t' read -r _bd _la; do
+      [ -n "$_bd" ] || continue
+      _bc="$(ccb_canon "$_bd")"; [ -n "$_bc" ] || _bc="$_bd"
+      { [ "$_bc" = "$ccan" ] || [ "$_bd" = "$cdir" ]; } || continue
+      printf '%s\n' "$_la"
+    done | tail -1)"
+fi
+tuuid="$(_ccuc "$(_ccpick "$brow" suuid)")"
+owner="$(_ccuc "$(_ccpick "$brow" csuuid)")"
+case "$tuuid" in *[!0-9A-F-]*) tuuid="" ;; esac
+
+live="$(cmux list-pane-surfaces --id-format both 2>/dev/null | sed 's/^\*//' | awk 'NF>=2{print $1 "\t" toupper($2)}')"
+tref=""
+[ -n "$tuuid" ] && tref="$(printf '%s\n' "$live" | awk -F'\t' -v u="$tuuid" '$2==u{print $1; exit}')"
+if [ -z "$tref" ]; then
+  # fallback: cmux agent session store — newest session whose cwd IS this dir (covers tabs the
+  # board predates, i.e. rows written before suuid existed)
+  suuid_fb="$(python3 - "$cstore" "$ccan" <<'PY' 2>/dev/null
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)
+d = d.get("sessions") if isinstance(d, dict) else None
+if not isinstance(d, dict):
+    sys.exit(0)
+import os
+want = os.path.realpath(sys.argv[2])          # the store may hold the LOGICAL /var form
+best = None
+for v in d.values():
+    if not isinstance(v, dict) or not v.get("cwd"):
+        continue
+    if os.path.realpath(v["cwd"]) != want:
+        continue
+    if best is None or (v.get("updatedAt") or 0) > (best.get("updatedAt") or 0):
+        best = v
+if best and best.get("surfaceId"):
+    sys.stdout.write(best["surfaceId"])
+PY
+)"
+  suuid_fb="$(_ccuc "$suuid_fb")"
+  if [ -n "$suuid_fb" ]; then
+    tref="$(printf '%s\n' "$live" | awk -F'\t' -v u="$suuid_fb" '$2==u{print $1; exit}')"
+    [ -n "$tref" ] && tuuid="$suuid_fb"
+  fi
+fi
+
+# ── ② print the resolution BEFORE acting (never close something you did not name out loud) ──
+echo "── close: $cdir ──"
+if [ -z "$tuuid" ] || [ -z "$tref" ]; then
+  echo "· no live tab resolves to this directory (already closed, or never recorded) — nothing to do"
+  exit 0
+fi
+echo "  resolved : $tref  uuid=$tuuid  cwd=$ccan"
+echo "  recorded : parent=${owner:-<none>}  this-session=${self_uuid:-<no CMUX_SURFACE_ID>}"
+
+# ── ③ policy (same rules as hooks/block-unsafe-close.sh) ──
+case "$ccan" in
+  */.claude/worktrees/*|*/.worktrees/*) ;;
+  *) echo "✗ refusing: $ccan is not a worktree checkout — parent / primary-checkout tabs are closed by the human in the cmux UI" >&2; exit 1 ;;
+esac
+if [ -n "$self_uuid" ] && [ "$tuuid" = "$self_uuid" ]; then
+  echo "✗ refusing: that surface is THIS session — no automated self-close (2026-08-16 incident)" >&2; exit 1
+fi
+if _cc_automated; then
+  # automated caller (decided by process ancestry, not by an env var): ownership is the whole
+  # point of the ledger
+  [ -n "$owner" ] || { echo "✗ refusing: no dispatching parent recorded for this dir — treat it as human-opened" >&2; exit 1; }
+  [ "$owner" = "$self_uuid" ] || {
+    echo "✗ refusing: this tab was dispatched by $owner, not by this session — a sub-task tab is closable by ITS OWN parent only" >&2; exit 1; }
+else
+  [ -n "$owner" ] && [ "$owner" != "$self_uuid" ] && \
+    echo "  (human shell: closing a tab dispatched by $owner — ownership check reported, not enforced)"
+fi
+
+# ── ④ close by the STABLE uuid ──
+if cmux close-surface --surface "$tuuid" >/dev/null 2>&1; then
+  echo "✔ closed $tref (uuid $tuuid)"
+  exit 0
+fi
+echo "✗ cmux close-surface failed for uuid $tuuid" >&2
+exit 1
 ;;
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -708,7 +888,11 @@ _ccres_keys(){ # $1 = file, $2 = field no, $3 = canon dir → prints the RAW val
   done
   return 0
 }
-_ccres_setref(){ # $1 = canon dir, $2 = new ref — rewrite field 3 (surface) on EVERY row of that dir
+_ccres_setref(){ # $1 = canon dir, $2 = new ref, $3 = new surface uuid ("" = leave suuid alone) —
+                 # rewrite field 3 (surface) and refresh the launch-args suuid on EVERY row of that
+                 # dir. Surface UUIDs are minted per surface, so a cmux restart invalidates the
+                 # recorded one; leaving it stale would make the tab-close gate refuse a legitimate
+                 # parent close (fail-closed, but wrong) — the ledger must track the new tab.
   f="$tasks"; [ -f "$f" ] || return 0
   lock="$f.lock"; got=""
   i=0; while [ "$i" -lt 60 ]; do mkdir "$lock" 2>/dev/null && { got=1; break; }; sleep 0.05; i=$((i+1)); done
@@ -717,8 +901,21 @@ _ccres_setref(){ # $1 = canon dir, $2 = new ref — rewrite field 3 (surface) on
   # NB: the match keys are read via getline-in-BEGIN, NOT the usual NR==FNR idiom — with an
   # EMPTY match file that idiom never flips and would rewrite/drop EVERY row (a dir with no
   # row in this file must leave it untouched).
-  awk -v r="$2" -v mf="$match" -F'\t' -v OFS='\t' \
-    'BEGIN{while((getline l < mf) > 0) m[l]=1; close(mf)} m[$4]{$3=r} {print}' "$f" > "$tmp"
+  awk -v r="$2" -v su="${3:-}" -v mf="$match" -F'\t' -v OFS='\t' '
+    function setsuuid(la, u,   i, n, seg, pre, mod, out) {
+      mod = ""; pre = la
+      i = index(la, "model=")                       # model is composed LAST and may hold colons
+      if (i > 0) { mod = substr(la, i); pre = substr(la, 1, i-1); sub(/:$/, "", pre) }
+      out = ""; n = split(pre, seg, ":")
+      for (i = 1; i <= n; i++) {
+        if (seg[i] == "" || seg[i] ~ /^suuid=/) continue
+        out = (out == "" ? seg[i] : out ":" seg[i])
+      }
+      out = (out == "" ? "suuid=" u : out ":suuid=" u)
+      return (mod == "" ? out : out ":" mod)
+    }
+    BEGIN{while((getline l < mf) > 0) m[l]=1; close(mf)}
+    m[$4]{ $3=r; if (su != "") $8 = setsuuid($8, su) } {print}' "$f" > "$tmp"
   mv "$tmp" "$f"; [ -s "$f" ] || rm -f "$f"
   rm -f "$match"
   [ -n "$got" ] && rmdir "$lock" 2>/dev/null
@@ -777,7 +974,9 @@ while IFS=$'\t' read -r c r_dir r_br r_ref r_task r_largs; do
   if [ -n "$live_ref" ]; then
     act="restored"
     [ "$_p" != "" ] && [ "$_p" != "anthropic" ] && act="restored-warn"
-    [ "$live_ref" != "$r_ref" ] && _ccres_setref "$c" "$live_ref"
+    # refresh BOTH the short ref and the recorded surface uuid — a restored tab is a NEW surface
+    live_uuid="$(printf '%s\n' "$live_pairs" | awk -F'\t' -v r="$live_ref" '$2==r{print $1; exit}')"
+    _ccres_setref "$c" "$live_ref" "$live_uuid"
     _ccres_dropstatus "$c"
     plan="${plan}${c}	${r_dir}	${r_br}	${r_task}	${act}	${live_ref}
 "
@@ -842,8 +1041,12 @@ if [ "$n_re" -gt 0 ]; then
     # on the exact path string.
     out="$(CC_WT_LAUNCH_CMD="$r_cmd" "$HOME/.config/cc-stack/cc-dispatch.sh" surface "$r_dir" "")"
     newref="$(printf '%s\n' "$out" | grep -oE 'surface:[0-9]+' | head -1)"
+    # the reopened tab's STABLE uuid (surface prints it; a fresh join covers older output forms)
+    newuuid="$(printf '%s\n' "$out" | awk 'match($0,/uuid=[0-9A-Fa-f-]+/){print substr($0,RSTART+5,RLENGTH-5); exit}')"
+    [ -n "$newuuid" ] || newuuid="$(cmux list-pane-surfaces --id-format both 2>/dev/null | sed 's/^\*//' \
+      | awk -v r="$newref" 'NF>=2 && $1==r{print $2; exit}')"
     if [ -n "$newref" ]; then
-      _ccres_setref "$c" "$newref"
+      _ccres_setref "$c" "$newref" "$newuuid"
       _ccres_dropstatus "$c"
       echo "✔ $r_br → $newref  ($([ "$r_act" = "reopen-idle" ] && echo "idle ccteam — no session recorded" || echo "resumed: $r_cmd"))"
     else

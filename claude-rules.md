@@ -15,6 +15,7 @@ The PostToolUse hook in `~/.config/cc-stack` then opens a new tab in the current
 - If `/.claude/worktrees/` isn't ignored yet, add it to the project root `.gitignore` first (worktree contents must not pollute git status).
 - cmux-only; over remote SSH everything is an automatic no-op.
 - Monitor sub-tasks from any shell (Claude's non-interactive Bash included) by running `bash ~/.config/cc-stack/cc-board.sh` (`--all` for every repo; humans keep using `gwt-status`).
+- **Closing tabs**: a sub-task tab is closed by ITS OWN parent session through `~/.config/cc-stack/cc-dispatch.sh close <worktree-dir>` (or `gwt-rm <name> --close`), which resolves the dir to the surface UUID recorded at dispatch. Parent / primary-checkout tabs are the human's to close in the cmux UI. NEVER hardcode a surface short id or a bare index into `cmux close-surface` / `cmux close-window` — short refs drift as panes open and close, a bare number is an index, and a positional target is silently ignored (cmux then closes YOUR own tab). A PreToolUse hook blocks those forms.
 
 ## Conduct (sub-task session — hook-spawned or gwt-claude)
 

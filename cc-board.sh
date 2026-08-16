@@ -35,8 +35,17 @@ set -u
 #   (parent = the caller's branch at dispatch; the board's PARENT column falls back to it
 #    once the branch's branch.<b>.ccMergeInto git config is gone, e.g. deleted after merge)
 #   launch-args (8th field, roadmap 2 gwt-resume) = compact k=v:... record of the dispatch-time
-#   launch: uuid=<claude session id> provider=<cld name|anthropic> pm=<permission-mode> model=<id>,
-#   empty parts omitted (model is composed LAST so a model id may itself contain colons).
+#   launch, colon-separated, empty parts omitted, written in this order:
+#     uuid=<claude session id>:provider=<cld name|anthropic>:pm=<permission-mode>
+#     :csuuid=<CALLER surface uuid>:suuid=<CHILD tab surface uuid>:model=<id>
+#   model stays LAST (a model id may itself contain colons — every parser stops there).
+#   csuuid/suuid (2026-08-16, tab-close permission model) are cmux SURFACE UUIDs, the only stable
+#   tab identities there are: short refs (surface:283) drift as panes open and close, so the 3rd
+#   field is an address, never an identity. csuuid = the session that dispatched this sub-task
+#   (the only one allowed to close its tab), suuid = the sub-task tab itself. Read by
+#   hooks/block-unsafe-close.sh and `cc-dispatch.sh close`; kept fresh across a cmux restart by
+#   gwt-resume. Rows without them (pre-feature) simply have no recorded owner → the close gate
+#   treats the tab as human-opened and refuses to close it automatically.
 #   POSITION: appended AFTER parent-branch, i.e. the LAST live-board field — every positional
 #   reader keys on fields 1-7 (cc-hooks.sh status matches $4 = dir; the PARENT fallback reads the
 #   7th), and the archive appends merged-at after it (live 8 fields → archive 9). Old 7-field rows
