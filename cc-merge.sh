@@ -74,10 +74,22 @@ cmd_preflight() {     # <repo> <child> [<target>] → prints checks; exit 1 if a
   # target-exists
   if git -C "$repo" show-ref --verify --quiet "refs/heads/$target"; then
     echo "check: target-exists ok"; else echo "check: target-exists FAIL"; rc=1; fi
+  # target-not-self — a branch merged into itself passes every other check, stages nothing, and
+  # returns "skipped: already merged" rc 0, which gwt-merge reads as a landing and archives.
+  if [ "$target" = "$child" ]; then echo "check: target-not-self FAIL"; rc=1
+  else echo "check: target-not-self ok"; fi
   # conflict (git 2.38+ --write-tree exits nonzero on conflict)
   if git -C "$repo" merge-tree --write-tree "$target" "$child" >/dev/null 2>&1; then
     echo "check: conflict ok"; else echo "check: conflict FAIL"; rc=1; fi
   echo "target: $target"
+  # Where the target itself lands, and whether the target is a sub-task line rather than the
+  # campaign branch. NOT a check (a nested tree merges into a sub-task line by design) — it is the
+  # one thing a human cannot see for themselves after a fast-forward makes two branches identical.
+  local tparent tcfg
+  tcfg="$(git -C "$repo" config --get "branch.$target.ccMergeInto" 2>/dev/null)"
+  tparent="$(cmd_get_parent "$repo" "$target")"
+  [ -n "$tparent" ] && echo "target-parent: $tparent"
+  [ -n "$tcfg" ] && echo "note: $target is itself a recorded sub-task line (it merges on into $tcfg) — landing here does NOT advance $tcfg"
   return $rc
 }
 
@@ -117,6 +129,12 @@ cmd_do_merge() {      # <repo> <child> <strategy> [<target>] [--message <text>]
     esac
   done
   [ -n "$target" ] || target="$(cmd_get_parent "$repo" "$child")"
+  # Refused BEFORE any git runs (preflight also checks it, but --force can wave preflight through
+  # and direct callers skip it entirely): merging a branch into itself stages nothing and would
+  # report "skipped: already merged" rc 0 — a no-op dressed up as a landing.
+  if [ "$target" = "$child" ]; then
+    echo "refused: $child -> $target (a branch cannot be its own merge target)" >&2; return 2
+  fi
   local tdir tmp="" tmpparent="" rc=0 skipped="" label="" childdir tip cap mdefault=""
   cap="$(mktemp)"                                        # scratch capture for git output
   tip="$(git -C "$repo" rev-parse "$child" 2>/dev/null)"  # child tip BEFORE anything moves it
@@ -207,10 +225,26 @@ Child-Tip: $tip"
   return $rc
 }
 
-cmd_capture() {       # <repo> <newBranch> <callerCwd>
-  local repo="$1" branch="$2" cwd="$3" parent
-  parent="$(git -C "$cwd" symbolic-ref --short HEAD 2>/dev/null)"
+cmd_capture() {       # <repo> <newBranch> <callerCwd> [<base>]
+  # An EXPLICIT base branch wins over the caller's cwd, because it is the only signal that
+  # survives a fast-forward. Once a sibling line ff-merges into the campaign branch the two tips
+  # are IDENTICAL — same commit, same working tree — so "which branch is this checkout on" can no
+  # longer tell campaign from sibling, and a caller standing one directory off silently records a
+  # SIBLING as the merge target (2026-08-17: a line was one `y` away from being folded into its
+  # sibling while the campaign branch stayed put). The graph cannot distinguish them either
+  # (merge-base is the same commit for both), so intent is the only usable evidence — record it.
+  # A base that does not name a branch (HEAD, a tag, a sha) is not intent: fall back to the cwd.
+  local repo="$1" branch="$2" cwd="$3" base="${4:-}" parent=""
+  if [ -n "$base" ] && git -C "$repo" show-ref --verify --quiet "refs/heads/$base"; then
+    parent="$base"
+  else
+    parent="$(git -C "$cwd" symbolic-ref --short HEAD 2>/dev/null)"
+  fi
   [ -n "$parent" ] || parent="$(_cm_main_branch "$repo")"
+  # Never record a branch as its own merge target: that is the shape a mis-resolved caller cwd
+  # leaves behind (the branch's own worktree), and it merges into itself as a silent no-op. With
+  # nothing recorded, get-parent answers the trunk — wrong perhaps, but never a fake success.
+  [ "$parent" = "$branch" ] && return 0
   cmd_set_parent "$repo" "$branch" "$parent"
 }
 

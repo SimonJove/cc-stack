@@ -217,7 +217,9 @@ gwt-new() {
   local wtpath branch="$prefix/$name"; wtpath="$(_gwt_wt_path "$name")" || return 1
   _gwt_bootstrap_wt "$root" "$wtpath" "$branch" "$base" || return 1
   echo "✔ worktree: $wtpath   branch: $branch"
-  ~/.config/cc-stack/cc-merge.sh capture "$root" "$branch" "$PWD" >/dev/null 2>&1
+  # 4th arg: an explicit base branch IS the merge target (cwd is only the fallback — after a
+  # fast-forward the campaign branch and a sibling are the same commit, see cmd_capture).
+  ~/.config/cc-stack/cc-merge.sh capture "$root" "$branch" "$PWD" "$base" >/dev/null 2>&1
   # When inside cmux, open a workspace (empty shell, focus it) for this worktree; no-op when not in cmux
   ~/.config/cc-stack/cc-dispatch.sh workspace "$wtpath" "$name" true >/dev/null 2>&1
   cd "$wtpath"
@@ -492,12 +494,17 @@ gwt-merge() {
     esac; shift
   done
   [[ -n "$target" ]] || target="$(~/.config/cc-stack/cc-merge.sh get-parent "$root" "$child")"
+  # A branch merged into itself passes every preflight check, stages nothing and comes back
+  # "skipped: already merged" rc 0 — refused here outright, --force included (do-merge refuses too).
+  [[ "$target" == "$child" ]] && { echo "✗ $child's merge target is itself — nothing to merge into. Fix it: cc-merge.sh set-parent \"$root\" $child <parent>"; return 1 }
   # ordering guard: if child itself has not-ready children, warn
   local kids; kids="$(~/.config/cc-stack/cc-merge.sh tree "$root" | awk -F'\t' -v p="$child" '$2==p && !($4=="clean" && $5=="done"){print $1}')"
   [[ -n "$kids" ]] && echo "⚠ $child still has not-ready children: ${kids//$'\n'/, } — consider 'gwt-collect $child' first"
   echo "── preflight: $child → $target ──"
   local pf rc; pf="$(~/.config/cc-stack/cc-merge.sh preflight "$root" "$child" "$target")"; rc=$?
-  echo "$pf" | grep '^check:'
+  # `note:` too, not just the checks: it is the line that says the target is another sub-task line
+  # rather than the campaign branch — invisible in git itself once a fast-forward equalized the tips.
+  echo "$pf" | grep -E '^(check|note):'
   if (( rc != 0 )) && [[ -z "$force" ]]; then
     echo "✗ preflight not clean. Re-run with --force to override, or fix the flagged items."; return 1
   fi
@@ -508,8 +515,11 @@ gwt-merge() {
     local ans; read -r ans
     case "$ans" in n|N|no-ff) strategy=no-ff ;; r|R|rebase) strategy=rebase ;; *) strategy=squash ;; esac
   fi
-  # AUTHORIZATION GATE
-  printf "About to merge \033[1m%s\033[0m --%s into \033[1m%s\033[0m. Proceed? [y/N] " "$child" "$strategy" "$target"
+  # AUTHORIZATION GATE — names where the TARGET goes on, so "into my campaign branch" and "into a
+  # sibling that happens to sit on the same commit" stop looking identical at the y/N.
+  local tpar; tpar="$(echo "$pf" | sed -n 's/^target-parent: //p')"
+  printf "About to merge \033[1m%s\033[0m --%s into \033[1m%s\033[0m%s. Proceed? [y/N] " \
+    "$child" "$strategy" "$target" "${tpar:+ → $tpar}"
   local ok; read -r ok
   [[ "$ok" == y || "$ok" == Y ]] || { echo "aborted."; return 1 }
   # merge message: --message here beats CC_MERGE_MESSAGE beats the conventional default

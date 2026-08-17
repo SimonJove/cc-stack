@@ -307,7 +307,8 @@ capture 分支跟着跑,`CC_CALLER_CWD` 是子任务自己的 cwd,于是把
 `branch.<b>.ccMergeInto` 写成了**分支自己**。后果链全程静默:`gwt-merge` 读到"目标=自己" →
 `do-merge` 返回 `skipped: already merged` **rc 0** → `gwt-merge` 当作成功、把板行归档 ——
 **这条线从板子上消失,却一行代码都没落地**。2026-08-16 实际发生过一次,靠人工核对 campaign
-的 tip 才发现。
+的 tip 才发现。(后果那一半 2026-08-17 已堵:`capture` 不再写自己、preflight 有
+`check: target-not-self`、`do-merge` 提前拒绝 —— 见下文"merge target 被记成兄弟分支"。)
 
 **已知残留(未修)**:目标已 pin 但 mtime > 120s(add 失败 / 目录早已存在)仍是静默跳过、无面包屑;
 面包屑只在 cmux 可达时才可能写(hook 在 `cmux ping` 之后才解析),远程 SSH 下整个 hook 是 no-op、
@@ -352,15 +353,42 @@ capture 分支跟着跑,`CC_CALLER_CWD` 是子任务自己的 cwd,于是把
 退出,**一个函数都不定义**(所以症状是 `gwt-rm: command not found`);
 "`gwt-rm` 在但 `_gwt_wt_path` 不在"是另一种部分加载态。
 
-## gwt-merge 不拒绝"目标 == 自身"(存量,未修)
+## merge target 被记成**兄弟分支**:ff 之后尖端相同,cwd 不再能区分 campaign 和兄弟(2026-08-17 修)
 
-`branch.<b>.ccMergeInto` 若被写成分支自己(见上文 mtime 兜底那条),`gwt-merge` 会照常走完
-preflight 四项全绿、询问确认,然后 `do-merge` 把分支合进自己、返回
-`skipped: already merged` **rc 0**,`gwt-merge` 据此判定成功并**归档板行**。
-一次空操作被完整包装成一次成功的落地。
+**现场**:一条 campaign 下三条并行线。线 A 先 ff 合进 campaign 分支 —— 此后
+`campaign` 与 `feat/A` **是同一个 commit、同一份工作树**。随后派出的线 B 的 merge target 被记成了
+`feat/A`;`gwt-merge B` 一路四项全绿、打印 `merged: feat/B -> feat/A`,而 **campaign 分支原地不动**。
+差一个 `y` 就把一条线折进了兄弟里。人工用 `set-parent` 钉死后两条线才躲开。
 
-`skipped` 返回 0 本身是对的(幂等),问题在于**没有一条 `target == child` 的前置守卫**。
-建议在 `gwt-merge` 的目标解析之后加一行拒绝。
+**根因**:merge target 由 `cc-merge.sh capture` 记录,取的是**发起方 cwd 所在分支**
+(`git -C <cwd> symbolic-ref --short HEAD`)。这个信号在 ff 之后**失去分辨力**:campaign 和刚合进去的
+兄弟指向同一个 commit,`git status`、工作树内容、`rev-parse` 全都一样,站错一个目录看不出来。
+
+**为什么闸门抓不住**:拓扑里也没有这个信息。B 从 campaign 拉出来,ff 后 `merge-base(B, A)` 与
+`merge-base(B, campaign)` 是同一个 commit,`merge-tree` 自然不冲突 —— preflight 的四项检查
+(clean / done / target-exists / conflict)**每一项都该绿**。**能区分二者的只有"派发时的意图"**。
+
+**修法(两层)**:
+1. **根因**:显式 base 就是记录的 merge target。`capture` 增加第 4 个参数
+   `<base>`,base 若命名了一个分支就直接写成 `ccMergeInto`,cwd 只在没有显式 base(或 base 是
+   `HEAD`/tag/sha,不构成意图)时兜底。三条派发路径都接上了:`gwt-claude --base`、`gwt-new` 的
+   base 位参、以及 **hook 路径** —— `cc-hooks.sh` 现在把 `git worktree add <path> <base>` 的第二个
+   位置参数解析出来,经 `CC_WT_BASE` 交给 `cc-dispatch.sh surface`(emit 协议随之变成
+   `path \t mode \t base \t prompt`,prompt 仍在最后)。技能文档一直写着"`--base` 记录 merge
+   target",现在代码才真的对上。
+2. **纵深(可见性)**:preflight 多打两行 —— `target-parent: <目标自己的目标>`,以及目标本身
+   是一条已登记的子任务线时的 `note: ... 落这儿不会推进 <camp>`;`gwt-merge` 的授权行也从
+   `into feat/A` 变成 `into feat/A → camp`。**这不是检查**(嵌套树本来就往子任务线上合),而是把
+   "尖端相同时人眼看不见的那一格"打印出来,让 y/N 之前能分辨。
+
+**顺带补的两条守卫**(同一个洞的另一面,原"gwt-merge 不拒绝目标 == 自身"那条):
+`capture` **不再把分支自己写成自己的 merge target**(不写配置 → `get-parent` 回落 trunk:可能不对,
+但绝不会伪装成一次成功);`preflight` 新增 `check: target-not-self`,`do-merge` 在任何 git 动作之前
+拒绝并返回 rc 2,`gwt-merge` 连 `--force` 也不放行 —— 此前它会四项全绿、把分支合进自己、拿
+`skipped: already merged` **rc 0** 当作落地并**归档板行**,一次空操作被完整包装成一次成功。
+
+**仍未覆盖**:发起方站错目录 **且** 没给显式 base 时,记的仍是 cwd 的分支(ff 之后依旧无从分辨)。
+派发时永远带 `--base`,或派完立刻 `cc-merge.sh set-parent` 钉死。
 
 ## gwt-tree 的 tab 存活标记仍是单 workspace(跨 workspace 问题的第五面,未修)
 

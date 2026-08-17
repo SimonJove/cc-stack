@@ -103,8 +103,15 @@ P="CC_WT_PROMPT='doX' "
 eq "A parsed path (relative)"  "$(run "$(pay "$R1" "${P}git worktree add wtC -b feat/C")" | cut -f1)" "$C"
 eq "A -b before path"          "$(run "$(pay "$R1" "${P}git worktree add -b feat/C wtC")" | cut -f1)" "$C"
 eq "A absolute path"           "$(run "$(pay "$R1" "${P}git worktree add $R1/wtC -b feat/C")" | cut -f1)" "$C"
-eq "CC_WT_PROMPT extraction"   "$(run "$(pay "$R1" "CC_WT_PROMPT='doX' git worktree add wtC")" | cut -f3)" "doX"
+# emit protocol: path \t mode \t base \t prompt — the prompt stays LAST (free text, may hold TABs)
+eq "CC_WT_PROMPT extraction"   "$(run "$(pay "$R1" "CC_WT_PROMPT='doX' git worktree add wtC")" | cut -f4)" "doX"
 eq "CC_WT_PERMISSION_MODE extraction" "$(run "$(pay "$R1" "CC_WT_PERMISSION_MODE=plan CC_WT_PROMPT='doX' git worktree add wtC")" | cut -f2)" "plan"
+# base = the 2nd bare positional of `worktree add`. It becomes the recorded merge target (§9), the
+# only thing that still separates the campaign branch from a sibling after a ff equalizes their tips.
+eq "base parsed (after path)"  "$(run "$(pay "$R1" "${P}git worktree add wtC -b feat/C feat/base")" | cut -f3)" "feat/base"
+eq "base parsed (-b first)"    "$(run "$(pay "$R1" "${P}git worktree add -b feat/C wtC feat/base")" | cut -f3)" "feat/base"
+eq "no base → empty field"     "$(run "$(pay "$R1" "${P}git worktree add wtC -b feat/C")" | cut -f3)" ""
+eq "no base → prompt still f4" "$(run "$(pay "$R1" "${P}git worktree add wtC -b feat/C")" | cut -f4)" "doX"
 # anti-double-tab skip must test only the REAL command: a brief that merely MENTIONS a script name
 # (inside the single-quoted CC_WT_PROMPT payload) still dispatches; a command that actually invokes
 # cc-dispatch.sh wt-claude opens its own tab, so the hook must not open a second one
@@ -535,6 +542,7 @@ mkdir -p "$H27/.config/cc-stack"
 cat > "$H27/.config/cc-stack/cc-dispatch.sh" <<'D27'
 #!/usr/bin/env bash
 printf 'DISPATCH|%s|%s\n' "${CC_WT_PERMISSION_MODE:-}" "$*" >> "$CC_STUB_LOG"
+printf 'BASE|%s\n' "${CC_WT_BASE:-}" >> "$CC_STUB_LOG"      # merge target the hook parsed off the add line
 exit 0
 D27
 printf '#!/usr/bin/env bash\nexit 0\n' > "$B27/cmux"            # ping (and anything else) succeeds
@@ -558,6 +566,13 @@ eq "prompt+target → one dispatch"   "$(dis27)" "1"
 eq "dispatch carries dir + prompt"  "$(grep -cF "|surface $W27 do 27" "$LG27")" "1"
 eq "permission mode exported"       "$(awk -F'|' 'NR==1{print $2}' "$LG27")" "plan"
 eq "a dispatch leaves no crumb"     "$([ -e "$FL27" ] && echo some || echo none)" "none"
+eq "no base on the add line → empty CC_WT_BASE" "$(grep -c '^BASE|$' "$LG27")" "1"
+# (a2) an explicit base travels to cc-dispatch.sh as CC_WT_BASE — that is what makes it the
+# recorded merge target instead of whatever branch the dispatching session happened to stand on
+res27
+h27 "$(pay "$R27" "CC_WT_PROMPT='do 27' git worktree add wt27 -b feat/w27 camp27")" "dispatch with base"
+eq "base reaches the dispatch"      "$(grep -c '^BASE|camp27$' "$LG27")" "1"
+eq "base does not disturb the prompt" "$(grep -cF "|surface $W27 do 27" "$LG27")" "1"
 # (b) no intent → no tab, and NO breadcrumb: skipping is the normal case here, not a failure
 res27
 h27 "$(pay "$R27" 'git worktree add wt27 -b feat/w27')" "no CC_WT_PROMPT"
@@ -813,6 +828,55 @@ git -C "$MR/wtAx" checkout -q --detach 2>/dev/null
 git -C "$MR" worktree add -q wtAy -b feat/Ay feat/A >/dev/null
 "$CC/cc-merge.sh" capture "$MR" feat/Ay "$MR/wtAx"
 eq "capture detached→trunk" "$(git -C "$MR" config branch.feat/Ay.ccMergeInto)" "main"
+# an EXPLICIT base branch beats the caller cwd (4th arg). This is the 2026-08-17 defect: once a
+# sibling fast-forwards into the campaign branch the two tips are identical, so a caller standing
+# in the sibling records the SIBLING as the merge target and the campaign branch never advances.
+git -C "$MR" worktree add -q wtAz -b feat/Az main >/dev/null
+"$CC/cc-merge.sh" capture "$MR" feat/Az "$MR/wtA" main
+eq "explicit base beats cwd"    "$(git -C "$MR" config branch.feat/Az.ccMergeInto)" "main"
+# a base that is not a branch (HEAD, a tag, a sha) is not intent → the cwd stays the fallback
+git -C "$MR" worktree add -q wtAw -b feat/Aw main >/dev/null
+"$CC/cc-merge.sh" capture "$MR" feat/Aw "$MR/wtA" HEAD
+eq "non-branch base → cwd"      "$(git -C "$MR" config branch.feat/Aw.ccMergeInto)" "feat/A"
+# and a self-target (caller cwd IS the new branch's own worktree — the shape a mis-resolved
+# dispatch leaves) is never recorded: no config beats a config that merges a branch into itself
+git -C "$MR" worktree add -q wtAv -b feat/Av main >/dev/null
+"$CC/cc-merge.sh" capture "$MR" feat/Av "$MR/wtAv"
+eq "self-target not recorded"   "$(git -C "$MR" config branch.feat/Av.ccMergeInto 2>/dev/null)" ""
+eq "…so get-parent says trunk"  "$("$CC/cc-merge.sh" get-parent "$MR" feat/Av)" "main"
+
+echo "== 9b. merge target sanity: self-target refused, target chain visible =="
+# The other half of the 2026-08-17 defect: a wrong target passed every check and printed "merged:".
+# The graph cannot tell a sibling from the campaign branch after a ff (same commit, same
+# merge-base), so the gate cannot decide it — but it must SAY where the target itself goes.
+MS=$(mktemp -d); ( cd "$MS"; git init -q; git config user.email t@t; git config user.name t
+  git commit -q --allow-empty -m i; git branch -M main
+  git branch camp; git worktree add -q wtS1 -b feat/S1 camp >/dev/null
+  git -C wtS1 commit -q --allow-empty -m s1
+  git worktree add -q wtS2 -b feat/S2 camp >/dev/null
+  git -C wtS2 commit -q --allow-empty -m s2 )
+"$CC/cc-merge.sh" set-parent "$MS" feat/S1 camp
+"$CC/cc-merge.sh" set-parent "$MS" feat/S2 camp
+"$CC/cc-merge.sh" done "$MS" feat/S1 true; "$CC/cc-merge.sh" done "$MS" feat/S2 true
+# S1 fast-forwards into camp → camp and feat/S1 are now the SAME commit
+"$CC/cc-merge.sh" do-merge "$MS" feat/S1 rebase camp >/dev/null 2>&1
+eq "ff left camp == feat/S1" "$(git -C "$MS" rev-parse camp)" "$(git -C "$MS" rev-parse feat/S1)"
+PFS="$("$CC/cc-merge.sh" preflight "$MS" feat/S2 feat/S1)"; pfs_rc=$?
+eq "sibling target still passes checks" "$(echo "$PFS" | grep -c '^check: .* ok')" "5"
+eq "…but names where the target goes"   "$(echo "$PFS" | grep -c '^target-parent: camp')" "1"
+eq "…and flags it as a sub-task line"   "$(echo "$PFS" | grep -c '^note: feat/S1 is itself a recorded sub-task line')" "1"
+eq "sibling preflight rc unchanged"     "$pfs_rc" "0"
+# target == child: FAIL in preflight, refused by do-merge (no "skipped: already merged" rc 0)
+PFSELF="$("$CC/cc-merge.sh" preflight "$MS" feat/S2 feat/S2)"; eq "self-target preflight rc1" "$?" "1"
+eq "self-target check FAILs" "$(echo "$PFSELF" | awk '/^check: target-not-self/{print $3}')" "FAIL"
+DMSELF="$("$CC/cc-merge.sh" do-merge "$MS" feat/S2 squash feat/S2 2>&1)"; eq "self-merge rc2" "$?" "2"
+eq "self-merge refused loudly" "$(echo "$DMSELF" | grep -c '^refused:')" "1"
+eq "self-merge never says merged/skipped" "$(echo "$DMSELF" | grep -cE '^(merged|skipped):')" "0"
+# and the trunk target (the normal case) carries no note
+PFT="$("$CC/cc-merge.sh" preflight "$MS" feat/S2 camp)"
+eq "trunk-ward target has no note" "$(echo "$PFT" | grep -c '^note:')" "0"
+eq "trunk-ward target-parent is the trunk" "$(echo "$PFT" | grep -c '^target-parent: main')" "1"
+rm -rf "$MS"
 
 echo "== 12. cc-merge trunk =="
 eq "trunk is main" "$("$CC/cc-merge.sh" trunk "$MR")" "main"

@@ -614,7 +614,10 @@ else
 fi
 echo "✔ worktree : $wtpath"
 echo "✔ branch   : $branch"
-"$HOME/.config/cc-stack/cc-merge.sh" capture "$root" "$branch" "$PWD" >/dev/null 2>&1
+# 4th arg = the explicit base: when --base names a branch it IS the recorded merge target (the
+# skill's documented contract). The default "HEAD" names no branch, so the caller's cwd stays the
+# fallback — see cmd_capture for why cwd alone cannot be trusted after a fast-forward.
+"$HOME/.config/cc-stack/cc-merge.sh" capture "$root" "$branch" "$PWD" "$base" >/dev/null 2>&1
 
 # ── Delegate: open tab + copy .env + start ccteam (plan) + pre-trust + send prompt + register ──
 exec "$HOME/.config/cc-stack/cc-dispatch.sh" surface "$wtpath" "$prompt"
@@ -690,14 +693,16 @@ if [ -n "$root" ] && [ "$root" != "$abspath" ]; then
   "$HOME/.config/cc-stack/cc-worktree-shared.sh" seed "$root" "$abspath" 2>/dev/null
 fi
 
-# Record the merge target (parent = caller's branch) — HOOK PATH ONLY.
+# Record the merge target — HOOK PATH ONLY (parent = the base named on the `git worktree add`
+# line when it names a branch, else the caller's branch; cc-hooks.sh parses the base out of the
+# command and hands it over as CC_WT_BASE).
 # On the gwt-claude path CC_CALLER_CWD is unset and wt-claude above already
 # captured with the real caller cwd; skipping here avoids overwriting it.
 if [ -n "${CC_CALLER_CWD:-}" ] && command -v git >/dev/null 2>&1; then
   _root="$(_cc_gitroot "$abspath")" || _root=""     # same caveat as above: resolve against $abspath
   _br="$(git -C "$abspath" symbolic-ref --short HEAD 2>/dev/null)"
   [ -n "$_root" ] && [ -n "$_br" ] && \
-    "$HOME/.config/cc-stack/cc-merge.sh" capture "$_root" "$_br" "$CC_CALLER_CWD" >/dev/null 2>&1
+    "$HOME/.config/cc-stack/cc-merge.sh" capture "$_root" "$_br" "$CC_CALLER_CWD" "${CC_WT_BASE:-}" >/dev/null 2>&1
 fi
 
 # Pre-authorize trust for this worktree, skipping claude's "Do you trust this folder?" prompt (more robust than screen-scraping; CC_WT_PRETRUST=0 disables)

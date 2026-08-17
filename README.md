@@ -181,9 +181,13 @@ that cmux itself brought back runs with the default provider env; close that tab
 ## Hierarchical worktrees (A ⊃ {A1,A2,A3})
 
 When a sub-task claude spins off its own worktrees, cc-stack records each
-child's merge target automatically (`git config branch.<b>.ccMergeInto`,
-captured from the caller's branch at creation). You then drive the merges
-back up the tree — each stops at a confirmation gate.
+child's merge target automatically (`git config branch.<b>.ccMergeInto`).
+An explicitly named base branch — `gwt-claude … --base <b>`, `gwt-new`'s base
+argument, the base on a hook-path `git worktree add <path> <base>` — IS that
+target; only without one does the caller's own branch stand in. Name it:
+once a sibling fast-forwards into the campaign branch the two are the same
+commit, and the caller's branch can no longer tell them apart. You then drive
+the merges back up the tree — each stops at a confirmation gate.
 
     gwt-tree                 # see the whole tree: A ⊃ {A1,A2,A3}, ready state, tabs
     gwt-done                 # (run inside A1) mark A1 ready when it's finished

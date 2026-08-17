@@ -30,6 +30,9 @@ case "${1:-}" in
 #     excluded — avoids two claudes colliding in the same directory.
 #   - Parses the target path + `-C <repo>` from the command (pinpoints the just-created worktree, cross-repo aware);
 #     what it cannot pin (e.g. a $VAR shell variable that wasn't expanded) it never guesses at.
+#   - Also parses the base (`git worktree add <path> <commit-ish>`) and passes it on as CC_WT_BASE:
+#     when it names a branch it becomes the recorded merge target, which is the only thing that
+#     still separates the campaign branch from a sibling once a fast-forward makes their tips equal.
 #   - Initial-prompt convention: prefix the command with CC_WT_PROMPT='task description', e.g.:
 #       CC_WT_PROMPT='refactor auth token refresh' git worktree add .claude/worktrees/oauth -b feat/oauth
 #   - Sub-tasks start in `auto` mode. To pin ONE dispatch to the plan-first gate, add the prefix
@@ -133,9 +136,15 @@ else:
     if os.path.isdir(r):
         repo = r
 
-# (2) TARGET, path half: first "bare positional" after add (skip value-taking options and command separators)
+# (2) TARGET, path half: the bare positionals after add (skip value-taking options and command
+# separators). `git worktree add <path> [<commit-ish>]`: the FIRST is the worktree path, the
+# SECOND (when present) is the base — and an explicitly named base branch is the stated merge
+# target of the dispatcher, the one signal that still separates the campaign branch from a sibling
+# after a fast-forward makes their tips identical. Passed on as CC_WT_BASE; cc-merge.sh capture
+# is what decides whether it names a branch.
 opts_with_val = {"-b", "-B", "--reason"}
 path_arg = None
+base_arg = ""
 j = wi + 2
 while j < len(toks):
     t = toks[j]
@@ -145,8 +154,12 @@ while j < len(toks):
         j += 2; continue
     if t.startswith("-"):
         j += 1; continue
-    path_arg = t
-    break
+    if path_arg is None:
+        path_arg = t
+    else:
+        base_arg = t
+        break
+    j += 1
 cand = None
 if path_arg:
     if os.path.isabs(path_arg):
@@ -192,8 +205,9 @@ if chosen is None:
 if time.time() - os.stat(chosen).st_mtime > 120:
     sys.exit(0)
 
-# mode goes in the middle: the prompt is free text and may itself contain tabs, so it must stay last
-sys.stdout.write(chosen + "\t" + mode + "\t" + prompt)
+# mode and base go in the middle: the prompt is free text and may itself contain tabs, so it must
+# stay last (both middle fields are single shell tokens and can hold neither a tab nor a newline)
+sys.stdout.write(chosen + "\t" + mode + "\t" + base_arg + "\t" + prompt)
 PY
 )"
 diag=""
@@ -202,14 +216,22 @@ if [ "$diagf" != /dev/null ]; then
   rm -f "$diagf" 2>/dev/null || true
 fi
 
-# Split path / permission-mode / prompt (python always writes two TABs; prompt is everything after the second)
+# Split path / permission-mode / base / prompt (python always writes three TABs; the prompt is
+# everything after the third). Fewer TABs = an older emitter: degrade field by field rather than
+# absorbing a whole prompt into $mode.
 newpath="${line%%$'\t'*}"
 rest="${line#*$'\t'}"
 [ "$rest" = "$line" ] && rest=""                    # no TAB at all → nothing but the path
+mode=""; wtbase=""; prompt=""
 if [ "$rest" = "${rest#*$'\t'}" ]; then
-  mode=""; prompt="$rest"                           # only one TAB → treat the remainder as the prompt
+  prompt="$rest"                                    # only one TAB → the remainder is the prompt
 else
-  mode="${rest%%$'\t'*}"; prompt="${rest#*$'\t'}"
+  mode="${rest%%$'\t'*}"; rest="${rest#*$'\t'}"
+  if [ "$rest" = "${rest#*$'\t'}" ]; then
+    prompt="$rest"                                  # two TABs (legacy) → no base field
+  else
+    wtbase="${rest%%$'\t'*}"; prompt="${rest#*$'\t'}"
+  fi
 fi
 
 # No dispatch. Two reasons, only one of them worth recording:
@@ -238,6 +260,7 @@ fi
 # (Shared-corpus seeding [CC_WT_SHARE] happens inside cc-dispatch.sh surface — the single point
 #  both this hook path and gwt-claude go through.)
 CC_CALLER_CWD="$(printf '%s' "$input" | python3 -c 'import json,sys;d=json.load(sys.stdin);print(d.get("cwd",""))' 2>/dev/null || true)" \
+CC_WT_BASE="$wtbase" \
   "$HOME/.config/cc-stack/cc-dispatch.sh" surface "$newpath" "$prompt" >/dev/null 2>&1
 
 exit 0
