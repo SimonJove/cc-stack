@@ -19,6 +19,12 @@
 # mis-blocked parent sessions whose shell was still parked inside a worktree while the
 # command itself cd'd out to commit in the primary checkout. Unparseable/exotic commands
 # fall back to the session-cwd check (never more permissive than v1).
+#
+# v2.1 — parsing hardening (test.sh §23). Three holes let the walk name a directory the command
+# never contained: pathname expansion against the hook's own cwd, a leading quote that was never
+# stripped, and an uninitialised `top` inherited from the caller's environment. Two of the three
+# were fail-OPEN. The invariant they all restore: when the command text cannot be resolved, the
+# session cwd decides — that is the conservative answer, never a silent allow.
 
 input=$(cat)
 
@@ -36,13 +42,29 @@ printf '%s' "$cmd" | grep -qE 'git([[:space:]]+-[Cc][[:space:]]+[^[:space:]]+|[[
 # LAST one before the commit subcommand wins. Best-effort only — unresolvable candidates
 # fall through to the session cwd.
 target=""
+top=""                                    # the fallback below READS this — never inherit it from the env
 case "$cmd" in
   *--git-dir=*) ;;                        # exotic form: keep the session-cwd check
   *)
+    # `set -f` is load-bearing. The split below is an unquoted expansion, so without it the shell
+    # also does PATHNAME expansion against the HOOK's cwd: whatever files happen to sit there get
+    # spliced into the token stream and can forge a `cd`/`-C` the command never contained (and the
+    # mirror case — a glob the real shell keeps quoted gets expanded here). The verdict must depend
+    # on the command text alone, never on a directory listing.
+    case "$-" in *f*) had_f=1 ;; *) had_f="" ;; esac
+    set -f
     want=0
     for tok in $cmd; do
       if [ "$want" != 0 ]; then
-        target="${tok#\"}"; target="${target%\"}"; target="${target%\'}"; target="${target%\'}"
+        # Strip ONE matching quote pair. A token carrying an UNBALANCED quote is a fragment (the
+        # word split cut `cd '/a b'` in half) — it names no directory we can trust, so blank it
+        # and let the session cwd decide. Stripping only the tail used to leave a leading quote
+        # in place, which silently disabled `cd '<dir>'` in both directions.
+        case "$tok" in
+          \"*\"|\'*\') target="${tok#?}"; target="${target%?}" ;;
+          *\"*|*\'*)   target="" ;;
+          *)           target="$tok" ;;
+        esac
         want=0
       fi
       case "$tok" in
@@ -50,6 +72,7 @@ case "$cmd" in
         commit) break ;;
       esac
     done
+    [ -n "$had_f" ] || set +f
     ;;
 esac
 

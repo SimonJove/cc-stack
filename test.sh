@@ -11,6 +11,83 @@ ok(){ echo "  ✔ $1"; pass=$((pass+1)); }
 no(){ echo "  ✗ $1  expected[$3] got[$2]"; fail=$((fail+1)); }
 eq(){ [ "$2" = "$3" ] && ok "$1" || no "$1" "$2" "$3"; }
 
+# ── Live-state isolation ──────────────────────────────────────────────────────────────────────
+# The suite must never write the human's real ledgers or trust store. "Add an override at every
+# call site" has now failed twice (leaked cmux workspaces, then §19b's `gwt-rm wtguard --branch`
+# rewriting the live TSVs), so isolation is two layers instead of a habit:
+#   1. SANDBOX — the four ledger vars and the trust-store override are exported here, so a call
+#      site that forgets an override lands in a temp dir instead of the live file. Sections that
+#      used to `unset` these now call cc_sandbox_ledgers to return to the sandbox, never to the
+#      live default path.
+#   2. TAIL ASSERTION (§24) — the live files are snapshotted now and re-checked at the end.
+#      What it can assert is constrained by churn: a board read prunes-on-read (rewriting
+#      worktree-tasks.tsv) and any live agent's status hook rewrites worktree-status.tsv, so
+#      neither sha nor mtime is attributable to this suite. The oracles that ARE attributable:
+#      nothing pre-existing may DISAPPEAR (rows, files, trust entries), no fixture path may
+#      appear, no lock may be left behind, and the overrides must still be sandboxed at the end.
+CC_TEST_SANDBOX="$(mktemp -d)"
+cc_sandbox_ledgers(){
+  export CC_TASKS_FILE="$CC_TEST_SANDBOX/worktree-tasks.tsv"
+  export CC_STATUS_FILE="$CC_TEST_SANDBOX/worktree-status.tsv"
+  export CC_ARCHIVE_FILE="$CC_TEST_SANDBOX/worktree-tasks-archive.tsv"
+  export CC_TABS_FILE="$CC_TEST_SANDBOX/opened-tabs.tsv"
+  export CC_TRUST_CFG_OVERRIDE="$CC_TEST_SANDBOX/claude.json"
+  rm -f "$CC_TASKS_FILE" "$CC_STATUS_FILE" "$CC_ARCHIVE_FILE" "$CC_TABS_FILE"
+  printf '{"projects":{}}\n' > "$CC_TRUST_CFG_OVERRIDE"
+}
+cc_sandbox_ledgers
+CC_LIVE_DIR="$HOME/.config/cc-stack"
+CC_LIVE_LEDGERS="worktree-tasks.tsv worktree-status.tsv worktree-tasks-archive.tsv opened-tabs.tsv"
+_mt(){ stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null; }
+# Which live ledgers exist, and their sha/mtime. Existence is an ASSERTION (a rewrite that filters
+# a ledger empty deletes it); sha/mtime are printed as diagnostics only — see the churn note above.
+_cc_live_files(){
+  local n f
+  for n in $CC_LIVE_LEDGERS; do
+    f="$CC_LIVE_DIR/$n"
+    if [ -e "$f" ]; then echo "$n present sha=$(shasum -a 256 < "$f" | awk '{print $1}') mtime=$(_mt "$f")"
+    else echo "$n ABSENT"; fi
+  done
+}
+_cc_live_exist(){ _cc_live_files | awk '{print $1, $2}'; }
+# Key sets — the attributable oracle. Outside traffic only ADDS or UPDATES rows; a leak DROPS them.
+# tasks/tabs rows can also be checked for fixture paths: every temp dir this suite makes is rooted
+# in the OS temp tree, so the count of live rows pointing there must not grow.
+_cc_live_keys(){
+  cut -f4 "$CC_LIVE_DIR/worktree-tasks.tsv"   2>/dev/null | sed 's/^/task /'
+  cut -f1 "$CC_LIVE_DIR/worktree-status.tsv"  2>/dev/null | sed 's/^/stat /'
+  cut -f1 "$CC_LIVE_DIR/opened-tabs.tsv"      2>/dev/null | sed 's/^/tab  /'
+  cut -f4 "$CC_LIVE_DIR/worktree-tasks-archive.tsv" 2>/dev/null | sed 's/^/arch /'
+}
+_cc_live_keys_sorted(){ _cc_live_keys | LC_ALL=C sort -u; }
+_cc_live_tmp_rows(){ _cc_live_keys | grep -cE ' (/private)?(/var/folders/|/tmp/)' || true; }
+# Layer 1's own integrity: count overrides that no longer point into the sandbox. Defined as a
+# function on purpose — bash 3.2 mis-parses a `case` pattern's `)` inside a `$( )` substitution.
+_cc_overrides_escaped(){
+  local v n=0
+  for v in "$CC_TASKS_FILE" "$CC_STATUS_FILE" "$CC_ARCHIVE_FILE" "$CC_TABS_FILE" "$CC_TRUST_CFG_OVERRIDE"; do
+    case "$v" in "$CC_TEST_SANDBOX"/*) ;; *) n=$((n+1)) ;; esac
+  done
+  echo "$n"
+}
+# ~/.claude.json likewise churns (a running claude rewrites lastCost etc.), but cc-trust.sh only
+# ever adds or deletes a projects KEY — that is the part worth watching.
+_cc_trust_keys(){ python3 -c 'import json,sys
+try: d=json.load(open(sys.argv[1]))
+except Exception: sys.exit(0)
+for k in (d.get("projects") or {}): print(k)' "$HOME/.claude.json" | LC_ALL=C sort -u; }
+# install / hook-registration tests run under a fake HOME; the live registrations must not move.
+_cc_settings_hooks(){ python3 -c 'import json,sys,hashlib
+try: d=json.load(open(sys.argv[1]))
+except Exception: print("ABSENT"); sys.exit(0)
+print(hashlib.sha256(json.dumps(d.get("hooks"),sort_keys=True).encode()).hexdigest())' "$HOME/.claude/settings.json"; }
+CC_LIVE_FILES_BEFORE="$(_cc_live_files)"
+CC_LIVE_EXIST_BEFORE="$(_cc_live_exist)"
+CC_LIVE_HOOKS_BEFORE="$(_cc_settings_hooks)"
+CC_LIVE_TMPROWS_BEFORE="$(_cc_live_tmp_rows)"
+_cc_live_keys_sorted > "$CC_TEST_SANDBOX/live-keys.before"
+_cc_trust_keys       > "$CC_TEST_SANDBOX/trust-keys.before"
+
 echo "== 1. hook parser =="
 # extract the worktree python (the ONLY <<'PY' heredoc in cc-hooks.sh)
 awk "/<<'PY'/{f=1;next} /^PY\$/{f=0} f" "$CC/cc-hooks.sh" > /tmp/cctest-ep.py
@@ -61,7 +138,7 @@ printf '2026-01-01 00:00:00\tfeat/OLD\tsurface:7\t%s\tsurface:1\told row task\tm
 CC_STATUS_FILE=/dev/null bash "$CC/cc-board.sh" --all >/dev/null 2>&1
 eq "old 7-field row kept"     "$(awk -F'\t' -v d="$CRT2" '$4==d{print NF}' "$CC_TASKS_FILE" | sort -u)" "7"
 eq "old row still renders"    "$(CC_TASKS_FILE="$CC_TASKS_FILE" CC_STATUS_FILE=/dev/null bash "$CC/cc-board.sh" --all 2>/dev/null | grep -c 'old row task')" "1"
-rm -rf "$RT" "$RT2"; rm -f "$CC_TASKS_FILE"; unset CC_TASKS_FILE
+rm -rf "$RT" "$RT2"; rm -f "$CC_TASKS_FILE"; cc_sandbox_ledgers   # back to the sandbox, NOT the live default
 
 echo "== 2b. cc-hooks.sh status: agent-state sidecar =="
 # Board rows must hold pwd -P-canonical dirs — exactly what cc-board.sh log writes in production
@@ -144,7 +221,7 @@ eq "strip removes stale cc-notify"    "$(sn Stop "cc-notify")" "0"
 eq "strip keeps new registration"     "$(sn Stop "cc-hooks.sh status")" "1"
 HOME="$IH" bash "$CC/install.sh" --yes --dir "$IH/cc" >/dev/null 2>&1
 eq "re-install after strip is stable" "$(sn PostToolUse "cc-hooks.sh worktree")+$(sn Stop "cc-hooks.sh status")" "1+1"
-rm -rf "$IH" "$RR" "$SB" "$NB" "$RD" "$RD2"; rm -f "$CC_TASKS_FILE" "$CC_STATUS_FILE"; unset CC_TASKS_FILE CC_STATUS_FILE
+rm -rf "$IH" "$RR" "$SB" "$NB" "$RD" "$RD2"; rm -f "$CC_TASKS_FILE" "$CC_STATUS_FILE"; cc_sandbox_ledgers
 
 echo ""
 echo "== 2c. cc-board: the board from ANY shell (bash-direct, no zsh) =="
@@ -248,7 +325,7 @@ eq "wrapper STATUS join"             "$(echo "$SW" | grep -c 'working(23m)')" "1
 eq "wrapper applies repo filter"     "$(echo "$SW" | grep -c 'wrap other')" "0"
 SWA="$( ( cd "$BRD" && zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; gwt-status --all") 2>/dev/null )"
 eq "wrapper forwards --all"          "$(echo "$SWA" | grep -c 'wrap other')" "1"
-rm -rf "$BRD" "$OTH" "$NORD"; rm -f "$CC_TASKS_FILE" "$CC_STATUS_FILE" "$CC_ARCHIVE_FILE" "$TF" "$SF" "$AF" "$DF"; unset CC_TASKS_FILE CC_STATUS_FILE CC_ARCHIVE_FILE
+rm -rf "$BRD" "$OTH" "$NORD"; rm -f "$CC_TASKS_FILE" "$CC_STATUS_FILE" "$CC_ARCHIVE_FILE" "$TF" "$SF" "$AF" "$DF"; cc_sandbox_ledgers
 
 echo "== 3. cc-trust add/remove (isolated json) =="
 TJ=$(mktemp); echo '{"projects":{}}' > "$TJ"
@@ -1621,6 +1698,55 @@ eq "clause 4 teaches the absolute path" "$(printf '%s' "$W4" | grep -c '~/.confi
 eq "clause 4 warns the bare name is zsh-only" "$(printf '%s' "$W4" | grep -c 'zsh function')" "1"
 rm -rf "$GD"
 echo ""
+echo "== 23. commit gate: command-text parsing (block-worktree-commit.sh v2.1) =="
+# The gate reads the commit's effective directory out of the command TEXT. Three parsing holes let
+# the walk name a directory the command never contained. The hook's hard rule is that an
+# unresolvable command falls back to the SESSION CWD — the conservative verdict — so every case
+# below also asserts that the fallback is what happens, never a silent allow.
+# (2 = blocked, 0 = allowed.)
+G23="$(cn "$(mktemp -d)")"; H23=$(mktemp -d)            # H23: fake HOME, the gate never reads the live one
+( cd "$G23"; git init -q; git config user.email t@t; git config user.name t; git commit -q --allow-empty -m i
+  mkdir .claude; git worktree add -q .claude/worktrees/w23 -b feat/w23 >/dev/null )
+W23="$(cn "$G23/.claude/worktrees/w23")"
+pay23(){ python3 -c "import json,sys;print(json.dumps({'tool_name':'Bash','tool_input':{'command':sys.argv[1]}}))" "$1"; }
+# g23 <session-cwd> <command> [extra env assignment…] → exit code
+g23(){ local d="$1" c="$2"; shift 2
+  printf '%s' "$(pay23 "$c")" | ( cd "$d" && env HOME="$H23" ${1+"$@"} bash "$CC/hooks/block-worktree-commit.sh" >/dev/null 2>&1; echo $? ); }
+
+# (a) pathname expansion. `for tok in $cmd` was an unquoted expansion with no `set -f`, so the
+# shell globbed the command text against the HOOK's cwd. Constructed exactly as it bites: the
+# worktree holds a file named `cd` and a symlink `p` → the primary checkout, so the `*` in an
+# unrelated part of the command expands to `cd p` and the walker reads a `cd` that was never
+# there. Fail-OPEN — a real worktree commit walks straight through the gate.
+: > "$W23/cd"; ln -s "$G23" "$W23/p"
+eq "cwd files cannot forge a cd target"   "$(g23 "$W23" 'git add * && git commit -m x')" "2"
+rm -f "$W23/cd" "$W23/p"
+eq "same verdict once they are gone"      "$(g23 "$W23" 'git add * && git commit -m x')" "2"
+
+# (b) quote stripping. Only TRAILING quotes were stripped (single twice, double once); a LEADING
+# single quote survived, so `cd '<dir>'` never resolved to a directory. Both directions were wrong:
+# it mis-blocked the parent committing in the primary checkout (b1) and it let a quoted `-C
+# <worktree>` out of a parent shell escape the gate entirely (b3).
+eq "cd '<primary>' resolves"              "$(g23 "$W23" "cd '$G23' && git commit -m x")" "0"
+eq "cd \"<primary>\" still resolves"      "$(g23 "$W23" "cd \"$G23\" && git commit -m x")" "0"
+eq "-C '<worktree>' is blocked"           "$(g23 "$G23" "git -C '$W23' commit -m x")" "2"
+eq "unbalanced quote → session cwd"       "$(g23 "$W23" "cd '$G23 x' && git commit -m y")" "2"
+eq "bare path still resolves"             "$(g23 "$W23" "cd $G23 && git commit -m x")" "0"
+
+# (c) `top` was read by `[ -z "$top" ]` without ever being assigned. The hook has no `set -u` and
+# `top` is a plain variable, so an inherited `top` from the caller's environment replaced the
+# session-cwd fallback outright — fail-OPEN again.
+eq "inherited \$top cannot replace the fallback" "$(g23 "$W23" 'git commit -m x' top="$G23")" "2"
+
+# the hard rule, restated: none of the above may become a silent allow, and the sentinel stays the
+# only way through
+eq "unparseable command still blocks"     "$(g23 "$W23" 'git commit -m "see docs/*.md"')" "2"
+touch "$W23/.commit-authorized"
+eq "sentinel is still the only way out"   "$(g23 "$W23" 'git commit -m x')" "0"
+eq "sentinel consumed"                    "$([ -f "$W23/.commit-authorized" ] && echo yes || echo no)" "no"
+rm -rf "$G23" "$H23"
+
+echo ""
 echo "== 19b. fail-closed path guards (partial-shell incident 2026-08-16) =="
 # Real incident: a partially-loaded shell had gwt-rm but not _gwt_dir → wtpath="/<name>" (fs ROOT)
 # fed to `git worktree remove`. Every _gwt_dir-built path must now fail closed via _gwt_wt_path.
@@ -1641,7 +1767,14 @@ gout="$(zsh -c '
 eq "gwt-new partial-shell exit!=0" "$([ "$grc2" -ne 0 ] && echo y || echo n)" "y"
 eq "gwt-new partial-shell creates nothing" "$(git -C "$GT2" branch --list 'feat/newguard' | wc -l | tr -d ' ')" "0"
 eq "_gwt_wt_path healthy echoes dir/name" "$(zsh -c 'source "'"$CC"'/worktree.zsh" >/dev/null 2>&1; cd "'"$GT2"'"; _gwt_wt_path foo' 2>/dev/null)" "$GT2/.claude/worktrees/foo"
-zsh -c 'source "'"$CC"'/worktree.zsh" >/dev/null 2>&1; cd "'"$GT2"'"; gwt-rm wtguard --branch' >/dev/null 2>&1
+# This one runs gwt-rm for real, i.e. through _gwt_tasks_drop_dir / _gwt_status_drop_dir /
+# cc-trust.sh --remove. Unisolated it rewrote the human's live TSVs on every suite run (proved by
+# their mtime moving) and reached into the live ~/.claude.json. The sandbox at the top of this
+# file already covers it; the explicit prefix keeps the call site self-documenting, matching the
+# other gwt-rm tests (§2b, §12).
+env CC_TASKS_FILE="$CC_TEST_SANDBOX/19b-tasks.tsv" CC_STATUS_FILE="$CC_TEST_SANDBOX/19b-status.tsv" \
+  CC_TRUST_CFG_OVERRIDE="$CC_TEST_SANDBOX/19b-claude.json" \
+  zsh -c 'source "'"$CC"'/worktree.zsh" >/dev/null 2>&1; cd "'"$GT2"'"; gwt-rm wtguard --branch' >/dev/null 2>&1
 eq "gwt-rm healthy path still works" "$(git -C "$GT2" worktree list --porcelain | grep -c wtguard)" "0"
 rm -rf "$GT2"
 
@@ -1669,6 +1802,39 @@ grep -q "opened-tabs.tsv" "$CC/README.md" && grep -q "CC_TABS_FILE" "$CC/README.
   && ok "opened-tabs ledger documented" || no "opened-tabs ledger documented" missing present
 grep -qxF "opened-tabs.tsv" "$CC/.gitignore" \
   && ok "opened-tabs.tsv gitignored" || no "opened-tabs.tsv gitignored" missing present
+
+echo ""
+echo "== 24. live-state isolation (the suite must not write the human's real files) =="
+# The recurrence guard for a defect that has now landed three times: leaked cmux workspaces
+# (2026-08-16), then §19b rewriting the live TSVs, then whatever comes next. Snapshot taken at the
+# top of this file; anything that reached a live path shows up here instead of in the human's data.
+# a filtering rewrite that empties a ledger DELETES it — the loudest outcome of a missing override
+eq "no live ledger vanished" "$(_cc_live_exist)" "$CC_LIVE_EXIST_BEFORE"
+# nothing that was on a live ledger may be gone: outside traffic only adds/updates rows, a leaked
+# _gwt_*_drop_dir / _gwt_archive_branch drops them
+_cc_live_keys_sorted > "$CC_TEST_SANDBOX/live-keys.after"
+_cc_trust_keys       > "$CC_TEST_SANDBOX/trust-keys.after"
+eq "no live ledger row dropped" \
+  "$(comm -23 "$CC_TEST_SANDBOX/live-keys.before" "$CC_TEST_SANDBOX/live-keys.after" | wc -l | tr -d ' ')" "0"
+eq "no live trust entry dropped" \
+  "$(comm -23 "$CC_TEST_SANDBOX/trust-keys.before" "$CC_TEST_SANDBOX/trust-keys.after" | wc -l | tr -d ' ')" "0"
+# and no fixture of this suite may have been registered on a live ledger
+eq "no fixture path reached a live ledger" "$(_cc_live_tmp_rows)" "$CC_LIVE_TMPROWS_BEFORE"
+eq "live hook registrations unchanged"     "$(_cc_settings_hooks)" "$CC_LIVE_HOOKS_BEFORE"
+# an interrupted rewrite leaves its mkdir lock behind; every later real write then stalls ~3s
+eq "no stale lock on a live ledger" \
+  "$(ls -d "$CC_LIVE_DIR"/worktree-tasks.tsv.lock "$CC_LIVE_DIR"/worktree-status.tsv.lock \
+       "$CC_LIVE_DIR"/worktree-tasks-archive.tsv.lock "$CC_LIVE_DIR"/opened-tabs.tsv.lock 2>/dev/null | wc -l | tr -d ' ')" "0"
+# layer 1's own integrity: a section that unsets an override instead of re-pointing it silently
+# hands the NEXT section the live default path — that is precisely how §19b leaked
+eq "ledger overrides still sandboxed" "$(_cc_overrides_escaped)" "0"
+# sha/mtime are diagnostics, not assertions: a board read prunes-on-read and any live agent's
+# status hook rewrites these files, so a change here is not attributable to this suite
+if [ "$(_cc_live_files)" != "$CC_LIVE_FILES_BEFORE" ]; then
+  echo "  · note: a live ledger changed during the run (outside traffic is expected here):"
+  diff <(printf '%s\n' "$CC_LIVE_FILES_BEFORE") <(printf '%s\n' "$(_cc_live_files)") | sed 's/^/      /'
+fi
+rm -rf "$CC_TEST_SANDBOX"
 
 echo ""
 echo "result: $pass passed, $fail failed"
