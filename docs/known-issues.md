@@ -9,7 +9,11 @@
 **严重度:** P1(真实功能性 bug;但用默认路径 `~/.config/cc-stack` 安装的用户不会触发)
 
 **现象:**
-`install.sh` 支持 `--dir <path>` / `CC_STACK_DIR` 装到任意目录(README 明确宣传:`curl ... | bash -s -- --dir ~/somewhere/cc-stack`)。安装时 `.zshrc` 写入的是正确路径(`$CCT/worktree.zsh`),所以 source 能成功。**但被 source 的脚本内部全部硬编码 `~/.config/cc-stack`**,且没有一个脚本用 `BASH_SOURCE`/`ZSH_SOURCE` 自解析目录 → 运行时找不到脚本,`gwt-*` 命令全面断裂。
+`install.sh` 支持 `--dir <path>` / `CC_STACK_DIR` 装到任意目录(README 明确宣传:`curl ... | bash -s -- --dir ~/somewhere/cc-stack`)。`.zshrc` 里 **source 得到**(2026-08-16 起真的能:见下方"已修的相邻面"),**但被 source 的脚本内部全部硬编码 `~/.config/cc-stack`**,且没有一个脚本用 `BASH_SOURCE`/`ZSH_SOURCE` 自解析目录 → 运行时找不到自己,`gwt-*` 命令全面断裂。**本条剩下的就只有"脚本内部硬编码"这一面。**
+
+**已修的相邻面(2026-08-16,feat/install-docs)** —— 原文把这两条并进了本条,现在分开记:
+- **步骤 3 的幂等判据认错人**:旧判据 `grep -qF "cc-stack/worktree.zsh"` 只要 `.zshrc` 里**任何一行**含该子串就跳过,于是从 `~/.config/cc-stack` 改装到 `~/other/cc-stack` 时命中旧行 → **新位置永远不会被 source**。现在判据只认本次目标(两种拼法),旧行保留但**响亮列出并说明本次目标胜出**。
+- **`--dir` / `--repo` 不带值会挂死**:`shift 2` 在 `$# < 2` 时返回 1 且不移位,而脚本只有 `set -u` 没有 `set -e` → `while [ $# -gt 0 ]` 死循环(实测 rc=124)。现在缺值 exit 2 并点名 flag。
 
 **根因:**
 脚本不从自身位置或 `CC_STACK_DIR` 推导 cc-stack 根目录,而是写死 `$HOME/.config/cc-stack`(或 `~/.config/cc-stack`)。
@@ -36,7 +40,10 @@
 # 在 /tmp/ccstack-test 起一个 claude,gwt-* 应全部工作、不依赖 ~/.config/cc-stack
 ```
 
-**关联:** `install.sh` 的 `--dir`/`CC_STACK_DIR` 处理(约行 13、34)、README 的 install 文档(约行 40-65)。
+**关联:** `install.sh` 的 `--dir`/`CC_STACK_DIR` 处理(约行 13、41)、README 的 install 文档(约行 40-65)。
+
+**当前硬编码计数(2026-08-16 本轮修复后重新统计,供下一条线用)**:`worktree.zsh` 27 · `cc-dispatch.sh` 18 · `cc-board.sh` 7 · `gwt-done` 4 · `cc-hooks.sh` 3 · `aliases.zsh` 3。
+注意 `worktree.zsh` 已有 `_gwt_src_dir` 自解析并用于 `cc-board.sh` / `cc-dispatch.sh` / `gwt-done` 三个入口,`gwt-done` 与 `cc-board.sh` 也已用 `$(dirname "$0")` 自解析——**方案 A 的机制已经存在,缺的只是推广到其余调用点**(`cc-merge.sh` / `cc-trust.sh` / `cc-worktree-shared.sh` 的调用仍写死)。
 
 ## hook 防双开过滤的非规范引号角落(cc-hooks.sh worktree)
 
@@ -86,27 +93,89 @@
 
 **规则**:在本仓库(darwin + bash 3.2)里,**解析含括号的行一律不用 sed 模式混排字面括号与通配**——用 bash 参数展开(`${v#*prefix}` / `${v%% (suffix*}`)或 awk。先例:test.sh 8c 的 `kept` 提取(注释里有指向本条)。
 
-## 测试泄漏真实 cmux workspace(2026-08-16 修)+ 删除动词备忘
+## 测试污染真实状态(同一类问题已三次;2026-08-16 上机制修)+ 删除动词备忘
 
-**现象**:`test.sh` 第 12 节的 `gwt-adopt` 走真 cmux——`gwt-adopt <branch>` 会给被收编的 worktree 开一个 cmux **workspace**(worktree.zsh → `cc-dispatch.sh workspace`),测试没做 PATH shim,**每跑一次套件就在用户界面上留一个 `feature-orphan-y` 空 workspace**(2026-08-16 一次清出 5 个:workspace:147-151)。已修:该节的 `gwt-adopt` 调用全部经一个 no-op 假 cmux(`azsh`),套件跑完 workspace/surface 计数不变(已实测 7/7、8/8)。
+**这条原名「测试泄漏真实 cmux workspace」,现按第三次复发后的教训一般化。**
 
-**规矩**:测试(和实弹探测)开的任何 surface / workspace,报告前必须自己关掉,并在报告里列出清单。
+**规矩(升级后)**:测试**不许留下任何真实副作用**——不只是 surface / workspace,还包括四个 TSV
+(`worktree-tasks` / `worktree-status` / `worktree-tasks-archive` / `opened-tabs`)、`~/.claude.json`、
+`~/.claude/settings.json`。
+
+**机制(不再靠"逐处加 override")**:`test.sh` 顶部统一 export 一组 sandbox 路径(四个 ledger +
+`CC_TRUST_CFG_OVERRIDE`);**裸 `unset` 是这类泄漏的根源**,凡是要"归还"的地方一律调 `cc_sandbox_ledgers`
+回落到 sandbox,而不是回落到 live 默认路径;末尾一节做 7 条**可归因**的收尾断言
+(账本不许消失 / 已有行一条不许少 / trust 条目不许少 / fixture 路径不许出现在真实账本 /
+settings.json 的 hooks 注册不许变 / 不许留 `.lock` / 五个 override 收尾时仍在 sandbox)。
+
+**取证教训(反直觉,值得记住)**:**sha 不足以证明没被污染。**
+`_gwt_tasks_rewrite` 做的是 read→`mv` 全量重写,恰好没有行匹配时**字节不变、只有 mtime 变**。
+第一次抓到泄漏靠的是 **mtime**,不是 sha。反过来,mtime/sha 也**不能当硬断言**:
+`cc-board.sh` 每次读板都 prune-on-read 重写 tasks.tsv,任何活着的 agent 的 status hook 都会写
+status.tsv——拿它们当断言会假阳性,而假阳性的门卫最后都会被删掉。所以收尾断言用的是上面那 7 条
+可归因判据,sha/mtime 只降级成诊断输出。
+
+**跨线交互的实例(2026-08-16,gate 时抓到)**:一条并行线在自己的小节结尾写了裸
+`unset CC_TASKS_FILE …`,rebase 后与另一条线新建的 sandbox 层相遇——
+`_cc_overrides_escaped` 在 `set -u` 下遍历已 unset 的变量,函数直接死掉、命令替换吐空,断言
+`expected[0] got[]`。断言变红只是可见的一半;不可见的一半是该节之后所有小节都回落到了真实默认路径。
+
+**第一次复发的原始记录(cmux workspace)**:`test.sh` 第 12 节的 `gwt-adopt` 走真 cmux——`gwt-adopt <branch>` 会给被收编的 worktree 开一个 cmux **workspace**(worktree.zsh → `cc-dispatch.sh workspace`),测试没做 PATH shim,**每跑一次套件就在用户界面上留一个 `feature-orphan-y` 空 workspace**(2026-08-16 一次清出 5 个:workspace:147-151)。已修:该节的 `gwt-adopt` 调用全部经一个 no-op 假 cmux(`azsh`),套件跑完 workspace/surface 计数不变(已实测 7/7、8/8)。
+
+**第二次复发(2026-08-16 gate 时抓到)**:`test.sh` 第 19b 节的 `gwt-rm wtguard --branch` 没带
+`CC_TASKS_FILE` / `CC_STATUS_FILE` override,直接对真实账本做 read→`mv` 重写,并对真实
+`~/.claude.json` 调 `cc-trust.sh --remove`;另有三处小节用裸 `unset` 归还变量,等于把后续小节交回真实默认路径。
+
+## 删除动词备忘
 
 **删除动词(实测定界,2026-08-16)**:
 - **关不掉最后一个 surface**:`cmux close-surface` 关 workspace 里仅剩的那个 surface 会报 `invalid_state: Cannot close the last surface`——所以"把 surface 关光,空 workspace 自己消失"这条路**不存在**;
 - workspace 必须显式删:`cmux workspace close --workspace <ref|uuid>`(旧名 `cmux close-workspace` 仍可用,但会打一行 alias 提示,`CMUX_QUIET=1` 可静音);
 - **UUID 目标跨 workspace 需要上下文**:`cmux close-surface --surface <UUID>` 只在目标位于调用者**当前 workspace** 时直接命中;目标在别的 workspace 里会报 `Error: Surface not found: <UUID>`,要补 `--workspace <ref>`。对 `cc-dispatch.sh close` 的影响:子任务 tab 是在派发方 workspace 里开的,常态命中;若有人把 tab 拖到别的 workspace,关闭会**响亮失败**(`✗ cmux close-surface failed for uuid …`),不会误关别的东西——留作已知残留,未加自动补 `--workspace` 的重试。
 
-## cc-board 读循环对空 caller 字段的 TAB 塌缩(存量,未修)
+## ~~cc-board 读循环对空 caller 字段的 TAB 塌缩(存量,未修)~~ 已修(2026-08-16,feat/wtz-board)
 
-**现象**:任务 TSV 第 5 字段(caller surface)为空时,bash/zsh 的 `read` 连续 TAB 塌缩导致后续字段左移一位——render 显示错列、prune 可能误删。live 数据 0 行受影响(实际派发都会写 caller)。
-**根因**:`read a b c` 语义对空字段不保位;写侧未做防塌缩(test.sh 的字段数断言因此恒非空)。
-**处置**:后续 sweep——写侧对空 caller 写占位符(如 `-`)或读侧换 `IFS=$'\t' read -r` 数组式解析(注意 bash 3.2 无 `read -a` 于 zsh 差异)。关联:8 字段 launch-args 落地时已确认新字段写侧有 tab 消毒,不会加重本条。
+**严重度修正:这条曾被记成"显示错列 / live 数据 0 行受影响",两条都是错的。它是 P0 落盘损坏。**
+
+**现象**:任务 TSV 任一中间字段为空时,`IFS=$'\t' read` 的连续 TAB 塌缩使后续字段左移一位。
+致命的一步在 **`cc-board.sh` 的 prune-on-read**:它读 7 个变量再 `printf` 7 个字段,
+于是把读错的结果**写回文件**——一次读错固化成永久损坏。同型写点还有 `worktree.zsh` 的
+`_gwt_tasks_rewrite` / `_gwt_archive_branch` / `gwt-prune` 去重循环。
+
+实测(2026-08-16,8 字段行跑一次 `cc-board.sh --all`):
+
+| 空字段 | 结果 |
+|---|---|
+| 第 7 字段 parent | 8 字段永久变 7 字段,`launch-args` 整串挪进 **PARENT 列** |
+| 第 5 字段 caller | caller/task/parent 全部左移,**第 8 字段直接消失** |
+
+**为什么"live 0 行"是错的**:(a) 第 8 字段 launch-args 落地后写侧几乎恒非空;
+(b) 第 7 字段 parent 在 detached HEAD 下恒空(`cc-dispatch.sh` 取 `symbolic-ref --short HEAD` 返回空)。
+
+**后果链**:第 8 字段错位 → `gwt-resume` 取不到 `uuid=` 把行降级成 idle tab;
+`cc-dispatch.sh close` 取不到 `csuuid`/`suuid` → fail-closed 拒绝关 tab。
+**下面「文本门卫退役」条里"三个 tab 只能人工去 UI 关"的现场,除了"先跑 gwt-rm 再 close",本条是另一个可能成因。**
+
+**处置**:走**读侧 awk** ——所有字段访问改 `awk -F'\t'`,所有 rewrite 改成"按行号选行、原样 re-emit 整行",
+不再逐字段 re-printf,因此 7/8/9 字段行逐字节 round-trip、**无存量行迁移问题**(没有选 `-` 占位的写侧方案)。
+awk→shell 的交接用 **US (0x1f)** 而非 TAB:TAB 是 IFS whitespace,`read` 必塌缩;US 不是,空字段能原样读回。
+顺带补了两处数据安全:archive / gwt-prune 的 awk 或管道失败时不再把半成品 `mv` 覆盖任务表(原来会)。
+
+**仍未修的同类残留**:`cc-dispatch.sh` resume 段用 awk 抽 5 字段之后,又用 `IFS=$'\t' read` 读回去
+——`$2`/`$3` 为空时同样错位,把 `r_task`/`r_largs` 挪位。dir 排第一所以不会错仓库,影响面是
+resume 误读 uuid;两个字段写侧都有 `?` 兜底,概率低。`cc-hooks.sh` 已全程 awk,无此问题。
 
 ## ~~block-worktree-commit.sh 未入库(运行态孤儿文件)~~ 已收编(2026-08-16,feat/safe-close-impl)
 
 原风险:`~/.claude/hooks/block-worktree-commit.sh`(v2,命令有效目录判定)是 commit 门卫的唯一实现,不在仓库——机器迁移即丢、无测试覆盖。
 **处置**:原样收编为 `hooks/block-worktree-commit.sh`(v2 语义未改:命令有效目录 `cd X`/`-C X` 优先,解析失败回退会话 cwd;哨兵一次一 commit),install.sh 注册到 PreToolUse,并把旧的 `~/.claude/hooks/…` 注册当陈旧项剥离(按 `.claude/hooks/` 路径子串匹配,不会误伤新注册)。**残留清理靠人**:重跑 install.sh 后 `~/.claude/hooks/block-worktree-commit.sh` 文件本身还在(已不再被注册),可手工删。(当初与它一起注册的 `hooks/block-unsafe-close.sh` 已于 2026-08-16 退役,见下文"关 tab 事故"条。)
+
+> **后续(2026-08-16 晚,feat/commit-gate-git):这个 PreToolUse 实现已整体退役。**
+> 门卫改为 `hooks/git-pre-commit.sh` —— **git 自己的 pre-commit**,按仓库挂一次到 `.git/hooks/`
+> (`cc-dispatch.sh commit-gate mount|unmount`;`surface`/`workspace` 开 worktree tab 时自动挂,
+> install.sh 步骤 4b 给安装目录挂)。install.sh 的 PreToolUse **不再注册任何东西**,旧注册按
+> **裸文件名** `block-worktree-commit.sh` 剥离(同时扫掉 `~/.claude/hooks/` 与仓库路径两种写法),
+> 安装目录里的旧文件由 install.sh 删除。**仍需人手删的只剩 `~/.claude/hooks/block-worktree-commit.sh` 这一个文件。**
+> 理由见下文「文本门卫退役」条末尾的"commit 门卫为什么结论不同"。
 
 ## 关 tab 事故(2026-08-16 02:19):父会话用漂移的短号自杀
 
@@ -159,3 +228,55 @@
 - **整 window / 整 workspace 的关闭**:同样是人的操作,只靠规则约束。
 
 - **"自动化 vs 人"不用环境变量判定,用进程祖先(2026-08-16 验收轮)**:`cc-dispatch.sh close` 的所有权强制原先看 `$CLAUDECODE`——验收方实弹验证 `env -u CLAUDECODE cc-dispatch.sh close <别人的子任务目录>` 会把强制降级成"只打印"并**真的关掉了那个 tab**。环境变量是被审查的那条命令行自己就能改的,不能当判据。现改为**沿 PPID 链上溯**(`ps -o ppid=`/`-o comm=`,深度上限 12):链上出现 claude 可执行文件 = 自动化调用方,强制所有权;走到 init/登录 shell 都没有 = 人,只打印不强制。`$CLAUDECODE` 只保留为快路径提示(**置位 ⇒ 一定是自动化;未置位不作任何结论**)。测试用 PATH shim 里的假 `ps` 驱动两条链,不给产品代码开 env 后门。
+
+### commit 门卫为什么结论不同(2026-08-16 晚,feat/commit-gate-git)
+
+同一天,同族的**最后一个**文本解析器——commit 门卫 `block-worktree-commit.sh`——也退役了。
+但**结论和关 tab 不一样,这个区别必须写清楚,否则后人会把"退役解析器"读成"放弃机械约束"**:
+
+- **关 tab 没有可靠的执行点**。cmux 不给我们任何"真的要关一个 tab 了"的钩子,唯一能插手的地方
+  就是"猜某条命令文本是不是关闭动作"。所以那里的结论是:**不要拦截层**,改成账本 + 合法出口 + 规则。
+- **commit 有一个天然的执行点:git 自己**。所以门卫没有消失,只是从"猜命令文本"搬到了
+  "**git 真的要提交的那一刻**"——`hooks/git-pre-commit.sh`,零文本解析,cwd 由 git 设成正在提交的
+  那个工作树,无论命令是 `cd X && git commit`、`git -C "$VAR" commit`、shell 函数还是脚本文件。
+
+**当天该解析器的实战战绩(两个方向都中,这是迁移的直接证据)**:
+
+| 方向 | 现场 |
+|---|---|
+| 误拦 ×2 | ① 子任务写一个 heredoc 文件,正文**引用**了 `git … commit` 的写法 → 被拦;② 父会话一条探针命令,所有 `git commit` 都在 `/tmp` 临时仓库里,walker 把 `&&` 当成 `cd` 的目标 → 落回 session cwd → 被拦。**两次都是在阻止一次写文件,不是阻止一次 commit。** |
+| **误放 ×1** | 父会话用 `git -C "$W" commit` 提交子任务成果——hook 看到的是字面三个字符 `$W`(hook 不做变量展开)→ 不是目录 → 落回 session cwd = 主 checkout → **豁免放行,哨兵从头到尾没被读过**。 |
+
+迁移前给旧解析器打的三个补丁(`set -f`、成对引号剥离、`top` 显式初始化)里,
+**有两个原本是 fail-open**——即真的放行了 worktree 里的 commit。加固是净收紧,
+但修不掉误拦:弱点在那条 trigger grep(对散文和真命令一视同仁),不在 walker。
+
+**为什么是 `.git/hooks/` 而不是 `core.hooksPath`(实测定界,git 2.55.0/darwin)**:
+`core.hooksPath` 会**静默替换下游项目的整套钩子**——一个靠自己的 `commit-msg` 强制
+Conventional Commits 的仓库会无声失去它(本仓库 `docs/issues/cc-stack-issues.md` 记录的下游仓库正是这种)。
+`.git/hooks/` 则**天然被该仓库的所有 linked worktree 共享**,所以挂载是**每仓库一次**,不是每 worktree 一次。
+已存在的 `pre-commit` 存为 `pre-commit.cc-stack-orig`,门卫放行后 `exec` 它,项目自己的钩子照跑;
+目标仓库如果已经在用 `core.hooksPath`,**响亮拒绝挂载**,不半吊子服务。
+
+**有意接受的残留**:`git commit --no-verify` 完全绕过(实测:静默提交成功)。这是**故意**的——
+退役的 PreToolUse 版本同样能绕(shell 函数、脚本文件、变量指路,父会话当天就无意绕过去一次),
+是同一档。**这道门是防手滑、防 skill 自作主张,不是安全边界,不要当成安全边界来卖。**
+
+**已知的行为收紧(未处理,留待决定)**:`cc-merge.sh do-merge` 的 squash 提交发生在
+"目标分支所在的那个工作树"里。目标在主 checkout(campaign 的常规情形)不受影响;
+但**嵌套子任务**(A1 并回 A,而 A 被 checkout 在受管 worktree 里)那次 merge 提交会被门卫拦下。
+降级是干净的(报 `commit-rejected`、保留已暂存的 merge、原样打出门卫那句 `touch`),
+父会话 touch 一下哨兵再跑一次即可;摩擦点在 `gwt-collect`——一次收多个孩子要一个哨兵一次。
+旧的文本门卫在这里从不触发(命令文本里没有 `git commit`),所以这是相对旧行为的**收紧**。
+
+## install.sh 从 linked worktree 安装会把 `.git` 指针文件复制进安装目录(2026-08-16 修)
+
+**现象**:安装时的 `find` 只排除了 `./.git/*`,但 **linked worktree 的 `.git` 是一个文件**(内含
+`gitdir:` 指针),不是目录,所以它被复制进了安装目录——**安装目录从此在 git 眼里是源仓库的一个工作树**。
+
+**为什么要紧**:影响远不止某一个功能。任何"按目录解析仓库"的逻辑(`gwt-*` 全家、
+commit 门卫的挂载、`_cc_gitroot`)从安装目录出发都会**静默指向源仓库**。
+它就是 feat/commit-gate-git 期间"install 步骤 4b 真的往主仓库 `.git/hooks/` 写了一个 pre-commit"的机制。
+
+**处置**:`find` 加 `! -name '.git'`;挂载侧另加一道守卫——目标目录解析出的 git dir 若不把它
+列为该仓库的 worktree(散落/被复制的 `.git` 指针),**拒绝挂载**。
