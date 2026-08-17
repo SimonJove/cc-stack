@@ -292,7 +292,18 @@ _cctabs_prune(){ # $1 = live map (optional; probed when omitted) — drop rows w
   _tgot=""; _cctabs_lock "$_tf" && _tgot=1
   _ttmp="$_tf.tmp.$$"
   printf '%s\n' "$_tlm" | awk -F'\t' 'NF>=2{print toupper($2)}' > "$_ttmp.live" 2>/dev/null
-  if awk -F'\t' 'NR==FNR{l[$1]=1; next} $1!="" && ($1 in l)' "$_ttmp.live" "$_tf" > "$_ttmp" 2>/dev/null; then
+  # NB: the live keys are read via getline-in-BEGIN, NOT the usual NR==FNR idiom — same reason
+  # _ccres_setref/_ccres_dropstatus do (see the note there). With an EMPTY key file NR==FNR never
+  # flips (on the first line of the SECOND file NR is still == FNR), so awk would swallow the whole
+  # ledger as keys, print nothing, and the mv + `[ -s ]` below would DELETE opened-tabs.tsv —
+  # losing every helper tab's recorded owner, after which `close` fail-closes on all of them and
+  # the human has to go close tabs in the UI. An empty key set is "no evidence": prune NOTHING,
+  # matching the guard above. (A failed mv needs no rollback: rename is atomic, so the ledger keeps
+  # its old content and the tmp is swept on the next line.)
+  if awk -F'\t' -v mf="$_ttmp.live" '
+        BEGIN{ n=0; while ((getline l < mf) > 0) if (l != "") { k[l]=1; n++ } close(mf) }
+        n==0{ print; next }
+        $1!="" && ($1 in k)' "$_tf" > "$_ttmp" 2>/dev/null; then
     mv "$_ttmp" "$_tf" 2>/dev/null
   fi
   rm -f "$_ttmp" "$_ttmp.live" 2>/dev/null
@@ -309,6 +320,33 @@ _cctabs_by_dir(){ # $1 = canonical dir, $2 = dir as given → "suuid<TAB>owner" 
   _tf="$(_cctabs_file)"; [ -f "$_tf" ] || return 0
   awk -F'\t' -v a="${1:-}" -v b="${2:-}" \
     '($3==a || $3==b) && $1!=""{u=$1; o=$2} END{if(u!="") print u "\t" ((o=="-")?"":o)}' "$_tf" 2>/dev/null
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _cc_gitroot — a DIRECTORY → the main repo root that contains it, always ABSOLUTE. rc 1 (and no
+# output) when the directory is gone or is not inside a repo.
+# WHY this is not the obvious one-liner (live-probed 2026-08-16, git 2.55.0/darwin):
+#   git -C <linked worktree> rev-parse --git-common-dir  →  /abs/path/to/main/.git
+#   git -C <MAIN checkout>   rev-parse --git-common-dir  →  .git            ← RELATIVE
+# and a relative answer resolves against the CALLER's pwd, never against the target. So
+# `cd "$(git -C "$d" rev-parse --git-common-dir)/.."` silently computes the CALLER's repo root
+# whenever $d is a main checkout — which on the `surface` path means copying the CALLER repo's
+# .env / .claude/settings.local.json and seeding its shared corpus into someone else's checkout,
+# plus recording the merge target in the wrong repo. Production only ever hands `surface` a linked
+# worktree (hook / wt-claude / resume alike), but `cc-dispatch.sh surface <any-dir>` is a public
+# subcommand, so the main-checkout case is reachable — a cross-repo file leak.
+# The fix: run BOTH cds inside the target, so a relative `.git` resolves against it and an absolute
+# one is unaffected. (git 2.31+ could say `--path-format=absolute` instead; doing it with cd keeps
+# this stack's git-version floor where the rest of it already is.)
+_cc_gitroot(){ # $1 = a directory
+  [ -n "${1:-}" ] || return 1
+  _ccgr="$( (CDPATH= cd -- "$1" 2>/dev/null || exit 1
+             _ccg="$(git rev-parse --git-common-dir 2>/dev/null)" || exit 1
+             [ -n "$_ccg" ] || exit 1          # an empty answer must never become `cd /..` → /
+             CDPATH= cd -- "$_ccg/.." 2>/dev/null || exit 1
+             pwd -P) 2>/dev/null )"
+  [ -n "$_ccgr" ] || return 1
+  printf '%s' "$_ccgr"
 }
 
 case "${1:-}" in
@@ -416,7 +454,10 @@ if [ -n "$marker" ] && [ -e "$marker" ]; then
 fi
 
 # Copy gitignored-but-needed files (.env etc.) so hook-path sub-tasks also get their environment (matches gwt-new/gwt-claude)
-root="$(git -C "$abspath" rev-parse --git-common-dir 2>/dev/null)" && root="$(cd "$root/.." 2>/dev/null && pwd -P)" || root=""
+# The root MUST be resolved relative to $abspath, not to this process's pwd — see _cc_gitroot:
+# when $abspath is a main checkout the naive form names the CALLER's repo and this loop then
+# copies the caller's .env into a foreign checkout.
+root="$(_cc_gitroot "$abspath")" || root=""
 if [ -n "$root" ] && [ "$root" != "$abspath" ]; then
   for f in ${CC_WT_COPY:-.env .env.local .claude/settings.local.json}; do
     [ -f "$root/$f" ] || continue
@@ -433,7 +474,7 @@ fi
 # On the gwt-claude path CC_CALLER_CWD is unset and wt-claude above already
 # captured with the real caller cwd; skipping here avoids overwriting it.
 if [ -n "${CC_CALLER_CWD:-}" ] && command -v git >/dev/null 2>&1; then
-  _root="$(git -C "$abspath" rev-parse --git-common-dir 2>/dev/null)" && _root="$(cd "$_root/.." && pwd -P)"
+  _root="$(_cc_gitroot "$abspath")" || _root=""     # same caveat as above: resolve against $abspath
   _br="$(git -C "$abspath" symbolic-ref --short HEAD 2>/dev/null)"
   [ -n "$_root" ] && [ -n "$_br" ] && \
     "$HOME/.config/cc-stack/cc-merge.sh" capture "$_root" "$_br" "$CC_CALLER_CWD" >/dev/null 2>&1
@@ -748,14 +789,15 @@ _cc_automated(){ # rc 0 = an AGENT is driving this call, rc 1 = a human shell is
   return 1
 }
 _cc_repo_of(){ # $1 = a worktree dir (which may already be GONE) → its MAIN repo root
-  _r="$(git -C "${1:-}" rev-parse --git-common-dir 2>/dev/null)" \
-    && _r="$(cd "$_r/.." 2>/dev/null && pwd -P)" && [ -n "$_r" ] && { printf '%s' "$_r"; return 0; }
+  # _cc_gitroot, not `git -C … --git-common-dir` + cd: for a MAIN checkout git answers with a
+  # RELATIVE `.git` that would resolve against THIS process's pwd, i.e. name the caller's repo —
+  # here that would ask cc-merge.sh whether the wrong repo has the branch marked ready.
+  _r="$(_cc_gitroot "${1:-}")" && [ -n "$_r" ] && { printf '%s' "$_r"; return 0; }
   case "${1:-}" in                                  # dir removed: the layout convention still holds
     */.claude/worktrees/*) printf '%s' "${1%%/.claude/worktrees/*}"; return 0 ;;
     */.worktrees/*)        printf '%s' "${1%%/.worktrees/*}"; return 0 ;;
   esac
-  _r="$(git rev-parse --git-common-dir 2>/dev/null)" \
-    && _r="$(cd "$_r/.." 2>/dev/null && pwd -P)" && printf '%s' "$_r"   # last resort: the caller's repo
+  _cc_gitroot "$PWD"                                # last resort: the caller's repo (see known-issues)
 }
 _cc_rowdone(){ # rc 0 = this row's branch is marked ready (gwt-done → branch.<b>.ccDone)
   [ -n "${bbranch:-}" ] || return 1

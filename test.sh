@@ -1006,6 +1006,134 @@ rm -f "${TMPDIR:-/tmp}/cc-cmux-tabs/$(printf '%s' "$D0"  | shasum -a 1 | cut -d'
 unset CC_FAKE_LOG CC_FAKE_SCREEN
 
 echo ""
+echo "== 21. dispatch path resolution: target repo root + the opened-tabs prune =="
+# F10 — `git rev-parse --git-common-dir` answers with an ABSOLUTE path when the target is a LINKED
+# WORKTREE but with the bare RELATIVE `.git` when it is a MAIN CHECKOUT (live-probed 2026-08-16,
+# git 2.55.0/darwin). A relative answer resolves against the CALLER's pwd, never against the
+# target — so `cd "$(git -C "$d" rev-parse --git-common-dir)/.."` computes the CALLER's repo root
+# whenever $d is a main checkout. `cc-dispatch.sh surface <any-dir>` is a public subcommand, so
+# that is a cross-repo FILE LEAK: the caller repo's .env / .claude/settings.local.json / shared
+# corpus copied into someone else's checkout, and the merge target captured into the caller's repo
+# instead of the target's. Production only ever hands `surface` a linked worktree, which is why it
+# never fired — these assertions pin the main-checkout case that the public interface allows.
+cn21(){ CDPATH= cd -- "$1" >/dev/null 2>&1 && pwd -P; }
+SF21=$(mktemp -d); export CC_FAKE_LOG21="$SF21/log"; export CF_SCREEN21="$SF21/screen"
+cat > "$SF21/cmux" <<'CMUX'
+#!/usr/bin/env bash
+case "$1" in
+  ping) exit 0 ;;
+  identify) echo '{ "caller": {} }' ;;
+  list-pane-surfaces)
+    printf '  surface:801\t11111111-AAAA-AAAA-AAAA-111111111111\thelper tab\n'
+    printf '* surface:802\t22222222-AAAA-AAAA-AAAA-222222222222\tthis session\n' ;;
+  new-surface)
+    n=$(cat "$CC_FAKE_LOG21.nscnt" 2>/dev/null || echo 800); n=$((n+1)); echo "$n" > "$CC_FAKE_LOG21.nscnt"
+    printf 'NEWSURF|surface:%s|%s\n' "$n" "$*" >> "$CC_FAKE_LOG21"
+    printf 'OK surface:%s (77777777-8888-8888-8888-%012d) pane:1 (P) workspace:1 (W)\n' "$n" "$n" ;;
+  close-surface) shift; printf 'CLOSE|%s\n' "$*" >> "$CC_FAKE_LOG21" ;;
+  send)     shift; printf 'SEND|%s\n'   "$*" >> "$CC_FAKE_LOG21" ;;
+  send-key) shift; printf 'KEY|%s\n'    "$*" >> "$CC_FAKE_LOG21" ;;
+  notify)   shift; printf 'NOTIFY|%s\n' "$*" >> "$CC_FAKE_LOG21" ;;
+  read-screen) cat "$CF_SCREEN21" 2>/dev/null ;;
+esac
+exit 0
+CMUX
+chmod +x "$SF21/cmux"
+NB21="$(printf '\xc2\xa0')"
+{ echo "RDY22"; printf '\xe2\x9d\xaf%s\n' "$NB21"; echo "? for shortcuts"; } > "$CF_SCREEN21"
+OP21="$PATH"
+# the CALLER: a repo holding exactly the files that must never travel to another repo
+CR21="$(cn21 "$(mktemp -d)")"
+( cd "$CR21"; git init -q; git config user.email t@t; git config user.name t
+  git commit -q --allow-empty -m i; git checkout -q -b feat/caller
+  printf 'CALLER_SECRET=leaked\n' > .env
+  mkdir -p .claude shared21; printf '{"caller":1}\n' > .claude/settings.local.json
+  printf 'caller corpus\n' > shared21/corpus.txt )
+# the TARGET: an unrelated repo's MAIN CHECKOUT — the shape whose --git-common-dir comes back relative
+TR21="$(cn21 "$(mktemp -d)")"
+( cd "$TR21"; git init -q; git config user.email t@t; git config user.name t
+  git commit -q --allow-empty -m i; git checkout -q -b tmain )
+FH21=$(mktemp -d); mkdir -p "$FH21/.config"; cp -R "$CC" "$FH21/.config/cc-stack"
+TF21=$(mktemp -u); TB21=$(mktemp -u)
+srf21(){ # $1 = the directory handed to `surface`, always called FROM INSIDE the caller repo
+  ( cd "$CR21" && env HOME="$FH21" PATH="$SF21:$OP21" CC_TASKS_FILE="$TF21" CC_TABS_FILE="$TB21" \
+      CC_CALLER_CWD="$CR21" CC_WT_PRETRUST=0 CC_WT_SHARE=shared21 CC_SEND_VERIFY_SEC=0.1 \
+      CC_SEND_FAILLOG="$SF21/fail" CC_CALLER_SURFACE_UUID="22222222-AAAA-AAAA-AAAA-222222222222" \
+      bash "$CC/cc-dispatch.sh" surface "$1" ) >/dev/null 2>&1
+}
+srf21 "$TR21"
+ex21(){ [ -e "$1" ] && echo leaked || echo clean; }
+eq "main checkout: no .env leak"        "$(ex21 "$TR21/.env")" "clean"
+eq "main checkout: no settings leak"    "$(ex21 "$TR21/.claude/settings.local.json")" "clean"
+eq "main checkout: no corpus leak"      "$(ex21 "$TR21/shared21/corpus.txt")" "clean"
+eq "merge target NOT in caller repo"    "$(git -C "$CR21" config --get branch.tmain.ccMergeInto 2>/dev/null)" ""
+eq "merge target in the TARGET repo"    "$(git -C "$TR21" config --get branch.tmain.ccMergeInto 2>/dev/null)" "feat/caller"
+# control: the production shape (a LINKED worktree of the caller repo) must still get its
+# environment — the guard may not cost the case the copy was written for
+( cd "$CR21" && git worktree add -q "$CR21/.claude/worktrees/kid21" -b feat/kid21 >/dev/null 2>&1 )
+KD21="$(cn21 "$CR21/.claude/worktrees/kid21")"
+srf21 "$KD21"
+eq "linked worktree still gets .env"    "$(ex21 "$KD21/.env")" "leaked"
+eq "linked worktree still gets corpus"  "$(ex21 "$KD21/shared21/corpus.txt")" "leaked"
+eq "linked worktree merge target kept"  "$(git -C "$CR21" config --get branch.feat/kid21.ccMergeInto 2>/dev/null)" "feat/caller"
+
+# F10, third site — _cc_repo_of answers the close gate's "is this branch marked ready (gwt-done)"
+# question. Same mis-resolution: for a MAIN checkout it used to name the CALLER's repo, so a
+# gwt-done recorded in the real repo went unseen and a collectible tab was refused.
+MR21="$(cn21 "$(mktemp -d)")"
+( cd "$MR21"; git init -q; git config user.email t@t; git config user.name t
+  git commit -q --allow-empty -m i; git checkout -q -b feat/ready21
+  git config branch.feat/ready21.ccDone true )
+U21H="11111111-AAAA-AAAA-AAAA-111111111111"   # the helper tab, live in the fake surface map
+U21S="22222222-AAAA-AAAA-AAAA-222222222222"   # this session (the tab's opener)
+U21O="33333333-AAAA-AAAA-AAAA-333333333333"   # a DIFFERENT dispatching parent: ownership is not the unlock
+TF21B=$(mktemp -u); TB21B=$(mktemp -u); ST21="$SF21/store.json"; echo '{}' > "$ST21"
+printf '2026-01-01 00:00:01\tfeat/ready21\tsurface:801\t%s\tsurface:9\tready main checkout\tmain\tuuid=u9:provider=anthropic:pm=auto:csuuid=%s:suuid=%s\n' \
+  "$MR21" "$U21O" "$U21H" > "$TF21B"
+printf '%s\t%s\t%s\t-\t2026-01-01 00:00:00\n' "$U21H" "$U21S" "$MR21" > "$TB21B"
+: > "$CC_FAKE_LOG21"
+CO21="$( cd "$CR21" && env PATH="$SF21:$OP21" CC_TASKS_FILE="$TF21B" CC_TABS_FILE="$TB21B" \
+    CC_CMUX_SESSIONS="$ST21" CC_CALLER_SURFACE_UUID="$U21S" CLAUDECODE=1 \
+    bash "$CC/cc-dispatch.sh" close "$MR21" 2>&1 )"; crc21=$?
+eq "close reads gwt-done from the TARGET repo" "$(echo "$CO21" | grep -c 'branch feat/ready21 is marked ready')" "1"
+eq "ready main-checkout tab closes (rc0)"      "$crc21" "0"
+eq "and it closed BY UUID"                     "$(grep -cF "CLOSE|--surface $U21H" "$CC_FAKE_LOG21")" "1"
+
+# F14 — _cctabs_prune used the NR==FNR two-file idiom. With an EMPTY key file that idiom never
+# flips (on the first line of the SECOND file NR is still == FNR), so awk eats the whole ledger as
+# keys, prints nothing, and the mv + `[ -s ]` below DELETE opened-tabs.tsv — every helper tab's
+# recorded owner gone, and `close` fail-closes on all of them afterwards. The same trap is spelled
+# out at _ccres_setref, which is exactly why that one reads its keys with getline-in-BEGIN.
+# The upstream `[ -n "$_tlm" ] || return 0` keeps the public subcommands off this path today; what
+# is pinned here is the INVARIANT (an empty key set prunes NOTHING), by driving the helper itself —
+# the ledger block is lifted out of the script and sourced, the way section 1 lifts the hook python.
+PR21=$(mktemp -d)
+awk '/^_cctabs_file\(\)/{f=1} /^case /{f=0} f' "$CC/cc-dispatch.sh" > "$PR21/ledger.sh"
+eq "ledger helpers extracted" "$(grep -c '^_cctabs_prune()' "$PR21/ledger.sh")" "1"
+prune21(){ ( set -u; . "$PR21/ledger.sh"; CC_TABS_FILE="$1" _cctabs_prune "$2" ) >/dev/null 2>&1; }
+L21="$PR21/tabs.tsv"
+mk21(){ printf 'AAAAAAAA-0000-0000-0000-00000000000A\tOWN\t/tmp/a21\t-\tts\n' >  "$L21"
+        printf 'BBBBBBBB-0000-0000-0000-00000000000B\tOWN\t/tmp/b21\t-\tts\n' >> "$L21"; }
+rows21(){ [ -f "$1" ] || { echo gone; return 0; }; awk 'END{print NR+0}' "$1"; }
+# a non-empty map that yields NO usable keys → no evidence → prune nothing, and above all KEEP the file
+mk21; prune21 "$L21" "surface:1"
+eq "empty key set keeps the ledger" "$(rows21 "$L21")" "2"
+# a real map still prunes exactly the rows whose surface is gone
+mk21; prune21 "$L21" "$(printf 'surface:1\tAAAAAAAA-0000-0000-0000-00000000000A')"
+eq "prune kept the live row"  "$(awk -F'\t' 'NR==1{print substr($1,1,8)}' "$L21" 2>/dev/null)" "AAAAAAAA"
+eq "prune dropped the dead row" "$(rows21 "$L21")" "1"
+# every row dead → the ledger file itself goes (unchanged behaviour)
+mk21; prune21 "$L21" "$(printf 'surface:1\tCCCCCCCC-0000-0000-0000-00000000000C')"
+eq "all-dead ledger removed" "$(rows21 "$L21")" "gone"
+
+# surface leaves contentless dedup markers in the real TMPDIR (hash-keyed) — sweep ours
+rm -f "${TMPDIR:-/tmp}/cc-cmux-tabs/$(printf '%s' "$TR21" | shasum -a 1 | cut -d' ' -f1)" \
+      "${TMPDIR:-/tmp}/cc-cmux-tabs/$(printf '%s' "$KD21" | shasum -a 1 | cut -d' ' -f1)" 2>/dev/null
+( cd "$CR21" && git worktree remove --force "$CR21/.claude/worktrees/kid21" >/dev/null 2>&1 )
+rm -rf "$SF21" "$FH21" "$CR21" "$TR21" "$MR21" "$PR21"; rm -f "$TF21" "$TB21" "$TF21B" "$TB21B"
+unset CC_FAKE_LOG21 CF_SCREEN21
+
+echo ""
 echo "== 18. tab-close policy: the two ledgers + the sanctioned primitive =="
 # The 2026-08-16 PreToolUse text gate (hooks/block-unsafe-close.sh) is RETIRED — a parser that had
 # to decide whether prose quoting a close command IS a close command kept blocking real dispatch
