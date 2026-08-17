@@ -5,13 +5,15 @@
 When I ask to "open/create/start a worktree", "spin off a sub-task", "do X in parallel", or "start another claude to work on Y", run it in Bash — never the native EnterWorktree tool (it moves THIS session into the worktree: no new tab, main session occupied, not the parallel sub-task I want; this rule overrides the superpowers using-git-worktrees skill). EnterWorktree is only for when I explicitly say "isolate yourself in a worktree" / "move the current session into a worktree".
 
 ```bash
-CC_WT_PROMPT='<full first instruction; multi-line ok, delivered verbatim>' git worktree add .claude/worktrees/<name> -b feat/<name>
+CC_WT_PROMPT='<full first instruction; multi-line ok, delivered verbatim>' git worktree add .claude/worktrees/<name> -b feat/<name> <campaign-branch>
 ```
 
 The PostToolUse hook in `~/.config/cc-stack` then opens a new tab in the current cmux workspace, starts a ccteam claude there, sends CC_WT_PROMPT verbatim as its first message, and gives it a backchannel to report back to you. You stay put and keep working — you are not occupied. CC_WT_PROMPT is what makes it a dispatch: without it the hook opens **no tab at all** (silently — a plain `git worktree add` stays a plain worktree).
 
+**Always name the base** (that trailing `<campaign-branch>`): the hook reads it and records it as this line's merge target. Leave it off and the target falls back to whatever branch your cwd is on — which stops being a reliable signal the moment a sibling line fast-forwards into the campaign branch, because the two are then the same commit and the same working tree (2026-08-17: a line was one `y` away from being merged into its sibling while the campaign branch never moved).
+
 - Project has the `worktree-subtask` skill / `.claude/worktree-context.md` → load the skill first and dispatch with `gwt-claude <slug> "<prompt>" --base <base>` (records the merge target, forces an explicit base); the bare form above is the fallback for projects without it.
-- Never dispatch while the primary checkout sits on the trunk (`main`/`master`): create a campaign branch first (confirm the name with me) and make it every child's base and merge target — otherwise merges drip onto the trunk one at a time, and a trunk branch-guard hook can block the parent session for the rest of the campaign.
+- Never dispatch while the primary checkout sits on the trunk (`main`/`master`): create a campaign branch first (confirm the name with me) and make it every child's base and merge target — name it explicitly on every dispatch (`--base <campaign>` / the trailing argument above), never by standing on it. Otherwise merges drip onto the trunk one at a time, and a trunk branch-guard hook can block the parent session for the rest of the campaign.
 - If `/.claude/worktrees/` isn't ignored yet, add it to the project root `.gitignore` first (worktree contents must not pollute git status).
 - cmux-only; over remote SSH everything is an automatic no-op.
 - Monitor sub-tasks from any shell (Claude's non-interactive Bash included) by running `bash ~/.config/cc-stack/cc-board.sh` (`--all` for every repo; humans keep using `gwt-status`).
