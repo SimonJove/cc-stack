@@ -12,8 +12,9 @@
 #   --archive  render worktree-tasks-archive.tsv (merged tasks; what gwt-log shows)
 # Columns (TAB before STATUS keeps the historical header contract): TAB | BRANCH | PARENT |
 #   STATUS | DIR | TASK.
-#   TAB     cmux surface liveness (one list-pane-surfaces call when ping succeeds; "?" when
-#           cmux is unreachable; "?old-session" when no registered ref is alive → restart)
+#   TAB     cmux surface liveness (one list-pane-surfaces call PER WORKSPACE when ping succeeds —
+#           the CLI has no all-workspaces flag; "?" when cmux is unreachable or a workspace could
+#           not be enumerated; "?old-session" when no registered ref is alive → restart)
 #   PARENT  recorded merge target (branch.<b>.ccMergeInto via the row's own repo), falling
 #           back to the 7th TSV field once that config is gone (branch deleted after merge),
 #           then cc-merge.sh get-parent's trunk heuristic; "-" when nothing resolves
@@ -177,10 +178,38 @@ if [ ! -f "$f" ]; then
   exit 0
 fi
 
-# ── tab liveness: one cmux call (live board only) ─────────────────────────────────────
-live=""
+# ── tab liveness: one cmux probe per WORKSPACE (live board only) ──────────────────────
+# `cmux list-pane-surfaces` lists the CALLER's workspace ($CMUX_WORKSPACE_ID) and the CLI has no
+# "every workspace" flag (live-probed 2026-08-16: 8 surfaces unscoped, 13 enumerated one workspace
+# at a time). The single unscoped call this used to make therefore answered "is this tab in MY
+# workspace?", so three sub-task tabs sitting in another workspace rendered ?old-session while
+# their own STATUS cell said working(11m) — the row contradicted itself. The probe is the UNION
+# over `cmux list-workspaces`, taken ONCE per render (1+N cmux calls, N = workspaces).
+# live_partial = the enumeration was incomplete: a workspace that could not be listed, or no
+# workspace list at all (then we cannot even count what we missed). Absence of evidence is not
+# evidence of death (the invariant cc-dispatch.sh's opened-tabs prune spells out, where getting it
+# wrong DELETES rows): a row we could not look for stays "?" — liveness unknown — and is never
+# reported as ⌫closed or ?old-session. The four TAB values keep their meanings; what changed is
+# only how much of cmux the probe covers.
+live=""; live_partial=""
 if [ -z "$archive" ] && command -v cmux >/dev/null 2>&1 && cmux ping >/dev/null 2>&1; then
-  live="$(cmux list-pane-surfaces 2>/dev/null)"
+  # leading ref token only (a `grep -o` would mint a ref out of a workspace NAMED after one)
+  ccb_wsrefs="$(cmux list-workspaces 2>/dev/null | sed 's/^\*//' | awk '$1 ~ /^workspace:[0-9]+$/{print $1}')"
+  if [ -n "$ccb_wsrefs" ]; then
+    for ccb_w in $ccb_wsrefs; do
+      # empty = a failed probe, not an empty workspace (cmux refuses to close a workspace's last
+      # surface, so one always exists); an unknown ref still exits 0, so rc cannot carry this
+      ccb_wl="$(cmux list-pane-surfaces --workspace "$ccb_w" 2>/dev/null)"
+      if [ -n "$ccb_wl" ]; then live="$live$ccb_wl$NL"; else live_partial=1; fi
+    done
+  else
+    # No workspace list (older CLI, or the call failed): the unscoped call still resolves the tabs
+    # it can see, but without the list we cannot even know how many workspaces went unlooked-at —
+    # the least complete evidence there is, so it counts as partial too (same call the opened-tabs
+    # prune makes, where the equivalent fallback was deleting live rows).
+    live="$(cmux list-pane-surfaces 2>/dev/null)"
+    [ -n "$live" ] && live_partial=1
+  fi
 fi
 # (C) surface refs are session-scoped; after a cmux restart they all become stale. If NO
 # registered ref is alive, refs are stale rather than tabs closed → "?old-session".
@@ -305,7 +334,8 @@ while IFS="$US" read -r cdir br ref task parent state sts parcfg auth livehit ca
     tab="-"; cell="-"
   else
     if   [ -z "$live" ]; then tab="?"
-    elif [ "$livehit" = 1 ]; then tab="✔live"
+    elif [ "$livehit" = 1 ]; then tab="✔live"           # a HIT is solid however partial the probe
+    elif [ -n "$live_partial" ]; then tab="?"           # a MISS on partial evidence proves nothing
     elif [ -z "$some_live" ]; then tab="?old-session"
     else tab="⌫closed"; fi
     if [ -n "$state" ]; then ccb_age "$sts"; cell="$state($ccb_age_v)"; else cell="-"; fi
@@ -333,7 +363,9 @@ done <<< "$rows"   # a here-STRING, not a heredoc: no $ / backtick expansion ove
 
 # ── trailing notes (live board only) ───────────────────────────────────────────────────
 if [ -z "$archive" ]; then
-  if [ -n "$live" ] && [ -z "$some_live" ]; then
+  if [ -n "$live_partial" ]; then
+    echo "(note: cmux workspace enumeration was incomplete — liveness partial, so a tab this probe did not reach shows '?' rather than ⌫closed)"
+  elif [ -n "$live" ] && [ -z "$some_live" ]; then
     echo "(note: all registered surface refs are stale — cmux was probably restarted → status shows '?old-session'; dirs still exist, cleanup unaffected)"
   fi
   # failure breadcrumb: "built a worktree but no tab" + cc-send fail-open/calibration lines, last 24h

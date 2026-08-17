@@ -880,6 +880,230 @@ grep -q 'cc-worktree-shared.sh" seed' "$CC/cc-dispatch.sh" && ok "surface script
 rm -rf "$SR"
 
 echo ""
+echo "== 26. workspace scope: liveness probed across ALL workspaces, never just the caller's =="
+# `cmux list-pane-surfaces` lists ONE workspace — the caller's ($CMUX_WORKSPACE_ID) — and the CLI
+# has NO all-workspaces flag (live-probed 2026-08-16: 8 surfaces from the default call, 13 when the
+# two workspaces are enumerated one by one). Two places read that partial list as the answer to
+# "is this tab still alive?":
+#   · _cctabs_prune (opened-tabs.tsv lazy prune) — DESTRUCTIVE: every tab living in another
+#     workspace had its owner row deleted, and a tab with no recorded owner is one `close`
+#     fail-closes on forever (4 of 10 live rows on the author's machine, 2026-08-16);
+#   · the board's live/some_live probe — three working sub-task tabs rendered ?old-session while
+#     one of the same rows said working(11m): tab judged dead, agent visibly alive.
+# The half that DELETES is the one that needs the invariant, and this section pins it: absence of
+# evidence is never evidence of death. One unreachable workspace blocks the WHOLE prune, genuinely
+# dead rows included — a stale row is swept by the next complete read, a deleted live row is gone.
+WS26=$(mktemp -d); export CC_FAKE_LOG26="$WS26/log"; : > "$CC_FAKE_LOG26"
+cat > "$WS26/cmux" <<'CMUX'
+#!/usr/bin/env bash
+# fake cmux with TWO workspaces. The UNSCOPED list-pane-surfaces call answers with workspace:1
+# alone — exactly what the real CLI does with $CMUX_WORKSPACE_ID context. Knobs:
+#   CC_FAKE_WSDOWN=<ref>  that workspace is unreachable (rc 1, no output) → a PARTIAL probe
+#   CC_FAKE_NOWS=1        this build cannot list workspaces at all → also partial, and MORE so:
+#                         nothing tells us how many workspaces were missed
+w=""; s=""; prev=""
+for a in "$@"; do
+  case "$prev" in --workspace) w="$a" ;; --surface) s="$a" ;; esac
+  prev="$a"
+done
+cmd="$1"; shift
+case "$cmd" in
+  ping) exit 0 ;;
+  identify) echo '{ "caller": {} }' ;;
+  restore-session) printf 'RESTORE\n' >> "$CC_FAKE_LOG26"; echo "(fake) nothing to restore" ;;
+  list-workspaces)
+    [ -n "${CC_FAKE_NOWS:-}" ] && exit 0
+    printf '* workspace:1  alpha  [selected]\n'
+    printf '  workspace:2  beta\n' ;;
+  list-pane-surfaces)
+    [ -n "$w" ] || w=workspace:1
+    [ "$w" = "${CC_FAKE_WSDOWN:-}" ] && { echo "Error: not_found: Workspace not found" >&2; exit 1; }
+    case "$w" in
+      workspace:1)
+        printf '  surface:11\tAAAAAAAA-1111-1111-1111-111111111111\tchild A\n'
+        printf '* surface:12\tCCCCCCCC-3333-3333-3333-333333333333\tparent\n' ;;
+      workspace:2)
+        printf '  surface:21\tBBBBBBBB-2222-2222-2222-222222222222\tchild B (another workspace)\n' ;;
+    esac ;;
+  new-surface)
+    n=$(cat "$CC_FAKE_LOG26.nscnt" 2>/dev/null || echo 900); n=$((n+1)); echo "$n" > "$CC_FAKE_LOG26.nscnt"
+    printf 'NEWSURF|surface:%s|%s\n' "$n" "$*" >> "$CC_FAKE_LOG26"
+    printf 'OK surface:%s (99999999-9999-9999-9999-%012d) pane:1 (P) workspace:1 (W)\n' "$n" "$n" ;;
+  close-surface)
+    printf 'CLOSE|%s\n' "$*" >> "$CC_FAKE_LOG26"
+    # a uuid resolves inside the WORKSPACE CONTEXT (docs/known-issues.md): the workspace:2 target
+    # needs --workspace or cmux answers "Surface not found" and exits 1
+    if [ "$s" = "BBBBBBBB-2222-2222-2222-222222222222" ] && [ "$w" != "workspace:2" ]; then
+      echo "Error: not_found: Surface not found: $s" >&2; exit 1
+    fi ;;
+  send)     printf 'SEND|%s\n' "$*" >> "$CC_FAKE_LOG26" ;;
+  send-key) printf 'KEY|%s\n'  "$*" >> "$CC_FAKE_LOG26" ;;
+esac
+exit 0
+CMUX
+chmod +x "$WS26/cmux"
+OP26="$PATH"
+UA26="AAAAAAAA-1111-1111-1111-111111111111"   # a tab in workspace:1 — the caller's own workspace
+UB26="BBBBBBBB-2222-2222-2222-222222222222"   # a tab in workspace:2 — invisible to the old probe
+UP26="CCCCCCCC-3333-3333-3333-333333333333"   # this session (workspace:1), owner of both
+UD26="DEADDEAD-0000-0000-0000-000000000000"   # a surface that is really gone: prune fodder
+cn26(){ CDPATH= cd -- "$1" >/dev/null 2>&1 && pwd -P; }
+R26="$(cn26 "$(mktemp -d)")"; mkdir -p "$R26/.claude/worktrees/wtA" "$R26/.claude/worktrees/wtB"
+WA26="$R26/.claude/worktrees/wtA"; WB26="$R26/.claude/worktrees/wtB"
+rows26(){ [ -f "$1" ] || { echo gone; return 0; }; awk 'END{print NR+0}' "$1"; }
+
+# ── the helper itself: the map is a union, and it carries its own completeness ──────────────
+# Lifted out of the script and sourced, the way §21 lifts the ledger block and §1 the hook python —
+# the invariant has to hold at the helper, not only at the two subcommands that happen to call it.
+PR26=$(mktemp -d)
+awk '/^_cctabs_file\(\)/{f=1} /^case /{f=0} f' "$CC/cc-dispatch.sh" > "$PR26/ledger.sh"
+eq "26 livemap extracted"  "$(grep -c '^_cctabs_livemap()' "$PR26/ledger.sh")" "1"
+lm26(){ ( set -u; . "$PR26/ledger.sh"
+          PATH="${3:-$WS26:$OP26}" CC_FAKE_WSDOWN="${1:-}" CC_FAKE_NOWS="${2:-}" _cctabs_livemap ) 2>/dev/null; }
+eq "26 livemap sees the caller workspace"  "$(lm26 | awk -F'\t' -v u="$UA26" '$2==u{c++} END{print c+0}')" "1"
+eq "26 livemap sees the OTHER workspace"   "$(lm26 | awk -F'\t' -v u="$UB26" '$2==u{c++} END{print c+0}')" "1"
+eq "26 livemap keeps ref then uuid"        "$(lm26 | awk -F'\t' -v u="$UB26" '$2==u{print $1}')" "surface:21"
+eq "26 livemap tags the workspace"         "$(lm26 | awk -F'\t' -v u="$UB26" '$2==u{print $3}')" "workspace:2"
+eq "26 complete map carries no sentinel"   "$(lm26 | grep -cx '!partial')" "0"
+eq "26 unreachable workspace is flagged"   "$(lm26 workspace:2 | grep -cx '!partial')" "1"
+eq "26 flagged map still lists what it saw" "$(lm26 workspace:2 | awk -F'\t' -v u="$UA26" '$2==u{c++} END{print c+0}')" "1"
+eq "26 no cmux at all is an empty map"     "$(lm26 "" "" "/usr/bin:/bin" | wc -l | tr -d ' ')" "0"
+# NO workspace list at all (older CLI, or the call failed): the unscoped call still resolves what
+# it can see, but it is the LEAST complete evidence of the lot — without the list there is no way
+# to know how many workspaces went unlooked-at — so it carries the sentinel too. The first cut of
+# this line called that case "the pre-fix behaviour, unchanged" and let it prune; that is the very
+# shape this section exists to remove, with "old cmux build" swapped in as the trigger.
+eq "26 no-list map = caller workspace only" "$(lm26 "" 1 | awk -F'\t' -v u="$UB26" '$2==u{c++} END{print c+0}')" "0"
+eq "26 no-list map still resolves what it saw" "$(lm26 "" 1 | awk -F'\t' -v u="$UA26" '$2==u{print $1}')" "surface:11"
+eq "26 no workspace list is INCOMPLETE evidence" "$(lm26 "" 1 | grep -cx '!partial')" "1"
+# THE invariant: a map carrying the sentinel prunes NOTHING — not even the row that is really dead
+prune26(){ ( set -u; . "$PR26/ledger.sh"; CC_TABS_FILE="$1" _cctabs_prune "$2" ) >/dev/null 2>&1; }
+L26="$PR26/tabs.tsv"
+mkl26(){ printf 'AAAAAAAA-0000-0000-0000-00000000000A\tOWN\t/tmp/a26\t-\tts\n' >  "$L26"
+         printf 'DEADDEAD-0000-0000-0000-00000000000D\tOWN\t/tmp/d26\t-\tts\n' >> "$L26"; }
+mkl26; prune26 "$L26" "$(printf 'surface:1\tAAAAAAAA-0000-0000-0000-00000000000A\tworkspace:1\n!partial\n')"
+eq "26 partial map prunes nothing"    "$(rows26 "$L26")" "2"
+# ...and the SAME map without the sentinel still prunes: the guard is the evidence, not the shape
+mkl26; prune26 "$L26" "$(printf 'surface:1\tAAAAAAAA-0000-0000-0000-00000000000A\tworkspace:1\n')"
+eq "26 complete map still prunes"     "$(rows26 "$L26")" "1"
+eq "26 complete map kept the live row" "$(awk -F'\t' 'NR==1{print substr($1,1,8)}' "$L26" 2>/dev/null)" "AAAAAAAA"
+
+# ── consequence one (destructive): the opened-tabs prune ────────────────────────────────────
+TB26=$(mktemp -u)
+mk26(){ : > "$TB26"
+  printf '%s\t%s\t%s\t-\t2026-01-01 00:00:00\n' "$UA26" "$UP26" "$WA26" >> "$TB26"
+  printf '%s\t%s\t%s\t-\t2026-01-01 00:00:00\n' "$UB26" "$UP26" "$WB26" >> "$TB26"
+  printf '%s\t%s\t%s\t-\t2026-01-01 00:00:00\n' "$UD26" "$UP26" "/tmp/cc-gone-26" >> "$TB26"; }
+tabs26(){ ( cd "$R26" && env PATH="$WS26:$OP26" CC_TABS_FILE="$TB26" CC_CALLER_SURFACE_UUID="$UP26" \
+    CC_FAKE_WSDOWN="${1:-}" CC_FAKE_NOWS="${2:-}" bash "$CC/cc-dispatch.sh" tabs --all ) 2>&1; }
+mk26; TO26="$(tabs26)"
+eq "26 tabs: caller-workspace tab alive"  "$(echo "$TO26" | grep -c "$UA26 .*alive")" "1"
+eq "26 tabs: OTHER-workspace tab alive"   "$(echo "$TO26" | grep -c "$UB26 .*alive")" "1"
+eq "26 cross-workspace row NOT pruned"    "$(grep -c "^$UB26" "$TB26")" "1"
+eq "26 genuinely dead row still pruned"   "$(grep -c "^$UD26" "$TB26")" "0"
+eq "26 prune kept exactly the live rows"  "$(rows26 "$TB26")" "2"
+# one workspace unreachable → nothing is pruned AT ALL, and the miss is reported as dead? not dead
+mk26; TO26="$(tabs26 workspace:2)"
+eq "26 partial probe prunes no row"       "$(rows26 "$TB26")" "3"
+eq "26 partial probe keeps the dead row"  "$(grep -c "^$UD26" "$TB26")" "1"
+eq "26 partial probe says so"             "$(echo "$TO26" | grep -c 'liveness partial')" "1"
+eq "26 unseen row prints dead?"           "$(echo "$TO26" | grep -c "$UB26 .*dead?")" "1"
+eq "26 seen row is still alive"           "$(echo "$TO26" | grep -c "$UA26 .*alive")" "1"
+# no workspace list at all → the SAME refusal. This is the case the parent gate sent back: a build
+# that cannot enumerate workspaces cannot know whether other workspaces exist, so pruning there is
+# the original defect wearing a different trigger. Cost accepted: on such a build the ledger only
+# grows, and a stale row is harmless (its uuid resolves to nothing → close says "no live tab", rc 0).
+mk26; TO26="$(tabs26 "" 1)"
+eq "26 no workspace list prunes NO row"   "$(rows26 "$TB26")" "3"
+eq "26 no workspace list keeps the dead row" "$(grep -c "^$UD26" "$TB26")" "1"
+eq "26 no workspace list keeps the cross-workspace row" "$(grep -c "^$UB26" "$TB26")" "1"
+eq "26 no workspace list says liveness is partial" "$(echo "$TO26" | grep -c 'liveness partial')" "1"
+eq "26 no workspace list still resolves its own tab" "$(echo "$TO26" | grep -c "$UA26 .*alive")" "1"
+
+# ── consequence two: the board's TAB column ─────────────────────────────────────────────────
+TF26=$(mktemp -u); SF26=$(mktemp -u); : > "$SF26"
+bt26(){ : > "$TF26"                       # $1/$2 = the refs recorded for the wtA / wtB rows
+  printf '2026-01-01 00:00:01\tfeat/A26\tsurface:%s\t%s\tsurface:9\ttask in the caller workspace\tmain\n' "${1:-11}" "$WA26" >> "$TF26"
+  printf '2026-01-01 00:00:02\tfeat/B26\tsurface:%s\t%s\tsurface:9\ttask in ANOTHER workspace\tmain\n'  "${2:-21}" "$WB26" >> "$TF26"; }
+brd26(){ ( cd "$R26" && env PATH="${3:-$WS26:$OP26}" CC_TASKS_FILE="$TF26" CC_STATUS_FILE="$SF26" \
+    CC_FAKE_WSDOWN="${1:-}" CC_FAKE_NOWS="${2:-}" bash "$CC/cc-board.sh" --all ) 2>/dev/null; }
+tabof26(){ echo "$1" | awk -v d="$2" '$5==d{print $1}'; }
+bt26; BO26="$(brd26)"
+eq "26 board: caller-workspace tab live"  "$(tabof26 "$BO26" "$WA26")" "✔live"
+eq "26 board: OTHER-workspace tab live"   "$(tabof26 "$BO26" "$WB26")" "✔live"
+# the four TAB values keep their meanings — only the probe's coverage changed:
+bt26 11 99; BO26="$(brd26)"
+eq "26 board: a truly closed tab is ⌫closed" "$(tabof26 "$BO26" "$WB26")" "⌫closed"
+bt26 98 99; BO26="$(brd26)"
+eq "26 board: all refs stale is ?old-session" "$(tabof26 "$BO26" "$WA26")" "?old-session"
+bt26; BO26="$(brd26 "" "" "/usr/bin:/bin")"
+eq "26 board: no cmux is ?"               "$(tabof26 "$BO26" "$WA26")" "?"
+# an unreachable workspace is "unknown", never "closed" — same invariant, non-destructive half
+bt26; BO26="$(brd26 workspace:2)"
+eq "26 board: unreachable workspace is ?" "$(tabof26 "$BO26" "$WB26")" "?"
+eq "26 board: seen tab stays live"        "$(tabof26 "$BO26" "$WA26")" "✔live"
+eq "26 board: partial probe is announced" "$(echo "$BO26" | grep -c 'liveness partial')" "1"
+eq "26 board: no restart claim on partial" "$(echo "$BO26" | grep -c 'probably restarted')" "0"
+# no workspace list → the board treats it as partial for the same reason the prune does: a hit is
+# still a hit, a miss is only "unknown"
+bt26 11 99; BO26="$(brd26 "" 1)"
+eq "26 board: no workspace list keeps a hit live" "$(tabof26 "$BO26" "$WA26")" "✔live"
+eq "26 board: no workspace list makes a miss ?"   "$(tabof26 "$BO26" "$WB26")" "?"
+
+# ── consequence three: close resolves — and closes — a tab in another workspace ─────────────
+TFC26=$(mktemp -u); ST26="$WS26/store.json"; echo '{}' > "$ST26"
+printf '2026-01-01 00:00:01\tfeat/A26\tsurface:11\t%s\tsurface:9\ttask A\tmain\tuuid=u1:provider=anthropic:pm=auto:csuuid=%s:suuid=%s\n' "$WA26" "$UP26" "$UA26" >  "$TFC26"
+printf '2026-01-01 00:00:02\tfeat/B26\tsurface:21\t%s\tsurface:9\ttask B\tmain\tuuid=u2:provider=anthropic:pm=auto:csuuid=%s:suuid=%s\n' "$WB26" "$UP26" "$UB26" >> "$TFC26"
+cl26(){ ( cd "$R26" && env PATH="$WS26:$OP26" CC_TASKS_FILE="$TFC26" CC_TABS_FILE="$TB26" \
+    CC_CMUX_SESSIONS="$ST26" CC_CALLER_SURFACE_UUID="$UP26" CLAUDECODE=1 \
+    bash "$CC/cc-dispatch.sh" close "$1" ) 2>&1; }
+mk26; : > "$CC_FAKE_LOG26"
+CO26="$(cl26 "$WB26")"; crc26=$?
+eq "26 close resolves the other workspace" "$(echo "$CO26" | grep -c 'resolved : surface:21')" "1"
+eq "26 cross-workspace close exit0"        "$crc26" "0"
+eq "26 close retried WITH --workspace"     "$(grep -cFx "CLOSE|--surface $UB26 --workspace workspace:2" "$CC_FAKE_LOG26")" "1"
+eq "26 close never used a short ref"       "$(grep -c 'CLOSE|--surface surface:' "$CC_FAKE_LOG26")" "0"
+# an unreachable workspace keeps the idempotence contract (rc 0, closes nothing) but must not
+# claim the tab is gone — "I could not look there" is a different sentence
+mk26; : > "$CC_FAKE_LOG26"
+CO26="$( cd "$R26" && env PATH="$WS26:$OP26" CC_TASKS_FILE="$TFC26" CC_TABS_FILE="$TB26" \
+    CC_CMUX_SESSIONS="$ST26" CC_CALLER_SURFACE_UUID="$UP26" CLAUDECODE=1 CC_FAKE_WSDOWN=workspace:2 \
+    bash "$CC/cc-dispatch.sh" close "$WB26" 2>&1 )"; crc26=$?
+eq "26 close on a partial probe exit0"     "$crc26" "0"
+eq "26 close on a partial probe closes nothing" "$(grep -c 'CLOSE|' "$CC_FAKE_LOG26")" "0"
+eq "26 close on a partial probe says why"  "$(echo "$CO26" | grep -c 'unseen by this probe')" "1"
+mk26; : > "$CC_FAKE_LOG26"
+CO26="$(cl26 "$WA26")"; crc26=$?
+eq "26 same-workspace close exit0"         "$crc26" "0"
+eq "26 same-workspace close is the bare form" "$(grep -cFx "CLOSE|--surface $UA26" "$CC_FAKE_LOG26")" "1"
+eq "26 same-workspace close does not retry"   "$(grep -c 'CLOSE|' "$CC_FAKE_LOG26")" "1"
+
+# ── consequence four: resume must not reopen a tab that is already back elsewhere ───────────
+# gwt-resume matched restored tabs against the same caller-workspace-only list, so a tab cmux
+# restored into another workspace looked absent and resume opened a DUPLICATE next to it.
+python3 - "$UB26" "$WB26" > "$ST26" <<'PY'
+import json, sys
+surf, cwd = sys.argv[1], sys.argv[2]
+json.dump({"sessions": {"55555555-5555-5555-5555-555555555555":
+                        {"surfaceId": surf, "cwd": cwd, "updatedAt": 200}}, "version": 3}, sys.stdout)
+PY
+TFR26=$(mktemp -u)
+printf '2026-01-01 00:00:01\tfeat/B26\tsurface:77\t%s\tsurface:9\ttask B\tmain\tuuid=55555555-5555-5555-5555-555555555555:provider=anthropic:pm=auto\n' "$WB26" > "$TFR26"
+HM26="$WS26/home"; mkdir -p "$HM26/.config"; ln -s "$CC" "$HM26/.config/cc-stack"
+: > "$CC_FAKE_LOG26"
+RO26="$( cd "$R26" && env HOME="$HM26" PATH="$WS26:$OP26" CC_TASKS_FILE="$TFR26" CC_STATUS_FILE="$SF26" \
+    CC_TABS_FILE="$TB26" CC_CMUX_SESSIONS="$ST26" CC_RESUME_SETTLE=0 CC_WT_PRETRUST=0 \
+    bash "$CC/cc-dispatch.sh" resume --all 2>&1 )"; rrc26=$?
+eq "26 resume exit0"                        "$rrc26" "0"
+eq "26 resume opens no duplicate tab"       "$(grep -c 'NEWSURF' "$CC_FAKE_LOG26")" "0"
+eq "26 resume refreshed the ref to the other workspace" "$(awk -F'\t' -v d="$WB26" '$4==d{print $3}' "$TFR26")" "surface:21"
+
+# insurance for a future regression: a resume that DOES reopen leaves a contentless dedup marker
+# in the real TMPDIR (hash-keyed, written by surface) — sweep ours either way
+rm -f "${TMPDIR:-/tmp}/cc-cmux-tabs/$(printf '%s' "$WB26" | shasum -a 1 | cut -d' ' -f1)" 2>/dev/null
+rm -rf "$WS26" "$R26" "$PR26"; rm -f "$TB26" "$TF26" "$SF26" "$TFC26" "$TFR26"
+unset CC_FAKE_LOG26
+echo ""
 echo "== 12. gwt-adopt (enroll an existing branch into the tree) =="
 AR=$(mktemp -d); ( cd "$AR"; git init -q; git config user.email t@t; git config user.name t
   git commit -q --allow-empty -m i; git branch -M main
@@ -1562,7 +1786,11 @@ case "$1" in
     n=$(cat "${CC_FAKE_LOG}.wscnt" 2>/dev/null || echo 700); n=$((n+1)); echo "$n" > "${CC_FAKE_LOG}.wscnt"
     printf 'NEWWS|%s\n' "$*" >> "$CC_FAKE_LOG"
     printf 'OK workspace:%s (WWWWWWWW-9999-9999-9999-%012d) surface:%s (88888888-9999-9999-9999-%012d)\n' "$n" "$n" "$n" "$n" ;;
-  list-workspaces) : ;;
+  # ONE workspace, and list-pane-surfaces answers the same set with or without --workspace: this
+  # fake is a single-workspace cmux. Needed since §26 — a probe that cannot list workspaces cannot
+  # know what it missed, so it now counts as INCOMPLETE evidence and prunes nothing; without this
+  # line the section's lazy-prune assertions would be testing the no-evidence path instead.
+  list-workspaces) printf '* workspace:1  fake  [selected]\n' ;;
   close-surface) shift; printf 'CLOSE|%s\n' "$*" >> "$CC_FAKE_LOG" ;;
   send)     shift; printf 'SEND|%s\n' "$*" >> "$CC_FAKE_LOG" ;;
   send-key) shift; printf 'KEY|%s\n'  "$*" >> "$CC_FAKE_LOG" ;;

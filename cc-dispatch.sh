@@ -268,8 +268,9 @@ _ccsend_calibrate() {  # $1 = ref, $2 = dir — self-calibration (hardening laye
 # resume), opened-tabs answers "who OPENED this tab". Both are consulted, in that order, by
 # `cc-dispatch.sh close`.
 # Rows are pruned LAZILY on read: a row whose surface uuid no longer appears in the live cmux
-# surface map is dropped. Never prune off an EMPTY map — cmux being unreachable is not evidence
-# that every tab died.
+# surface map is dropped. Never prune off an INCOMPLETE map — neither an empty one (cmux
+# unreachable) nor a partial one (a workspace that could not be enumerated); not having looked
+# there is not evidence that the tab died. See the workspace-scope block below.
 _cctabs_file(){ printf '%s' "${CC_TABS_FILE:-$HOME/.config/cc-stack/opened-tabs.tsv}"; }
 _cctabs_uc(){ printf '%s' "${1:-}" | tr 'abcdefghijklmnopqrstuvwxyz' 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'; }
 _cctabs_lock(){ # $1 = file — same atomic-mkdir discipline as the board's append (macOS lacks flock)
@@ -290,15 +291,91 @@ _cctabs_log(){ # $1 = surface uuid, $2 = owner surface uuid, $3 = dir, $4 = clau
   [ -n "$_tgot" ] && rmdir "$_tf.lock" 2>/dev/null
   return 0
 }
-_cctabs_livemap(){ # "short-ref <TAB> UPPERCASE-uuid" for every live surface ("" = cmux unreachable)
+# ── workspace scope (2026-08-16) ────────────────────────────────────────────────────────────
+# `cmux list-pane-surfaces` lists ONE workspace — the caller's ($CMUX_WORKSPACE_ID) — and the CLI
+# has NO "every workspace" flag (live-probed 2026-08-16: 8 surfaces from the default call, 13 when
+# the two workspaces are enumerated one by one). A single unscoped call therefore does not answer
+# "is this tab still alive?", it answers "is this tab alive IN MY WORKSPACE?" — and every tab living
+# anywhere else reads as dead. For the lazy prune below that is DESTRUCTIVE: it deleted the owner
+# rows of four live sub-task tabs that sat in another workspace, and a tab with no recorded owner
+# is one `close` fail-closes on forever (only the human can finish it in the cmux UI).
+# The map is now the UNION over `cmux list-workspaces`, and it carries its own completeness:
+#   · one "<short-ref> TAB <UPPERCASE-uuid> TAB <workspace-ref>" line per live surface
+#   · a final "!partial" line whenever the enumeration was INCOMPLETE — one workspace unreachable,
+#     or the workspace LIST itself unavailable (then there is no way to know how many workspaces
+#     were missed, which is the least complete evidence of all, not the most)
+#   · nothing at all when cmux is unreachable (the pre-existing "no evidence" signal, unchanged)
+# WHY the completeness flag travels INSIDE the output instead of in a shell variable: every caller
+# captures the map through `$( )`, and a variable set in that subshell never comes back — the
+# warning would be lost at exactly the call sites that prune. Consumers that only ask "is THIS uuid
+# alive?" ($2 == u) skip the sentinel for free; the consumer that infers DEATH from absence must
+# look at it. Short refs stay ADDRESSES and uuids stay IDENTITIES — the extra column is context for
+# resolving an address, never a second identity (refs do not repeat across workspaces here, but
+# nothing in this stack may start relying on that).
+_cc_ws_refs(){ # every workspace ref cmux knows, one per line ("" = cannot enumerate)
+  # `list-workspaces` prints "<*| > workspace:N  <name> [selected]" (the legacy-alias notice goes to
+  # stderr). Only the LEADING ref token counts — a `grep -o` over the whole line would mint a
+  # workspace ref out of a workspace NAMED after one.
+  cmux list-workspaces 2>/dev/null | sed 's/^\*//' | awk '$1 ~ /^workspace:[0-9]+$/{print $1}'
+}
+_cctabs_livemap(){ # live surface map; see the block comment above for the format and the sentinel
   command -v cmux >/dev/null 2>&1 || return 0
-  cmux list-pane-surfaces --id-format both 2>/dev/null | sed 's/^\*//' \
-    | awk 'NF>=2{print $1 "\t" toupper($2)}'
+  _tws="$(_cc_ws_refs)"
+  if [ -z "$_tws" ]; then
+    # No workspace list (older CLI, or the call failed). The unscoped call is still the best
+    # ADDRESS book we can get — resolution keeps working — but it is NOT complete evidence: without
+    # the list we cannot even know how many workspaces we failed to look in, so this is the LEAST
+    # complete case, not a special safe one. It therefore carries the same "!partial" sentinel and
+    # prunes nothing. (Gate call, 2026-08-16: the earlier "this is exactly the pre-fix behaviour"
+    # fallback still deleted live rows whenever the list call failed — the very shape this line was
+    # opened to remove, only with a different trigger. Cost accepted: on such a build the ledger
+    # only grows. A stale row is harmless — its uuid resolves to nothing, `close` says "no live tab"
+    # and exits 0 — while a deleted row is unrecoverable.)
+    _tmap="$(cmux list-pane-surfaces --id-format both 2>/dev/null | sed 's/^\*//' \
+      | awk 'NF>=2{print $1 "\t" toupper($2)}')"
+    [ -n "$_tmap" ] || return 0          # nothing at all = cmux unreachable = no evidence, no map
+    printf '%s\n!partial\n' "$_tmap"
+    return 0
+  fi
+  _tmap=""; _tpart=""
+  for _tw in $_tws; do
+    _tout="$(cmux list-pane-surfaces --workspace "$_tw" --id-format both 2>/dev/null | sed 's/^\*//' \
+      | awk -v w="$_tw" 'NF>=2{print $1 "\t" toupper($2) "\t" w}')"
+    # An EMPTY answer is a failed probe, not an empty workspace: a workspace always holds at least
+    # one surface (cmux refuses to close the last one — docs/known-issues.md). rc alone cannot carry
+    # this — an unknown --workspace ref still exits 0, it just answers about a different workspace.
+    if [ -n "$_tout" ]; then
+      _tmap="$_tmap$_tout
+"
+    else
+      _tpart=1
+    fi
+  done
+  [ -n "$_tmap" ] || return 0            # nothing anywhere = cmux unreachable = no evidence at all
+  printf '%s' "$_tmap"
+  [ -n "$_tpart" ] && printf '!partial\n'
+  return 0
+}
+_cctabs_partial(){ # rc 0 when a map carries the incomplete-evidence sentinel
+  _tpnl='
+'
+  case "$_tpnl${1:-}$_tpnl" in *"$_tpnl!partial$_tpnl"*) return 0 ;; esac
+  return 1
+}
+_cctabs_where(){ # $1 = live map, $2 = surface uuid → the workspace ref it was seen in ("" = unknown)
+  printf '%s\n' "${1:-}" | awk -F'\t' -v u="${2:-}" '$2==u{print $3; exit}'
 }
 _cctabs_prune(){ # $1 = live map (optional; probed when omitted) — drop rows whose surface is gone
   _tf="$(_cctabs_file)"; [ -f "$_tf" ] || return 0
   _tlm="${1:-$(_cctabs_livemap)}"
   [ -n "$_tlm" ] || return 0                              # no map = no evidence = no pruning
+  # INVARIANT (2026-08-16): absence of evidence is NEVER evidence of death, and it only ever gets
+  # stronger. An empty map already pruned nothing; a PARTIAL map — one workspace enumerated, another
+  # unreachable — prunes nothing either, genuinely dead rows included. Deleting a live row is
+  # irreversible (its owner is gone, `close` fail-closes, a human has to clean up in the UI);
+  # keeping a dead row costs one stale line that the next COMPLETE read sweeps. Never weaken this
+  # into "prune within the workspaces we could see".
+  _cctabs_partial "$_tlm" && return 0
   _tgot=""; _cctabs_lock "$_tf" && _tgot=1
   _ttmp="$_tf.tmp.$$"
   printf '%s\n' "$_tlm" | awk -F'\t' 'NF>=2{print toupper($2)}' > "$_ttmp.live" 2>/dev/null
@@ -1048,6 +1125,10 @@ tabowner_u=""
 echo "── close: $cdir ──"
 if [ -z "$tuuid" ] || [ -z "$tref" ]; then
   echo "· no live tab resolves to this directory (already closed, or never recorded) — nothing to do"
+  # rc stays 0 (the idempotence `gwt-rm --close` relies on), but do not let an INCOMPLETE probe
+  # masquerade as "it is gone": say which claim we are actually entitled to make.
+  _cctabs_partial "$live" && \
+    echo "  (cmux workspace enumeration was incomplete — the tab may be alive in a workspace unseen by this probe)"
   exit 0
 fi
 echo "  resolved : $tref  uuid=$tuuid  cwd=$ccan"
@@ -1088,11 +1169,22 @@ else
 fi
 
 # ── ④ close by the STABLE uuid ──
+# A uuid is resolved inside the caller's WORKSPACE CONTEXT: a target in another workspace used to
+# answer "Error: not_found: Surface not found: <uuid>" unless --workspace came along
+# (docs/known-issues.md; this build's read-screen does resolve cross-workspace, so the need is
+# version-dependent). The bare call stays FIRST — it is the shape every caller and test knows, and
+# it is the only one used when the tab is in this workspace — and the workspace the live map just
+# told us about is used only to RETRY what would otherwise be a loud failure.
+tws="$(_cctabs_where "$live" "$tuuid")"
 if cmux close-surface --surface "$tuuid" >/dev/null 2>&1; then
   echo "✔ closed $tref (uuid $tuuid)"
   exit 0
 fi
-echo "✗ cmux close-surface failed for uuid $tuuid" >&2
+if [ -n "$tws" ] && cmux close-surface --surface "$tuuid" --workspace "$tws" >/dev/null 2>&1; then
+  echo "✔ closed $tref (uuid $tuuid, workspace $tws)"
+  exit 0
+fi
+echo "✗ cmux close-surface failed for uuid $tuuid${tws:+ (also retried in $tws)}" >&2
 exit 1
 ;;
 
@@ -1102,8 +1194,9 @@ exit 1
 #   and are they still there?") in the only identity that survives a pane opening or closing.
 #   Columns: REF (current short ref, "-" when the tab is gone) | UUID (the stable identity) |
 #   STATE (alive/dead) | OWNER (the surface uuid that opened it, "self" marked) | DIR.
-#   Reading prunes: rows whose surface no longer resolves are dropped — unless cmux is
-#   unreachable, in which case nothing is pruned and every row prints as "dead?" .
+#   Reading prunes: rows whose surface no longer resolves are dropped — unless the liveness probe
+#   was INCOMPLETE (cmux unreachable, or any workspace that could not be enumerated), in which case
+#   nothing is pruned and every unresolved row prints as "dead?" instead of "dead".
 # Usage: cc-dispatch.sh tabs [--all]
 #   (default) only rows this session opened;  --all  every row in the ledger
 # Related env: CC_TABS_FILE (ledger), CC_CALLER_SURFACE_UUID (override for $CMUX_SURFACE_ID)
@@ -1115,11 +1208,13 @@ if [ "${1:-}" = "--all" ]; then tabs_all=1; shift; fi
 
 tabs_f="$(_cctabs_file)"
 tabs_live="$(_cctabs_livemap)"
+tabs_part=""; _cctabs_partial "$tabs_live" && tabs_part=1
 _cctabs_prune "$tabs_live"
 tabs_self="$(_cctabs_uc "${CC_CALLER_SURFACE_UUID:-${CMUX_SURFACE_ID:-}}")"
 echo "── opened tabs ($tabs_f) ──"
 [ -f "$tabs_f" ] || { echo "  (no tabs recorded)"; exit 0; }
 [ -n "$tabs_live" ] || echo "  ⚠ cmux unreachable — liveness unknown, nothing pruned"
+[ -n "$tabs_part" ] && echo "  ⚠ cmux workspace enumeration incomplete — liveness partial, nothing pruned (rows below print dead? rather than dead)"
 printf '%-12s  %-36s  %-6s  %-36s  %s\n' REF UUID STATE OWNER DIR
 tabs_n=0
 while IFS=$'\t' read -r t_u t_o t_d t_s t_ts; do
@@ -1127,8 +1222,14 @@ while IFS=$'\t' read -r t_u t_o t_d t_s t_ts; do
   [ "$t_o" = "-" ] && t_o=""
   if [ -z "$tabs_all" ] && [ -n "$tabs_self" ] && [ "$t_o" != "$tabs_self" ]; then continue; fi
   t_ref="$(printf '%s\n' "$tabs_live" | awk -F'\t' -v u="$t_u" '$2==u{print $1; exit}')"
-  if [ -n "$t_ref" ]; then t_state="alive"; else t_ref="-"; t_state="dead"; fi
-  [ -n "$tabs_live" ] || t_state="dead?"
+  if [ -n "$t_ref" ]; then
+    t_state="alive"                     # a HIT is solid evidence however partial the probe was
+  else
+    t_ref="-"; t_state="dead"
+    # a MISS is only a claim when the evidence is complete: an unreachable cmux (empty map) and an
+    # unreachable workspace (partial map) are both "we could not look there" → dead?, never dead
+    { [ -n "$tabs_live" ] && [ -z "$tabs_part" ]; } || t_state="dead?"
+  fi
   t_own="${t_o:--}"
   [ -n "$tabs_self" ] && [ "$t_o" = "$tabs_self" ] && t_own="$t_o (self)"
   printf '%-12s  %-36s  %-6s  %-36s  %s\n' "$t_ref" "$t_u" "$t_state" "$t_own" "$t_d"
@@ -1189,9 +1290,13 @@ sw="${CC_RESUME_SETTLE:-2}"; case "$sw" in ''|*[!0-9]*) sw=2 ;; esac
 [ "$sw" -gt 0 ] && sleep "$sw"
 
 # ── ② live-surface map + agent session store ──
-# list-pane-surfaces --id-format both → "surface:N <surface-UUID> <title>" (leading * on the
-# selected one); keep "UUID<TAB>ref" pairs keyed by the STABLE uuid (short refs are session-scoped).
-live_pairs="$(cmux list-pane-surfaces --id-format both 2>/dev/null | sed 's/^\*//' | awk 'NF>=2{print $2 "\t" $1}')"
+# "UUID<TAB>ref" pairs keyed by the STABLE uuid (short refs are session-scoped), via the SAME
+# workspace-union probe the opened-tabs prune uses — a bare list-pane-surfaces sees the caller's
+# workspace only, so a tab cmux restored into another workspace looked absent and this step
+# reopened a DUPLICATE of a tab that was already back. The "!partial" sentinel line has one field
+# and is dropped by NF>=2; a partial map only costs a duplicate tab here (visible, not destructive),
+# which is why resume does not refuse on it the way the prune does.
+live_pairs="$(_cctabs_livemap | awk -F'\t' 'NF>=2{print $2 "\t" $1}')"
 # session store: claude session id (key) → surfaceId UUID + cwd (+ updatedAt for newest-wins).
 # Absent/unreadable → no native matching at all; every unrestored row simply goes to reopen.
 store="${CC_CMUX_SESSIONS:-$HOME/.cmuxterm/claude-hook-sessions.json}"
