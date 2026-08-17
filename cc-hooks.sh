@@ -13,12 +13,23 @@ case "${1:-}" in
 # ─────────────────────────────────────────────────────────────────────────────
 # worktree — PostToolUse (Bash|EnterWorktree) tab opener
 # What it does: after Claude runs `git worktree add` in Bash, automatically open a new surface (tab)
-#   in the current cmux workspace and start a ccteam claude there; if CC_WT_PROMPT is set, send it as the first message.
+#   in the current cmux workspace, start a ccteam claude there and send CC_WT_PROMPT as its first message.
+#   It dispatches ONLY when both halves are unambiguous (2026-08-16 tightening):
+#     * INTENT — the command carries a non-empty CC_WT_PROMPT. Without one there is no first instruction,
+#       so the tab could only sit there doing nothing: bisect helpers, hand-made worktrees and test
+#       fixtures each used to earn an idle tab. No prompt = silent skip, no breadcrumb (that is the norm).
+#     * TARGET — the new worktree path is parsed out of the command AND confirmed to be a linked worktree
+#       of that repo. The old "no match, take the newest mtime" guess is gone: it opened tabs on unrelated
+#       worktrees, once starting a second claude inside a directory another sub-task was working in.
+#       An unpinnable target = no tab + ONE line in cc-failures.log, because a dispatch that was meant to
+#       happen and did not must stay visible (the board surfaces that log).
+#   This is the HOOK decision only: `cc-dispatch.sh surface <dir>` with no prompt still opens an idle tab
+#   on purpose — gwt-resume reopens crashed sub-tasks through exactly that path.
 #   - Only handles a Bash `git worktree add` (adjacent tokens); list/remove/prune do NOT trigger.
 #     EnterWorktree (which moves the current claude into the worktree) has no `command` field, so it's naturally
 #     excluded — avoids two claudes colliding in the same directory.
 #   - Parses the target path + `-C <repo>` from the command (pinpoints the just-created worktree, cross-repo aware);
-#     if it can't parse (e.g. a $VAR shell variable that wasn't expanded), falls back to "most-recent mtime".
+#     what it cannot pin (e.g. a $VAR shell variable that wasn't expanded) it never guesses at.
 #   - Initial-prompt convention: prefix the command with CC_WT_PROMPT='task description', e.g.:
 #       CC_WT_PROMPT='refactor auth token refresh' git worktree add .claude/worktrees/oauth -b feat/oauth
 #   - Sub-tasks start in `auto` mode. To pin ONE dispatch to the plan-first gate, add the prefix
@@ -45,9 +56,14 @@ esac
 command -v cmux >/dev/null 2>&1 || exit 0
 cmux ping >/dev/null 2>&1 || exit 0
 
-# Parse: the just-created worktree absolute path + CC_WT_PROMPT value, TAB-separated (prompt may be empty)
+# Parse: the just-created worktree absolute path + CC_WT_PROMPT value, TAB-separated.
+# CONTRACT: non-empty stdout == dispatch. Every "do not dispatch" case prints nothing; the one case
+# that deserves a breadcrumb (target not pinnable) says so on stderr, captured here into $diag —
+# a temp file, or /dev/null when none can be made (the breadcrumb is best effort, never noise).
+diagf="$(mktemp "${TMPDIR:-/tmp}/cc-hooks-wt.XXXXXX" 2>/dev/null || true)"
+[ -n "$diagf" ] && [ -w "$diagf" ] || diagf=/dev/null
 line="$(
-  CC_HOOK_INPUT="$input" python3 - <<'PY' 2>/dev/null || true
+  CC_HOOK_INPUT="$input" python3 - <<'PY' 2>"$diagf" || true
 import json, os, sys, subprocess, time, shlex, re
 try:
     d = json.loads(os.environ.get("CC_HOOK_INPUT", ""))   # passed via env: the heredoc occupies stdin, so json.load(stdin) is not usable
@@ -86,21 +102,38 @@ for i in range(len(toks) - 1):
 if wi < 0:
     sys.exit(0)
 
-# (B) Cross-repo: take the nearest `-C <dir>` before "worktree" as the repo.
-# If the parsed dir is invalid (e.g. -C $VAR not expanded by the shell), fall back to cwd — combined with the mtime fallback below it still works.
-repo = None
+# (1) INTENT. Extract the CC_WT_PROMPT / CC_WT_PERMISSION_MODE values from the command (quote-aware).
+# The env-prefix form only sets them inside the Bash tool shell — this hook is a separate process and would
+# never see them — so they are read out of the command TEXT, same as everything else here.
+# No prompt means no first instruction, which means the tab would only sit there idle: skip, silently.
+# (No apostrophes in this heredoc: bash 3.2 mis-parses a single quote inside a heredoc nested in $( ).)
+prompt = ""
+mode = ""
+for tok in toks:
+    if tok.startswith("CC_WT_PROMPT="):
+        prompt = tok[len("CC_WT_PROMPT="):]
+    elif tok.startswith("CC_WT_PERMISSION_MODE="):
+        mode = tok[len("CC_WT_PERMISSION_MODE="):].strip()
+if not prompt.strip():
+    sys.exit(0)
+
+# (2) TARGET, repo half. Cross-repo: take the nearest `-C <dir>` before "worktree" as the repo.
+# With no -C the hook cwd IS the repo the command ran in — a fact, not a guess. An explicit -C we cannot
+# resolve (an unexpanded $VAR) leaves the repo UNKNOWN: falling back to cwd there would resolve the target
+# against a repo the command never named, which is the same class of mistake as the old mtime pick.
+cdir = None
 for i in range(wi):
     if toks[i] == "-C" and i + 1 < wi:
-        repo = toks[i + 1]
-if repo:
-    if not os.path.isabs(repo):
-        repo = os.path.join(cwd, repo)
-    if not os.path.isdir(repo):
-        repo = None
-if not repo:
+        cdir = toks[i + 1]
+repo = None
+if cdir is None:
     repo = cwd
+else:
+    r = cdir if os.path.isabs(cdir) else os.path.join(cwd, cdir)
+    if os.path.isdir(r):
+        repo = r
 
-# (A) Parse the add target path directly: first "bare positional" after add (skip value-taking options and command separators)
+# (2) TARGET, path half: first "bare positional" after add (skip value-taking options and command separators)
 opts_with_val = {"-b", "-B", "--reason"}
 path_arg = None
 j = wi + 2
@@ -114,51 +147,60 @@ while j < len(toks):
         j += 1; continue
     path_arg = t
     break
-
-# List worktrees in the correct repo
-try:
-    out = subprocess.check_output(
-        ["git", "-C", repo, "worktree", "list", "--porcelain"],
-        text=True, stderr=subprocess.DEVNULL,
-    )
-except Exception:
-    sys.exit(0)
-listed = [l[len("worktree "):] for l in out.splitlines() if l.startswith("worktree ")]
-linked = [p for p in listed[1:] if os.path.isdir(p)]   # first entry is the main worktree
-if not linked:
-    sys.exit(0)
-
-# (A) Prefer an exact match on the parsed path (relative paths resolved against the repo dir); fall back to most-recent mtime (covers $VAR etc.)
-chosen = None
+cand = None
 if path_arg:
-    cand = path_arg if os.path.isabs(path_arg) else os.path.join(repo, path_arg)
-    cand = os.path.realpath(cand)
-    for p in linked:
-        if os.path.realpath(p) == cand:
+    if os.path.isabs(path_arg):
+        cand = os.path.realpath(path_arg)
+    elif repo:
+        cand = os.path.realpath(os.path.join(repo, path_arg))
+
+# Where to list worktrees from: the repo, plus the target itself when it is an absolute path that exists —
+# a linked worktree names its own repo, so an unresolvable -C alone does not cost us that case.
+anchors = []
+if repo:
+    anchors.append(repo)
+if cand and os.path.isdir(cand) and cand not in anchors:
+    anchors.append(cand)
+
+# (3) VERIFY. The parsed path must BE one of that repo linked worktrees: PostToolUse fires for a FAILED
+# `git worktree add` too, so a directory existing on disk proves nothing. No match, no dispatch — there is
+# deliberately no "most recent mtime" fallback any more.
+chosen = None
+for a in anchors:
+    try:
+        out = subprocess.check_output(
+            ["git", "-C", a, "worktree", "list", "--porcelain"],
+            text=True, stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        continue
+    listed = [l[len("worktree "):] for l in out.splitlines() if l.startswith("worktree ")]
+    for p in listed[1:]:                                   # first entry is the main worktree
+        if cand and os.path.isdir(p) and os.path.realpath(p) == cand:
             chosen = p
             break
+    if chosen is not None:
+        break
+
 if chosen is None:
-    chosen = max(linked, key=lambda p: os.stat(p).st_mtime)
+    # The caller MEANT to dispatch (there is a prompt) and gets nothing: hand the shell the pieces of a
+    # cc-failures.log line. Marker + TAB-separated fields, ASCII only — the shell formats and writes it.
+    sys.stderr.write("CCWT_UNRESOLVED\t" + (repo or cwd) + "\t" + (path_arg or ""))
+    sys.exit(0)
 
 # Only handle "just created" (within 120s), avoids opening on odd cases
 if time.time() - os.stat(chosen).st_mtime > 120:
     sys.exit(0)
 
-# Extract the CC_WT_PROMPT / CC_WT_PERMISSION_MODE values from the command (quote-aware); empty if absent.
-# The env-prefix form only sets them inside the Bash tool shell — this hook is a separate process and would
-# never see them — so they are read out of the command TEXT, same as everything else here.
-# (No apostrophes in this heredoc: bash 3.2 mis-parses a single quote inside a heredoc nested in $( ).)
-prompt = ""
-mode = ""
-for tok in toks:
-    if tok.startswith("CC_WT_PROMPT="):
-        prompt = tok[len("CC_WT_PROMPT="):]
-    elif tok.startswith("CC_WT_PERMISSION_MODE="):
-        mode = tok[len("CC_WT_PERMISSION_MODE="):].strip()
 # mode goes in the middle: the prompt is free text and may itself contain tabs, so it must stay last
 sys.stdout.write(chosen + "\t" + mode + "\t" + prompt)
 PY
 )"
+diag=""
+if [ "$diagf" != /dev/null ]; then
+  diag="$(cat "$diagf" 2>/dev/null || true)"
+  rm -f "$diagf" 2>/dev/null || true
+fi
 
 # Split path / permission-mode / prompt (python always writes two TABs; prompt is everything after the second)
 newpath="${line%%$'\t'*}"
@@ -169,7 +211,24 @@ if [ "$rest" = "${rest#*$'\t'}" ]; then
 else
   mode="${rest%%$'\t'*}"; prompt="${rest#*$'\t'}"
 fi
-[ -n "$newpath" ] || exit 0
+
+# No dispatch. Two reasons, only one of them worth recording:
+#   * no CC_WT_PROMPT / not a `worktree add` at all → the normal case, stay completely silent;
+#   * the target could not be pinned → the caller wanted a sub-task and got none, so leave the same
+#     one-line breadcrumb every other dispatch failure leaves (gwt-status surfaces the last ones).
+if [ -z "$newpath" ]; then
+  case "$diag" in
+    *CCWT_UNRESOLVED*)
+      d_rest="${diag#*CCWT_UNRESOLVED$'\t'}"
+      d_loc="${d_rest%%$'\t'*}"
+      d_arg="${d_rest#*$'\t'}"; [ "$d_arg" = "$d_rest" ] && d_arg=""
+      [ -n "$d_arg" ] || d_arg="(none)"
+      { echo "[$(date '+%F %T')] $d_loc — worktree path unresolved (add target: $d_arg), no tab opened; dispatch it by hand: gwt-claude <name> \"<prompt>\"" \
+          >> "${CC_SEND_FAILLOG:-$HOME/.config/cc-stack/cc-failures.log}"; } 2>/dev/null || true
+      ;;
+  esac
+  exit 0
+fi
 
 # Per-dispatch permission mode: CC_WT_PERMISSION_MODE=plan on the command line pins THIS sub-task to
 # plan-first (default is auto). cc-dispatch.sh surface whitelists the value.

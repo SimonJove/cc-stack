@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # cc-stack · smoke test (pure logic, no real cmux tab needed). Guards the regressions we've hit:
-#   hook parsing (A path / B cross-repo / $VAR fallback / non-add-doesn't-trigger / CC_WT_PROMPT), tasks-log, prune/drop, trust add/remove,
+#   hook parsing (A path / B cross-repo / unresolvable-target-doesn't-dispatch / non-add-doesn't-trigger / CC_WT_PROMPT), tasks-log, prune/drop, trust add/remove,
 #   status-hook (agent-state sidecar writes, Notification classification, gwt-status rendering, install registration).
 # Usage: bash ~/.config/cc-stack/test.sh
 set -u
@@ -92,13 +92,17 @@ echo "== 1. hook parser =="
 # extract the worktree python (the ONLY <<'PY' heredoc in cc-hooks.sh)
 awk "/<<'PY'/{f=1;next} /^PY\$/{f=0} f" "$CC/cc-hooks.sh" > /tmp/cctest-ep.py
 run(){ CC_HOOK_INPUT="$1" python3 /tmp/cctest-ep.py 2>/dev/null; }
+rer(){ CC_HOOK_INPUT="$1" python3 /tmp/cctest-ep.py 2>&1 >/dev/null; }   # the no-dispatch REASON (stderr only)
 pay(){ python3 -c "import json,sys;print(json.dumps({'tool_name':'Bash','cwd':sys.argv[1],'tool_input':{'command':sys.argv[2]}}))" "$1" "$2"; }
 R1=$(mktemp -d); ( cd "$R1"; git init -q; git config user.email t@t; git config user.name t; git commit -q --allow-empty -m i
   git worktree add -q wtC -b feat/C >/dev/null; git worktree add -q wtD -b feat/D >/dev/null )
-touch "$R1/wtD/x"; touch "$R1/wtD"
+touch "$R1/wtD/x"; touch "$R1/wtD"       # wtD is the NEWEST linked worktree — what the deleted mtime guess used to pick
 C="$(cd "$R1/wtC" && pwd -P)"
-eq "A parsed-path beats mtime" "$(run "$(pay "$R1" 'git worktree add wtC -b feat/C')" | cut -f1)" "$C"
-eq "A -b before path"          "$(run "$(pay "$R1" 'git worktree add -b feat/C wtC')" | cut -f1)" "$C"
+# Dispatch now requires an initial prompt (§27 owns that gate), so every path fixture here carries one.
+P="CC_WT_PROMPT='doX' "
+eq "A parsed path (relative)"  "$(run "$(pay "$R1" "${P}git worktree add wtC -b feat/C")" | cut -f1)" "$C"
+eq "A -b before path"          "$(run "$(pay "$R1" "${P}git worktree add -b feat/C wtC")" | cut -f1)" "$C"
+eq "A absolute path"           "$(run "$(pay "$R1" "${P}git worktree add $R1/wtC -b feat/C")" | cut -f1)" "$C"
 eq "CC_WT_PROMPT extraction"   "$(run "$(pay "$R1" "CC_WT_PROMPT='doX' git worktree add wtC")" | cut -f3)" "doX"
 eq "CC_WT_PERMISSION_MODE extraction" "$(run "$(pay "$R1" "CC_WT_PERMISSION_MODE=plan CC_WT_PROMPT='doX' git worktree add wtC")" | cut -f2)" "plan"
 # anti-double-tab skip must test only the REAL command: a brief that merely MENTIONS a script name
@@ -108,12 +112,24 @@ eq "brief naming scripts dispatches" "$(run "$(pay "$R1" "CC_WT_PROMPT='read cc-
 eq "dispatcher command skipped"     "$(run "$(pay "$R1" "CC_WT_PROMPT='seed corpus' cc-dispatch.sh wt-claude wtC && git worktree add wtC -b feat/C")" | cut -f1)" ""
 R2=$(mktemp -d); ( cd "$R2"; git init -q; git config user.email t@t; git config user.name t; git commit -q --allow-empty -m i; git worktree add -q wtX -b feat/X >/dev/null )
 X="$(cd "$R2/wtX" && pwd -P)"
-eq "B cross-repo -C"           "$(run "$(pay "$R1" "git -C $R2 worktree add wtX")" | cut -f1)" "$X"
-eq "non-add (list) no trigger"   "$(run "$(pay "$R1" 'git worktree list')")" ""
-eq "non-add (remove) no trigger" "$(run "$(pay "$R1" 'git worktree remove wtC')")" ""
-# $VAR fallback: invalid repo falls back to cwd, unmatched path falls back to mtime (newest = wtD, which we touched)
+eq "B cross-repo -C"           "$(run "$(pay "$R1" "${P}git -C $R2 worktree add wtX")" | cut -f1)" "$X"
+# an unresolvable -C does not cost us an ABSOLUTE target: a linked worktree names its own repo
+eq "B unresolvable -C, abs path" "$(run "$(pay "$R1" "${P}"'git -C $root worktree add '"$R1/wtC")" | cut -f1)" "$C"
+eq "non-add (list) no trigger"   "$(run "$(pay "$R1" "${P}git worktree list")")" ""
+eq "non-add (remove) no trigger" "$(run "$(pay "$R1" "${P}git worktree remove wtC")")" ""
+# WAS "$VAR fallback (to mtime)": an unpinnable target used to fall back to the newest worktree, which
+# is how a tab got opened on an unrelated dir (2026-08-16: a second claude inside a working sub-task).
+# Now it dispatches NOTHING and says why on stderr — the shell turns that into the cc-failures.log line (§27).
 D="$(cd "$R1/wtD" && pwd -P)"
-eq "\$VAR fallback (to mtime)"  "$(run "$(pay "$R1" 'git -C $root worktree add $root/wtNope')" | cut -f1)" "$D"
+UN1="$(pay "$R1" "${P}"'git -C $root worktree add $root/wtNope')"
+eq "unpinnable target: no dispatch" "$(run "$UN1")" ""
+eq "…not even the newest worktree"  "$(run "$UN1" | grep -cF "$D")" "0"
+eq "unpinnable target: reason out"  "$(rer "$UN1" | cut -f1)" "CCWT_UNRESOLVED"
+eq "reason carries the add target"  "$(rer "$UN1" | cut -f3)" '$root/wtNope'
+# a target that parses but is NOT a linked worktree (the add failed / plain dir) is unpinnable too —
+# PostToolUse fires whether the command succeeded or not
+mkdir -p "$R1/plain"
+eq "non-worktree target: no dispatch" "$(run "$(pay "$R1" "${P}git worktree add plain -b feat/P")")" ""
 rm -rf "$R1" "$R2" /tmp/cctest-ep.py
 
 echo "== 2. cc-board.sh log (task registration) =="
@@ -503,6 +519,74 @@ eq "set-parent writes config" "$(git -C "$MR" config branch.feat/A1.ccMergeInto)
 eq "get-parent returns it"    "$("$CC/cc-merge.sh" get-parent "$MR" feat/A1)" "feat/A"
 eq "get-parent falls back to trunk" "$("$CC/cc-merge.sh" get-parent "$MR" feat/A)" "main"
 eq "get-parent of trunk is empty"   "$("$CC/cc-merge.sh" get-parent "$MR" main)" ""
+
+echo "== 27. hook dispatch decision: intent (CC_WT_PROMPT) + a pinnable target =="
+# 2026-08-16 tightening. The hook opens a tab ONLY when BOTH halves are unambiguous:
+#   intent — the command carries a non-empty CC_WT_PROMPT (no first instruction = an idle do-nothing
+#            tab, which is what bisect helpers / hand-made worktrees / test fixtures used to earn);
+#   target — the new worktree path is pinned to a real linked worktree (the "newest mtime" guess is
+#            gone; it once opened a second claude inside a dir a sub-task was already working in).
+# §1 pins the parser half; this section drives cc-hooks.sh END TO END, entirely on stubs: a fake HOME
+# whose cc-dispatch.sh only RECORDS its argv, so a dispatch decision can never reach a real surface,
+# plus a fake cmux that answers ping. The gate lives in the HOOK: cc-dispatch.sh surface is unchanged
+# and still opens an idle tab when called without a prompt (gwt-resume needs that — §17 guards it).
+H27=$(mktemp -d); B27=$(mktemp -d); R27=$(mktemp -d); OP27="$PATH"
+mkdir -p "$H27/.config/cc-stack"
+cat > "$H27/.config/cc-stack/cc-dispatch.sh" <<'D27'
+#!/usr/bin/env bash
+printf 'DISPATCH|%s|%s\n' "${CC_WT_PERMISSION_MODE:-}" "$*" >> "$CC_STUB_LOG"
+exit 0
+D27
+printf '#!/usr/bin/env bash\nexit 0\n' > "$B27/cmux"            # ping (and anything else) succeeds
+chmod +x "$H27/.config/cc-stack/cc-dispatch.sh" "$B27/cmux"
+( cd "$R27"; git init -q; git config user.email t@t; git config user.name t
+  git commit -q --allow-empty -m i; git worktree add -q wt27 -b feat/w27 >/dev/null )
+W27="$(cd "$R27/wt27" && pwd -P)"
+LG27="$H27/argv"; FL27="$H27/.config/cc-stack/cc-failures.log"
+# hook runner: fake HOME + fake cmux, stdout and stderr together (HARD RULES: prints nothing, exits 0)
+h27(){ local o rc
+  o="$(printf '%s' "$1" | env HOME="$H27" PATH="$B27:$OP27" CC_STUB_LOG="$LG27" \
+        ${3:+CC_SEND_FAILLOG="$3"} bash "$CC/cc-hooks.sh" worktree 2>&1)"; rc=$?
+  eq "$2 silent" "$o" ""; eq "$2 exit0" "$rc" "0"
+}
+dis27(){ grep -c '^DISPATCH|' "$LG27" 2>/dev/null || true; }
+res27(){ : > "$LG27"; rm -f "$FL27" "$H27/alt.log"; }
+# (a) both halves present → exactly one dispatch, carrying dir + prompt + the permission mode, no breadcrumb
+res27
+h27 "$(pay "$R27" "CC_WT_PERMISSION_MODE=plan CC_WT_PROMPT='do 27' git worktree add wt27 -b feat/w27")" "dispatch"
+eq "prompt+target → one dispatch"   "$(dis27)" "1"
+eq "dispatch carries dir + prompt"  "$(grep -cF "|surface $W27 do 27" "$LG27")" "1"
+eq "permission mode exported"       "$(awk -F'|' 'NR==1{print $2}' "$LG27")" "plan"
+eq "a dispatch leaves no crumb"     "$([ -e "$FL27" ] && echo some || echo none)" "none"
+# (b) no intent → no tab, and NO breadcrumb: skipping is the normal case here, not a failure
+res27
+h27 "$(pay "$R27" 'git worktree add wt27 -b feat/w27')" "no CC_WT_PROMPT"
+eq "no prompt → no dispatch"        "$(dis27)" "0"
+eq "no prompt → no crumb"           "$([ -e "$FL27" ] && echo some || echo none)" "none"
+res27
+h27 "$(pay "$R27" "CC_WT_PROMPT='' git worktree add wt27")" "empty CC_WT_PROMPT"
+eq "empty prompt → no dispatch"     "$(dis27)" "0"
+res27
+h27 "$(pay "$R27" "CC_WT_PROMPT='   ' git worktree add wt27")" "blank CC_WT_PROMPT"
+eq "blank prompt → no dispatch"     "$(dis27)" "0"
+eq "blank prompt → no crumb"        "$([ -e "$FL27" ] && echo some || echo none)" "none"
+# (c) intent without a pinnable target → no tab, ONE breadcrumb (a dispatch that was meant to happen
+# and did not must stay visible; cc-board.sh reads the last 24h of this file)
+res27
+h27 "$(pay "$R27" "CC_WT_PROMPT='do 27' "'git -C $root worktree add $root/wtNope')" "unpinnable target"
+eq "unpinnable → no dispatch"       "$(dis27)" "0"
+eq "unpinnable → one crumb line"    "$(wc -l < "$FL27" | tr -d ' ')" "1"
+eq "crumb says path unresolved"     "$(grep -c 'worktree path unresolved' "$FL27")" "1"
+eq "crumb names the add target"     "$(grep -cF 'add target: $root/wtNope' "$FL27")" "1"
+eq "crumb hints the manual form"    "$(grep -c 'gwt-claude <name>' "$FL27")" "1"
+# the board filters by a leading [timestamp] and renders "<locator> — <what>": pin that shape
+eq "crumb in board format"          "$(grep -cE '^\[[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}\] .+ — ' "$FL27")" "1"
+# and the crumb path is overridable exactly like every other dispatch breadcrumb (tests, sandboxes)
+res27
+h27 "$(pay "$R27" "CC_WT_PROMPT='do 27' "'git -C $root worktree add $root/wtNope')" "crumb override" "$H27/alt.log"
+eq "CC_SEND_FAILLOG takes the crumb" "$(wc -l < "$H27/alt.log" | tr -d ' ')" "1"
+eq "default crumb path untouched"    "$([ -e "$FL27" ] && echo some || echo none)" "none"
+rm -rf "$H27" "$B27" "$R27"
 
 echo "== 5. cc-merge done/is-done =="
 "$CC/cc-merge.sh" done "$MR" feat/A1

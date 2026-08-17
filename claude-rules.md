@@ -8,7 +8,7 @@ When I ask to "open/create/start a worktree", "spin off a sub-task", "do X in pa
 CC_WT_PROMPT='<full first instruction; multi-line ok, delivered verbatim>' git worktree add .claude/worktrees/<name> -b feat/<name>
 ```
 
-The PostToolUse hook in `~/.config/cc-stack` then opens a new tab in the current cmux workspace, starts a ccteam claude there, sends CC_WT_PROMPT verbatim as its first message, and gives it a backchannel to report back to you. You stay put and keep working — you are not occupied. Without CC_WT_PROMPT the tab opens with an idle ccteam.
+The PostToolUse hook in `~/.config/cc-stack` then opens a new tab in the current cmux workspace, starts a ccteam claude there, sends CC_WT_PROMPT verbatim as its first message, and gives it a backchannel to report back to you. You stay put and keep working — you are not occupied. CC_WT_PROMPT is what makes it a dispatch: without it the hook opens **no tab at all** (silently — a plain `git worktree add` stays a plain worktree).
 
 - Project has the `worktree-subtask` skill / `.claude/worktree-context.md` → load the skill first and dispatch with `gwt-claude <slug> "<prompt>" --base <base>` (records the merge target, forces an explicit base); the bare form above is the fallback for projects without it.
 - Never dispatch while the primary checkout sits on the trunk (`main`/`master`): create a campaign branch first (confirm the name with me) and make it every child's base and merge target — otherwise merges drip onto the trunk one at a time, and a trunk branch-guard hook can block the parent session for the rest of the campaign.

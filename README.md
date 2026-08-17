@@ -265,7 +265,7 @@ Every sub-task still launches in **team mode** (`cmux claude-teams`) regardless 
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `CC_WT_PROMPT` | (none) | The **first message** for the sub-task when creating a worktree; multi-line supported. Without it, an idle ccteam starts. |
+| `CC_WT_PROMPT` | (none) | The **first message** for the sub-task when creating a worktree; multi-line supported. **It is what turns a `git worktree add` into a dispatch**: without it the hook opens no tab at all and skips silently (`gwt-claude` / `gwt-resume` still open tabs on their own). |
 | `CC_WT_PERMISSION_MODE` | `auto` | The sub-task claude's `--permission-mode`. Set `plan` for the plan-first approval gate. Also accepted as a **prefix token on the `git worktree add` line** (the hook parses it out of the command text, like `CC_WT_PROMPT` — an env prefix alone never reaches the hook process). Whitelist: `plan` `auto` `acceptEdits` `bypassPermissions` `manual` `dontAsk`; anything else falls back to `auto`. |
 | `CC_WT_PRETRUST` | `1` | Whether to pre-trust the worktree dir (skip the trust prompt). Set `0` to disable (falls back to screen-scrape confirmation). |
 | `CC_WT_COPY` | `.env .env.local .claude/settings.local.json` | Files copied from the main repo into a new worktree (space-separated, no spaces in paths). |
@@ -288,7 +288,10 @@ Every sub-task still launches in **team mode** (`cmux claude-teams`) regardless 
 Main Claude: "open a worktree"
   │  (Bash: CC_WT_PROMPT=... git worktree add ...)
   ▼
-cc-hooks.sh worktree            PostToolUse(Bash) hook: parse the command for the new worktree path (cross-repo -C aware; $VAR falls back to mtime)
+cc-hooks.sh worktree            PostToolUse(Bash) hook: dispatch only when intent AND target are unambiguous —
+  │                             a non-empty CC_WT_PROMPT, and a path parsed out of the command (cross-repo -C aware)
+  │                             that pins to a real linked worktree. No prompt → silent skip; unpinnable path (an
+  │                             unexpanded $VAR) → no tab + one cc-failures.log line, never a guess at another dir.
   │                             Only triggers on a real `git worktree add`; list/remove/EnterWorktree do not.
   ▼
 cc-dispatch.sh surface  ◀────── single source of truth ──────  cc-dispatch.sh wt-claude (gwt-claude: builds worktree then exec-delegates)
