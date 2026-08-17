@@ -47,7 +47,12 @@
 
 ## hook 防双开过滤的非规范引号角落(cc-hooks.sh worktree)
 
-**现象:** `CC_WT_PROMPT` 若不用文档规定的单引号形式(例如双引号包裹、或 `'\''` 内嵌撇号),且 payload 文本里恰好字面点名 `cc-dispatch.sh` 或两个 legacy 脚本名,该次派发会被 SKIP(无 tab,但失败可见:cc-failures.log 有记录)。
+**现象:** `CC_WT_PROMPT` 若不用文档规定的单引号形式(例如双引号包裹、或 `'\''` 内嵌撇号),且 payload 文本里恰好字面点名 `cc-dispatch.sh` 或两个 legacy 脚本名,该次派发会被 SKIP —— **无 tab,且无任何记录**。
+
+> **订正(2026-08-16 实证)**:原文这里写的是"失败可见:cc-failures.log 有记录",**与实现不符**。
+> 防双开这一跳走的是裸 `sys.exit(0)`,从来不写面包屑(改动前后都是)——否则每次 `gwt-claude`
+> 都会刷日志。实测:双引号形式 + payload 点名 dispatcher → stdout 空、stderr 空。
+> 所以这个角落的真实性质是**静默**,比原文描述的更难排查(症状只有"该开的 tab 没开")。
 
 **界定:** 规范单引号形式完全不受影响(剥离按 `CC_WT_PROMPT='…'` span 做);该角落是剥离方式的固有边界,方向为净收紧(基线对新名字本来就是 DISPATCH),触发需要同时违反引号约定并在 payload 里点名 dispatcher,概率极低。
 
@@ -280,3 +285,86 @@ commit 门卫的挂载、`_cc_gitroot`)从安装目录出发都会**静默指向
 
 **处置**:`find` 加 `! -name '.git'`;挂载侧另加一道守卫——目标目录解析出的 git dir 若不把它
 列为该仓库的 worktree(散落/被复制的 `.git` 指针),**拒绝挂载**。
+
+## hook 派发闸门:两条静默跳过 + 一条面包屑(2026-08-16,feat/hook-notab)
+
+PostToolUse 的 worktree hook 现在**只在"意图明确 + 目标无歧义"时才派发**。三种终局:
+
+| 情形 | 行为 |
+|---|---|
+| 无 `CC_WT_PROMPT` | **不开 tab,静默**(常态,不是故障,不写记录) |
+| 路径 pin 不出该仓库的 linked worktree | **不开 tab**,写一行 `cc-failures.log`(板子会显示),点名 add target 并提示改用 `gwt-claude` |
+| 意图明确 + 路径精确 | 正常派发 |
+
+**为什么删掉 mtime 兜底**:旧实现解析不出路径时会挑"该仓库 mtime 最新的 linked worktree"顶替。
+两个实测后果:(a) bisect 辅助 / 手工建 worktree / 测试 fixture 各白得一个什么都不做的 idle tab
+(其中一个的目录当时已经不存在);(b) **更严重**——一个正在跑测试套件的子任务(fixture 里满是
+变量指路的 `git worktree add`),被兜底挑中了**它自己的 worktree**,于是在一个已经有 claude 在
+工作的目录里又起了一个 claude。
+
+**最隐蔽的一面:mtime 兜底会污染 merge target。** 兜底选中目录后,`cc-dispatch.sh surface` 的
+capture 分支跟着跑,`CC_CALLER_CWD` 是子任务自己的 cwd,于是把
+`branch.<b>.ccMergeInto` 写成了**分支自己**。后果链全程静默:`gwt-merge` 读到"目标=自己" →
+`do-merge` 返回 `skipped: already merged` **rc 0** → `gwt-merge` 当作成功、把板行归档 ——
+**这条线从板子上消失,却一行代码都没落地**。2026-08-16 实际发生过一次,靠人工核对 campaign
+的 tip 才发现。
+
+**已知残留(未修)**:目标已 pin 但 mtime > 120s(add 失败 / 目录早已存在)仍是静默跳过、无面包屑;
+面包屑只在 cmux 可达时才可能写(hook 在 `cmux ping` 之后才解析),远程 SSH 下整个 hook 是 no-op、
+不留任何记录。
+
+## commit 门卫在 `core.hooksPath` 仓库上完全不生效(能力边界,非缺陷)
+
+`hooks/git-pre-commit.sh` 挂进 `.git/hooks/`。但仓库若设了 `core.hooksPath`,git **完全忽略**
+`.git/hooks/`,门卫无处可挂,`cc-dispatch.sh commit-gate mount` 会**响亮拒绝**。
+
+**为什么不能强挂**(2026-08-16 对一个真实下游仓库实测,`core.hooksPath = .githooks`):
+1. 那个目录是**被版本控制的项目内容**(`commit-msg` / `pre-commit` / `pre-push` / `lib/*.sh` 全部 tracked)
+   —— 往里写等于改项目源码,会出现在 diff 里、可能被提交进去;
+2. **相对 `core.hooksPath` 按每个工作树各自解析**(实测:在 worktree 自己的 `.githooks/` 放不同钩子,
+   提交时跑的是 worktree 那份)—— 所以就算写进主 checkout 也**根本管不到 worktree**。
+
+**后果(要正视)**:**越是有自己钩子纪律的项目,越拿不到 commit 门卫。** 那里的
+`.commit-authorized` 令牌机制没有任何机械强制,只剩规则约束。
+唯一止损是在派发简报里明说"没有文件挡着不代表可以提交"。
+
+理论上的出路:`git config --worktree core.hooksPath`(需先开 `extensions.worktreeConfig`)
+能按 worktree 挂而不动项目配置 —— 会改下游仓库的 git 配置,**未采纳**,记录备查。
+
+## gwt-* 里 9 个动词没有任意 shell 入口(存量)
+
+`gwt-*` 是 zsh 函数,子任务的非交互 shell 里不存在。已有任意 shell 入口的只有 5 个,
+而且**每一个都是事故之后补的**:
+
+| 有入口 | 无入口(zsh only) |
+|---|---|
+| `gwt-status` / `gwt-log` → `cc-board.sh` | `gwt-merge` `gwt-collect` `gwt-tree` |
+| `gwt-resume` / `gwt-tabs` → `cc-dispatch.sh` | **`gwt-rm`** `gwt-new` `gwt-adopt` |
+| `gwt-done` → 独立脚本(2026-08-16 事故后补) | `gwt-prune` `gwt-clean` `gwt-provider` |
+
+**整个"清理 + 合并"家族都在无入口那一列。** 2026-08-16 现场:一个 agent 跑 `gwt-rm` 得到
+`_gwt_wt_path: command not found`(部分加载的 shell),改用 `cc-dispatch.sh close <dir>` 才走通。
+
+**注意 `close` 不是 `gwt-rm` 的替代品**:它只关 tab;`gwt-rm` 还要删 worktree、清板行、
+清 sidecar、清 pre-trust、可选删分支。用 close 顶替会漏掉后面几步。
+
+**排查提示**:纯 bash `source worktree.zsh` 会在第 20 行 `${${(%):-%x}:A:h}` 直接 bad substitution
+退出,**一个函数都不定义**(所以症状是 `gwt-rm: command not found`);
+"`gwt-rm` 在但 `_gwt_wt_path` 不在"是另一种部分加载态。
+
+## gwt-merge 不拒绝"目标 == 自身"(存量,未修)
+
+`branch.<b>.ccMergeInto` 若被写成分支自己(见上文 mtime 兜底那条),`gwt-merge` 会照常走完
+preflight 四项全绿、询问确认,然后 `do-merge` 把分支合进自己、返回
+`skipped: already merged` **rc 0**,`gwt-merge` 据此判定成功并**归档板行**。
+一次空操作被完整包装成一次成功的落地。
+
+`skipped` 返回 0 本身是对的(幂等),问题在于**没有一条 `target == child` 的前置守卫**。
+建议在 `gwt-merge` 的目标解析之后加一行拒绝。
+
+## gwt-tree 的 tab 存活标记仍是单 workspace(跨 workspace 问题的第五面,未修)
+
+`worktree.zsh` 的 `gwt-tree` 自己调 `cmux list-pane-surfaces` 判 `✔live`/`⌫closed`,
+**没有走** 2026-08-16 修好的跨 workspace 并集(`_cctabs_livemap`)。
+所以别的 workspace 里活着的子任务,在 `gwt-tree` 上仍会显示成 `⌫closed`。
+`cc-board.sh` / `cc-dispatch.sh`(prune / close / resume)四面都已修,只剩这一面。
