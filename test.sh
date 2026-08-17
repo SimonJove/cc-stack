@@ -327,6 +327,158 @@ SWA="$( ( cd "$BRD" && zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; gwt-st
 eq "wrapper forwards --all"          "$(echo "$SWA" | grep -c 'wrap other')" "1"
 rm -rf "$BRD" "$OTH" "$NORD"; rm -f "$CC_TASKS_FILE" "$CC_STATUS_FILE" "$CC_ARCHIVE_FILE" "$TF" "$SF" "$AF" "$DF"; cc_sandbox_ledgers
 
+echo "== 20. TSV empty-field integrity + worktree lifecycle guards =="
+# F1 (P0, 2026-08-16 audit): TAB is IFS *whitespace*, so `while IFS=$'\t' read -r a b c …`
+# collapses RUNS of it — one empty field shifts every later field left. A rewriter that then
+# re-printf's those shifted variables writes the corruption BACK to disk (prune-on-read,
+# _gwt_tasks_rewrite, _gwt_archive_branch, gwt-prune all did). Consequences on a shifted row:
+# gwt-resume can't find uuid= in the 8th field and degrades the tab to idle; `cc-dispatch.sh
+# close` can't find csuuid/suuid and fail-closed refuses to close it. Every read of the two
+# TSVs goes through awk -F'\t' now, and every rewrite re-emits $0 verbatim.
+cn(){ CDPATH= cd -- "$1" >/dev/null 2>&1 && pwd -P; }
+TT=$(mktemp -u); TS=$(mktemp -u); TA=$(mktemp -u)
+export CC_TASKS_FILE="$TT" CC_STATUS_FILE="$TS" CC_ARCHIVE_FILE="$TA"
+LA='uuid=11111111-2222-3333-4444-555555555555:provider=kimi:pm=plan:csuuid=AAAA-BBBB:suuid=CCCC-DDDD'
+E1="$(cn "$(mktemp -d)")"   # 7th field (parent) EMPTY — what a detached-HEAD dispatch writes
+E2="$(cn "$(mktemp -d)")"   # 5th field (caller) EMPTY
+E3="$(cn "$(mktemp -d)")"   # complete 8-field row (the drop target)
+E4="$(cn "$(mktemp -d)")"   # pre-feature 7-field row (backward compat)
+now20=$(date +%s)
+mkrows(){   # regenerate the fixture — every rewrite path is exercised from a clean file
+  printf '2026-01-01 00:00:01\tfeat/E1\tsurface:51\t%s\tsurface:9\tdo E1\t\t%s\n'      "$E1" "$LA" >  "$TT"
+  printf '2026-01-01 00:00:02\tfeat/E2\tsurface:52\t%s\t\tdo E2\tfeat/par\t%s\n'       "$E2" "$LA" >> "$TT"
+  printf '2026-01-01 00:00:03\tfeat/E3\tsurface:53\t%s\tsurface:9\tdo E3\tmain\t%s\n'  "$E3" "$LA" >> "$TT"
+  printf '2026-01-01 00:00:04\tfeat/E4\tsurface:54\t%s\tsurface:1\told 7-field row\tmain\n' "$E4" >> "$TT"
+}
+shape(){ awk -F'\t' -v d="$2" '$4==d{printf "%s|%s|%s|%s|%s\n", NF, $5, $6, $7, $8}' "$1" 2>/dev/null; }
+S_E1="8|surface:9|do E1||$LA"; S_E2="8||do E2|feat/par|$LA"; S_E4="7|surface:1|old 7-field row|main|"
+# (a) prune-on-read (cc-board.sh render) — the write-back that fossilizes the shift
+mkrows
+bash "$CC/cc-board.sh" --all >/dev/null 2>&1
+eq "prune keeps an empty PARENT row"    "$(shape "$TT" "$E1")" "$S_E1"
+eq "prune keeps an empty CALLER row"    "$(shape "$TT" "$E2")" "$S_E2"
+eq "prune keeps a 7-field legacy row"   "$(shape "$TT" "$E4")" "$S_E4"
+# (b) render: the board's own columns must not shift either
+BE="$(bash "$CC/cc-board.sh" --all 2>/dev/null)"
+eq "render PARENT with an empty caller" "$(echo "$BE" | awk -v d="$E2" '$5==d{print $3}')" "feat/par"
+eq "render TASK with an empty caller"   "$(echo "$BE" | awk -v d="$E2" '$5==d{$1=$2=$3=$4=$5="";sub(/^ +/,"");print}')" "do E2"
+eq "render PARENT '-' when unresolvable" "$(echo "$BE" | awk -v d="$E1" '$5==d{print $3}')" "-"
+# (c) _gwt_tasks_rewrite (the gwt-rm / gwt-prune path)
+mkrows
+zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; CC_TASKS_FILE='$TT' _gwt_tasks_drop_dir '$E3'" >/dev/null 2>&1
+eq "rewrite drops the target row"       "$(cat "$TT" 2>/dev/null | grep -c 'do E3')" "0"
+eq "rewrite keeps an empty PARENT row"  "$(shape "$TT" "$E1")" "$S_E1"
+eq "rewrite keeps an empty CALLER row"  "$(shape "$TT" "$E2")" "$S_E2"
+eq "rewrite keeps a 7-field legacy row" "$(shape "$TT" "$E4")" "$S_E4"
+# (d) gwt-prune: dead-dir sweep + newest-per-dir dedup, still verbatim
+mkrows
+{ printf '2026-01-01 00:00:00\tfeat/E2\tsurface:50\t%s\t\tolder E2 row\tfeat/par\t%s\n' "$E2" "$LA"; cat "$TT"; } > "$TT.x" && mv "$TT.x" "$TT"
+zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; cd '$E1'; CC_TASKS_FILE='$TT' CC_STATUS_FILE='$TS' gwt-prune" >/dev/null 2>&1
+eq "gwt-prune drops the older dup"      "$(cat "$TT" 2>/dev/null | grep -c 'older E2 row')" "0"
+eq "gwt-prune keeps an empty CALLER row" "$(shape "$TT" "$E2")" "$S_E2"
+eq "gwt-prune keeps a 7-field legacy row" "$(shape "$TT" "$E4")" "$S_E4"
+# (e) _gwt_archive_branch: merged-at is APPENDED, so 8-field rows → 9, 7-field rows → 8
+mkrows; : > "$TA"
+zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; CC_TASKS_FILE='$TT' CC_STATUS_FILE='$TS' CC_ARCHIVE_FILE='$TA' _gwt_archive_branch feat/E2" >/dev/null 2>&1
+zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; CC_TASKS_FILE='$TT' CC_STATUS_FILE='$TS' CC_ARCHIVE_FILE='$TA' _gwt_archive_branch feat/E4" >/dev/null 2>&1
+eq "archive keeps the empty CALLER"     "$(awk -F'\t' -v d="$E2" '$4==d{printf "%s|%s|%s|%s|%s\n", NF, $5, $6, $7, $8}' "$TA")" "9||do E2|feat/par|$LA"
+eq "archive merged-at is 9th on 8-field" "$(awk -F'\t' -v d="$E2" '$4==d{print ($9 ~ /^[0-9]+$/)?"ok":"no"}' "$TA")" "ok"
+eq "archive merged-at is 8th on 7-field" "$(awk -F'\t' -v d="$E4" '$4==d{print NF ":" (($8 ~ /^[0-9]+$/)?"ok":"no")}' "$TA")" "8:ok"
+# F7: the sidecar (worktree-status.tsv) is swept by the same "does this dir exist?" pass the
+# board already runs per row — before this only gwt-prune/gwt-rm touched it and it grew forever.
+SLIVE="$(cn "$(mktemp -d)")"; SDEAD="/tmp/cc-board-dead-$$"
+mkrows
+printf '%s\tworking\t%s\n' "$SLIVE" "$now20"  > "$TS"
+printf '%s\tidle\t%s\n'    "$SDEAD" "$now20" >> "$TS"
+bash "$CC/cc-board.sh" --all >/dev/null 2>&1
+eq "sidecar prune drops a dead dir"     "$(cat "$TS" 2>/dev/null | grep -c "$SDEAD")" "0"
+eq "sidecar prune keeps a live dir"     "$(cat "$TS" 2>/dev/null | grep -c "$SLIVE")" "1"
+printf '%s\tidle\t%s\n' "$SDEAD" "$now20" >> "$TS"
+printf '2026-01-01 00:00:05\tfeat/AR\tsurface:55\t%s\tsurface:1\tarch row\tmain\t%s\n' "$E1" "$LA" > "$TA"
+bash "$CC/cc-board.sh" --archive --all >/dev/null 2>&1
+eq "archive render spares the sidecar"  "$(cat "$TS" 2>/dev/null | grep -c "$SDEAD")" "1"
+printf '%s\tidle\t%s\n' "$SDEAD" "$now20" > "$TS"
+bash "$CC/cc-board.sh" --all >/dev/null 2>&1
+eq "all-dead sidecar file removed"      "$([ -f "$TS" ] && echo yes || echo no)" "no"
+# F2: a worktree whose dir was deleted from OUTSIDE must stay reclaimable. `git worktree remove`
+# returns 0 on a gone dir (it prunes the registration); the -d guard added for the partial-shell
+# incident bailed before ANY cleanup ran, stranding the registration, the board row, the sidecar
+# row and the branch. The guard now falls through to the git registration, never to a blind path.
+RMR=$(mktemp -d); RMR="$(cn "$RMR")"
+( cd "$RMR"; git init -q; git config user.email t@t; git config user.name t; git commit -q --allow-empty -m i; git branch -M main
+  mkdir -p .claude; git worktree add -q .claude/worktrees/stale -b feat/stale >/dev/null )
+STALEDIR="$RMR/.claude/worktrees/stale"
+rm -rf "$STALEDIR"                       # external rm -rf: the dir is gone, the registration is not
+printf '2026-01-01 00:00:06\tfeat/stale\tsurface:56\t%s\tsurface:1\tstale ghost row\tmain\t%s\n' "$STALEDIR" "$LA" > "$TT"
+printf '%s\tidle\t%s\n' "$STALEDIR" "$now20" > "$TS"
+RMO="$(zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; cd '$RMR'; CC_TASKS_FILE='$TT' CC_STATUS_FILE='$TS' gwt-rm stale --branch" 2>&1)"; rmrc=$?
+eq "gwt-rm reclaims a gone dir (rc 0)"  "$rmrc" "0"
+eq "gwt-rm prunes the registration"     "$(git -C "$RMR" worktree list --porcelain | grep -c 'worktrees/stale')" "0"
+eq "gwt-rm deletes the stale branch"    "$(git -C "$RMR" branch --list 'feat/stale' | wc -l | tr -d ' ')" "0"
+eq "gwt-rm drops the ghost board row"   "$(cat "$TT" 2>/dev/null | grep -c 'stale ghost row')" "0"
+eq "gwt-rm drops the ghost sidecar row" "$(cat "$TS" 2>/dev/null | grep -c 'worktrees/stale')" "0"
+NEV="$(zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; cd '$RMR'; CC_TASKS_FILE='$TT' CC_STATUS_FILE='$TS' gwt-rm neverwas" 2>&1)"; nevrc=$?
+eq "gwt-rm unknown name exit!=0"        "$([ "$nevrc" -ne 0 ] && echo y || echo n)" "y"
+eq "gwt-rm unknown name says which"     "$(echo "$NEV" | grep -c 'no worktree named')" "1"
+# F4: gwt-tree renders DOWN from the trunk, so a node whose merge target no longer exists (the
+# README's own `gwt-merge <parent>` → `gwt-rm <parent> --branch` sequence) silently vanished —
+# and the merge gate is exactly what gwt-tree is read for. Unreachable nodes get their own block.
+TR=$(mktemp -d); TR="$(cn "$TR")"
+( cd "$TR"; git init -q; git config user.email t@t; git config user.name t; git commit -q --allow-empty -m i; git branch -M main
+  mkdir -p .claude; git worktree add -q .claude/worktrees/o1 -b feat/o1 >/dev/null
+  git worktree add -q .claude/worktrees/o2 -b feat/o2 >/dev/null )
+gtree(){ ( cd "$TR" && CC_TASKS_FILE=/dev/null zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; gwt-tree" ) 2>/dev/null; }
+git -C "$TR" config branch.feat/o1.ccMergeInto feat/ghost      # parent deleted after its merge
+git -C "$TR" config branch.feat/o2.ccMergeInto main
+TO="$(gtree)"
+eq "tree still renders the trunk child" "$(echo "$TO" | grep -c 'feat/o2')" "1"
+eq "tree flags the orphan"              "$(echo "$TO" | grep -c 'orphaned')" "1"
+eq "orphan branch is listed"            "$(echo "$TO" | grep -c 'feat/o1')" "1"
+eq "orphan names its missing parent"    "$(echo "$TO" | grep 'feat/o1' | grep -c 'feat/ghost')" "1"
+git -C "$TR" config branch.feat/o1.ccMergeInto feat/o2         # a cycle: neither is reachable
+git -C "$TR" config branch.feat/o2.ccMergeInto feat/o1
+TC="$(gtree)"
+eq "cycle: trunk still printed"         "$(echo "$TC" | head -1)" "main"
+eq "cycle: both nodes surface"          "$(echo "$TC" | grep -c 'feat/o1\|feat/o2')" "2"
+eq "cycle: flagged as orphaned"         "$(echo "$TC" | grep -c 'orphaned')" "1"
+git -C "$TR" config branch.feat/o1.ccMergeInto main
+eq "healthy tree has no orphan block"   "$(gtree | grep -c 'orphaned')" "0"
+eq "healthy tree still nests"           "$(gtree | grep -c '├─\|└─')" "2"
+# F6: _gwt_dir fails for TWO reasons — the helper is missing (partially loaded shell) or the cwd
+# is not a repo. They used to share one message ("source worktree.zsh first") that sent people to
+# re-source their shell over a wrong cwd. Both still fail CLOSED (rc 1, nothing touched, §19b).
+NOREPO="$(cn "$(mktemp -d)")"
+wtp(){ ( cd "$1" && zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; ${2:-}_gwt_wt_path foo" ) 2>&1; }
+eq "_gwt_wt_path outside a repo blames cwd" "$(wtp "$NOREPO")" "✗ not inside a git repo"
+eq "_gwt_wt_path outside a repo prints no path" "$( ( cd "$NOREPO" && zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; _gwt_wt_path foo" ) 2>/dev/null )" ""
+eq "_gwt_wt_path partial shell blames shell" "$(wtp "$TR" 'unfunction _gwt_dir 2>/dev/null; ')" "✗ worktree helpers unavailable — source ~/.config/cc-stack/worktree.zsh first"
+eq "_gwt_wt_path partial (_gwt_root gone) blames shell" "$(wtp "$TR" 'unfunction _gwt_root 2>/dev/null; ')" "✗ worktree helpers unavailable — source ~/.config/cc-stack/worktree.zsh first"
+NRO="$( ( cd "$NOREPO" && zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; CC_TASKS_FILE='$TT' CC_STATUS_FILE='$TS' gwt-rm foo" ) 2>&1 )"; nrorc=$?
+eq "gwt-rm outside a repo exit!=0"      "$([ "$nrorc" -ne 0 ] && echo y || echo n)" "y"
+eq "gwt-rm outside a repo blames cwd"   "$(echo "$NRO" | grep -c 'not inside a git repo')" "1"
+eq "gwt-rm outside a repo touches nothing" "$(echo "$NRO" | grep -c 'removed\|deleted')" "0"
+# F13: the merge-target map is now read ONCE PER REPO instead of once per row, so it must never
+# leak across repos (two repos, same branch name, different targets) and must still fall back to
+# the per-row `git config` for a row that is not a registered worktree of any repo.
+P1=$(mktemp -d); P1="$(cn "$P1")"; P2=$(mktemp -d); P2="$(cn "$P2")"
+for P in "$P1" "$P2"; do
+  ( cd "$P"; git init -q; git config user.email t@t; git config user.name t; git commit -q --allow-empty -m i; git branch -M main
+    mkdir -p .claude; git worktree add -q .claude/worktrees/same -b feat/same >/dev/null )
+done
+git -C "$P1" config branch.feat/same.ccMergeInto main
+git -C "$P2" config branch.feat/same.ccMergeInto release
+git -C "$P1" config branch.feat/plain.ccMergeInto main
+mkdir -p "$P1/plaindir"                                   # inside repo 1, but not a worktree
+printf '2026-01-01 00:00:07\tfeat/same\tsurface:57\t%s\tsurface:1\tsame branch repo1\t\n' "$P1/.claude/worktrees/same" >  "$TT"
+printf '2026-01-01 00:00:08\tfeat/same\tsurface:58\t%s\tsurface:1\tsame branch repo2\t\n' "$P2/.claude/worktrees/same" >> "$TT"
+printf '2026-01-01 00:00:09\tfeat/plain\tsurface:59\t%s\tsurface:1\tplain dir row\t\n'    "$P1/plaindir"               >> "$TT"
+BM="$(bash "$CC/cc-board.sh" --all 2>/dev/null)"
+eq "per-repo merge target (repo 1)" "$(echo "$BM" | awk -v d="$P1/.claude/worktrees/same" '$5==d{print $3}')" "main"
+eq "per-repo merge target (repo 2)" "$(echo "$BM" | awk -v d="$P2/.claude/worktrees/same" '$5==d{print $3}')" "release"
+eq "non-worktree row uses git config" "$(echo "$BM" | awk -v d="$P1/plaindir" '$5==d{print $3}')" "main"
+rm -rf "$E1" "$E2" "$E3" "$E4" "$SLIVE" "$RMR" "$TR" "$NOREPO" "$P1" "$P2"
+rm -f "$TT" "$TS" "$TA"; cc_sandbox_ledgers   # back to the sandbox, NOT the live default (§24)
+
 echo "== 3. cc-trust add/remove (isolated json) =="
 TJ=$(mktemp); echo '{"projects":{}}' > "$TJ"
 TD=$(mktemp -d)

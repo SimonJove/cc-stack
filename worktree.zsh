@@ -36,8 +36,15 @@ _gwt_wt_path() {   # <name> → echoes <worktrees-dir>/<name>; FAIL-CLOSED when 
                    # continued with wtpath="/<name>" (fs ROOT!) and fed it to `git worktree remove`.
                    # Every path built from _gwt_dir must resolve through this guard.
   emulate -L zsh
-  local d
-  d="$(_gwt_dir 2>/dev/null)" || { echo "✗ worktree helpers unavailable — source ~/.config/cc-stack/worktree.zsh first" >&2; return 1; }
+  local d=""
+  # _gwt_dir has TWO failure modes and they used to share one message, so `gwt-rm foo` in a
+  # non-repo directory told people to re-source their shell config. Separate them — the cwd is
+  # what is usually wrong, and every other function in this file says "not inside a git repo".
+  # Both still fail CLOSED: rc 1, nothing echoed on stdout, no path handed to any caller.
+  if (( ! $+functions[_gwt_dir] )) || (( ! $+functions[_gwt_root] )); then
+    echo "✗ worktree helpers unavailable — source ~/.config/cc-stack/worktree.zsh first" >&2; return 1
+  fi
+  d="$(_gwt_dir 2>/dev/null)" || { echo "✗ not inside a git repo" >&2; return 1; }
   [[ -n "$d" ]] || { echo "✗ worktrees dir unresolvable (helper returned empty)" >&2; return 1; }
   echo "$d/$1"
 }
@@ -72,6 +79,33 @@ _gwt_bootstrap_wt() {
   [[ -n "$CC_WT_SHARE" ]] && ~/.config/cc-stack/cc-worktree-shared.sh seed "$root" "$wtpath" ${(s: :)CC_WT_SHARE}
 }
 
+# ── TSV access discipline (2026-08-16 audit, F1) ─────────────────────────────
+# NEVER `while IFS=$'\t' read -r a b c …` over worktree-tasks.tsv / worktree-status.tsv. TAB is
+# IFS *whitespace*, so zsh (like bash) collapses RUNS of it: one empty field — parent on a
+# detached HEAD, caller on a hand-written row — shifts every later field left. Reading a shifted
+# row is cosmetic; a rewriter that re-printf's the shifted VARIABLES writes the shift back and
+# fossilizes it (launch-args lands in the PARENT column ⇒ gwt-resume finds no uuid= and degrades
+# the tab to idle, `cc-dispatch.sh close` finds no csuuid/suuid and fail-closed refuses to close
+# it). So: field access via awk -F'\t' (cc-board.sh's header block documents this in full), and
+# every rewrite selects rows by LINE NUMBER and re-emits $0 verbatim — which is also what keeps
+# 7-field legacy, 8-field live and 9-field archive rows byte-identical across a rewrite.
+_gwt_dead_lines() {   # <file> <keep-fn> [dir-field-no=4] → line numbers to DROP (space separated)
+  emulate -L zsh
+  local f="$1" keep_fn="$2" col="${3:-4}" ln="" dir="" out=""
+  while IFS=$'\t' read -r ln dir; do
+    "$keep_fn" "$dir" || out="$out $ln"
+  done < <(awk -F'\t' -v c="$col" '{print NR "\t" $(c)}' "$f")
+  print -r -- "$out"
+}
+_gwt_drop_lines() {   # <file> <line numbers> → rewrite without them; kept rows byte-identical
+  emulate -L zsh
+  local f="$1" tmp="$1.tmp.$$"
+  awk -v drop="$2" 'BEGIN{n=split(drop,a," "); for(i=1;i<=n;i++) D[a[i]]=1} !(FNR in D)' "$f" > "$tmp" || return 1
+  mv "$tmp" "$f"
+  [[ -s "$f" ]] || rm -f "$f"
+  return 0
+}
+
 # ── Task list (worktree-tasks.tsv) maintenance ───────────────────────────────
 _gwt_tasks_file() { echo "${CC_TASKS_FILE:-$HOME/.config/cc-stack/worktree-tasks.tsv}" }
 
@@ -79,16 +113,10 @@ _gwt_tasks_file() { echo "${CC_TASKS_FILE:-$HOME/.config/cc-stack/worktree-tasks
 _gwt_tasks_rewrite() {
   emulate -L zsh
   local f; f="$(_gwt_tasks_file)"; [[ -f "$f" ]] || return 0
-  local keep_fn="$1" tmp="$f.tmp.$$" lock="$f.lock" got= i
+  local keep_fn="$1" lock="$f.lock" got= i
   # Share one mkdir lock with cc-board.sh log's append, to avoid losing a concurrent append during read→mv
   for i in {1..60}; do mkdir "$lock" 2>/dev/null && { got=1; break }; sleep 0.05; done
-  local ts branch ref dir caller task parent
-  : > "$tmp"
-  while IFS=$'\t' read -r ts branch ref dir caller task parent; do
-    "$keep_fn" "$dir" && printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$ts" "$branch" "$ref" "$dir" "$caller" "$task" "$parent" >> "$tmp"
-  done < "$f"
-  mv "$tmp" "$f"
-  [[ -s "$f" ]] || rm -f "$f"
+  _gwt_drop_lines "$f" "$(_gwt_dead_lines "$f" "$keep_fn" 4)"
   [[ -n "$got" ]] && rmdir "$lock" 2>/dev/null
   return 0
 }
@@ -121,19 +149,26 @@ _gwt_archive_branch() {
   local branch="$1"; [[ -n "$branch" ]] || return 0
   local f; f="$(_gwt_tasks_file)"; [[ -f "$f" ]] || return 0
   local arch; arch="$(_gwt_archive_file)"
-  local lock="$f.lock" got= i tmp="$f.tmp.$$" now ts bref ref dir caller task parent
+  local lock="$f.lock" got= i tmp="$f.tmp.$$" now="" out=""
   local -a moved=()
   for i in {1..60}; do mkdir "$lock" 2>/dev/null && { got=1; break }; sleep 0.05; done
   now="$(date +%s)"
   : > "$tmp"
-  while IFS=$'\t' read -r ts bref ref dir caller task parent; do
-    if [[ "$bref" == "$branch" ]]; then
-      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$ts" "$bref" "$ref" "$dir" "$caller" "$task" "$parent" "$now" >> "$arch"
-      [[ -n "$dir" ]] && moved+=("$dir")
-    else
-      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$ts" "$bref" "$ref" "$dir" "$caller" "$task" "$parent" >> "$tmp"
-    fi
-  done < "$f"
+  # One awk pass (see the TSV access discipline above): a matching row is archived AS IT STANDS
+  # with merged-at appended — a live 8-field row becomes 9, a legacy 7-field row becomes 8 — and
+  # every other row is copied verbatim. The moved dirs come back on stdout for the sidecar sweep.
+  local rc=0
+  out="$(awk -F'\t' -v b="$branch" -v now="$now" -v arch="$arch" -v tmp="$tmp" '
+    $2 == b { printf "%s\t%s\n", $0, now >> arch; if ($4 != "") print $4; next }
+    { print $0 >> tmp }
+  ' "$f")" || rc=$?
+  if (( rc )); then   # never mv a half-written rewrite over the task list — rows would vanish
+    rm -f "$tmp"
+    [[ -n "$got" ]] && rmdir "$lock" 2>/dev/null
+    echo "✗ archive rewrite failed (awk rc $rc) — task list left untouched (the archive may have gained duplicates)" >&2
+    return 1
+  fi
+  [[ -n "$out" ]] && moved=("${(@f)out}")
   mv "$tmp" "$f"
   [[ -s "$f" ]] || rm -f "$f"
   [[ -n "$got" ]] && rmdir "$lock" 2>/dev/null
@@ -153,15 +188,9 @@ _gwt_status_file() { echo "${CC_STATUS_FILE:-$HOME/.config/cc-stack/worktree-sta
 _gwt_status_rewrite() {
   emulate -L zsh
   local f; f="$(_gwt_status_file)"; [[ -f "$f" ]] || return 0
-  local keep_fn="$1" tmp="$f.tmp.$$" lock="$f.lock" got= i
+  local keep_fn="$1" lock="$f.lock" got= i
   for i in {1..60}; do mkdir "$lock" 2>/dev/null && { got=1; break }; sleep 0.05; done
-  local d st ts
-  : > "$tmp"
-  while IFS=$'\t' read -r d st ts; do
-    "$keep_fn" "$d" && printf '%s\t%s\t%s\n' "$d" "$st" "$ts" >> "$tmp"
-  done < "$f"
-  mv "$tmp" "$f"
-  [[ -s "$f" ]] || rm -f "$f"
+  _gwt_drop_lines "$f" "$(_gwt_dead_lines "$f" "$keep_fn" 1)"   # dir is the sidecar's FIRST field
   [[ -n "$got" ]] && rmdir "$lock" 2>/dev/null
   return 0
 }
@@ -312,14 +341,19 @@ gwt-prune() {
   local f; f="$(_gwt_tasks_file)"; [[ -f "$f" ]] || { echo "list is empty"; return 0 }
   _gwt_tasks_prune_dead
   [[ -f "$f" ]] || { echo "✔ emptied (no live records)"; return 0 }
-  typeset -A seen; local tmp="$f.tmp.$$" ts branch ref dir caller task parent
-  : > "$tmp"
-  while IFS=$'\t' read -r ts branch ref dir caller task parent; do
-    [[ -n "$dir" && -z "${seen[$dir]:-}" ]] || continue
-    seen[$dir]=1
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$ts" "$branch" "$ref" "$dir" "$caller" "$task" "$parent"
-  done < <(tail -r "$f") | tail -r > "$tmp"
+  # Newest-per-dir dedup, again by re-emitting $0 verbatim under the shared lock (a read/printf
+  # loop here rewrote every empty field shifted — see the TSV access discipline above).
+  local tmp="$f.tmp.$$" lock="$f.lock" got= i
+  for i in {1..60}; do mkdir "$lock" 2>/dev/null && { got=1; break }; sleep 0.05; done
+  tail -r "$f" | awk -F'\t' '$4 != "" && !seen[$4]++' | tail -r > "$tmp"
+  if (( ${pipestatus[1]} + ${pipestatus[2]} + ${pipestatus[3]} )); then
+    rm -f "$tmp"                                  # partial rewrite ⇒ keep the list as it was
+    [[ -n "$got" ]] && rmdir "$lock" 2>/dev/null
+    echo "✗ compaction failed — task list left untouched" >&2
+    return 1
+  fi
   mv "$tmp" "$f"; [[ -s "$f" ]] || rm -f "$f"
+  [[ -n "$got" ]] && rmdir "$lock" 2>/dev/null
   echo "✔ task list compacted"
 }
 
@@ -328,6 +362,12 @@ _gwt_tree_render() {
   emulate -L zsh
   local node="$1" prefix="$2"
   local kids=(${=_gt_kids[$node]:-})
+  # Draw each node ONCE: _gt_seen is both the cycle brake (a ↔ b reachable from the trunk would
+  # recurse forever) and the record the orphan block below reads to find what was never drawn.
+  local -a fresh=()
+  local k=""
+  for k in $kids; do [[ -n "${_gt_seen[$k]:-}" ]] || { fresh+=("$k"); _gt_seen[$k]=1 }; done
+  kids=($fresh)
   local n=${#kids} i=1 kid conn childprefix
   for kid in $kids; do
     if (( i == n )); then conn="└─ "; childprefix="$prefix   "; else conn="├─ "; childprefix="$prefix│  "; fi
@@ -362,14 +402,16 @@ gwt-tree() {
   [[ -n "$data" ]] || { echo "no worktree branches (nothing to show)"; return 0 }
   local trunk; trunk="$(~/.config/cc-stack/cc-merge.sh trunk "$root")"
   # tab liveness (best-effort)
-  typeset -gA _gt_ref _gt_parent _gt_ahead _gt_dirty _gt_done _gt_kids
-  _gt_ref=(); _gt_parent=(); _gt_ahead=(); _gt_dirty=(); _gt_done=(); _gt_kids=()
+  typeset -gA _gt_ref _gt_parent _gt_ahead _gt_dirty _gt_done _gt_kids _gt_seen
+  _gt_ref=(); _gt_parent=(); _gt_ahead=(); _gt_dirty=(); _gt_done=(); _gt_kids=(); _gt_seen=()
   _gt_live=""
   command -v cmux >/dev/null 2>&1 && cmux ping >/dev/null 2>&1 && _gt_live="$(cmux list-pane-surfaces 2>/dev/null)"
   local f; f="$(_gwt_tasks_file)"
   if [[ -f "$f" ]]; then
-    local ts br rf dir cl tk pt
-    while IFS=$'\t' read -r ts br rf dir cl tk pt; do [[ -n "$br" ]] && _gt_ref[$br]="$rf"; done < "$f"
+    local br="" rf=""
+    # branch + surface ref via awk -F'\t' (see the TSV access discipline): a read loop over the
+    # whole row shifts the ref onto whatever follows an empty caller field.
+    while IFS=$'\t' read -r br rf; do _gt_ref[$br]="$rf"; done < <(awk -F'\t' '$2 != "" {print $2 "\t" $3}' "$f")
   fi
   local branch parent ahead dirty dn
   while IFS=$'\t' read -r branch parent ahead dirty dn; do
@@ -379,8 +421,34 @@ gwt-tree() {
     _gt_kids[$parent]="${_gt_kids[$parent]:-} $branch"
   done <<< "$data"
   echo "$trunk"
+  _gt_seen[$trunk]=1
   _gwt_tree_render "$trunk" ""
-  unset _gt_ref _gt_parent _gt_ahead _gt_dirty _gt_done _gt_kids _gt_live
+  # Orphans: the render walks DOWN from the trunk, so a node the walk never reaches used to
+  # vanish with no hint at all — and gwt-tree is exactly what the merge gate is read from, where
+  # an invisible branch reads as "nothing left to merge". Two routine ways in: its merge target
+  # was deleted (the README's own gwt-merge <parent> → gwt-rm <parent> --branch sequence), or two
+  # branches point at each other. Print them, with the target that failed to resolve.
+  local -a orphans=()
+  local b=""
+  for b in ${(k)_gt_parent}; do [[ -n "${_gt_seen[$b]:-}" ]] || orphans+=("$b"); done
+  if (( ${#orphans} )); then
+    echo "⚠ orphaned (parent gone / cycle) — not reachable from $trunk, gwt-merge them explicitly:"
+    local pb="" why="" ahead="" dirty="" dn="" doneflag="" rf="" tab="" ready=""
+    for b in ${(o)orphans}; do
+      pb="${_gt_parent[$b]:-?}"
+      if git -C "$root" show-ref --verify --quiet "refs/heads/$pb"; then why="unreachable (cycle)"; else why="branch gone"; fi
+      ahead="${_gt_ahead[$b]}"; dirty="${_gt_dirty[$b]}"; dn="${_gt_done[$b]}"
+      doneflag=""; [[ "$dn" == done ]] && doneflag="✓done"
+      rf="${_gt_ref[$b]:-}"
+      if [[ -z "$_gt_live" ]]; then tab="?"
+      elif [[ -n "$rf" ]] && grep -qF "$rf" <<<"$_gt_live"; then tab="✔live"
+      elif [[ -n "$rf" ]]; then tab="⌫closed"; else tab="-"; fi
+      if [[ "$dirty" == clean && "$dn" == done ]]; then ready="ready ✅"; else ready="not ready ⏳"; fi
+      printf '   ✗  %-14s ↑%-3s %-5s %-6s [%s]  → %s   (merge target %s: %s)\n' \
+        "$b" "$ahead" "$dirty" "$doneflag" "$tab" "$ready" "$pb" "$why"
+    done
+  fi
+  unset _gt_ref _gt_parent _gt_ahead _gt_dirty _gt_done _gt_kids _gt_seen _gt_live
 }
 
 # gwt-done / gwt-undone — mark the current worktree's branch ready (harmless annotation, no gate).
@@ -527,7 +595,19 @@ gwt-rm() {
     esac
   done
   local wtpath; wtpath="$(_gwt_wt_path "$name")" || return 1
-  [[ -d "$wtpath" ]] || { echo "✗ no worktree named '$name' under the worktrees dir" >&2; return 1; }
+  # A gone DIRECTORY is not a gone worktree: an external `rm -rf`, or a half-finished removal,
+  # leaves git's registration (marked prunable) plus a board row, a sidecar row, a pre-trust
+  # entry, an orphan cmux tab and the branch. `git worktree remove` returns 0 on exactly that
+  # state and prunes the registration, so this IS the reclaim path — bailing on -d alone stranded
+  # all of it. Still fail-closed (the 2026-08-16 partial-shell incident): the fallback is git's
+  # own registration list, never a blind path, so a typo'd name can never reach `worktree remove`.
+  if [[ ! -d "$wtpath" ]]; then
+    local _rt; _rt="$(_gwt_root 2>/dev/null)"
+    if [[ -z "$_rt" ]] || ! git -C "$_rt" worktree list --porcelain 2>/dev/null | grep -qxF "worktree $wtpath"; then
+      echo "✗ no worktree named '$name' under the worktrees dir" >&2; return 1
+    fi
+    echo "  ↳ directory already gone — reclaiming the stale registration for $wtpath"
+  fi
   local wtabs; wtabs="$(cd "$wtpath" 2>/dev/null && pwd -P)"   # canonical path (before removal) for bookkeeping
   local wtbranch; wtbranch="$(git -C "$wtpath" symbolic-ref --short HEAD 2>/dev/null)"   # real branch, any prefix (captured before removal)
   # Merge the worktree's shared corpus (new e2e tests) back into the main repo BEFORE removal, so
