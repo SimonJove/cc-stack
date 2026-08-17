@@ -740,7 +740,7 @@ GT=$(mktemp -d); ( cd "$GT"; git init -q; git config user.email t@t; git config 
 "$CC/cc-merge.sh" set-parent "$GT" feat/A main
 "$CC/cc-merge.sh" set-parent "$GT" feat/A1 feat/A
 "$CC/cc-merge.sh" done "$GT" feat/A1 true
-GTOUT="$(cd "$GT" && CC_TASKS_FILE=/dev/null zsh -c 'source ~/.config/cc-stack/worktree.zsh; gwt-tree' 2>/dev/null)"
+GTOUT="$(cd "$GT" && CC_TASKS_FILE=/dev/null zsh -c "source '$CC/worktree.zsh'; gwt-tree" 2>/dev/null)"
 eq "tree root is trunk"        "$(echo "$GTOUT" | head -1)" "main"
 eq "tree shows feat/A"         "$(echo "$GTOUT" | grep -c 'feat/A ')" "1"
 eq "tree shows feat/A1"        "$(echo "$GTOUT" | grep -c 'feat/A1')" "1"
@@ -1762,59 +1762,315 @@ env HOME="$FH18" PATH="$CF:$OP18" CC_TASKS_FILE="$TF18R" CC_STATUS_FILE="$SF18R"
   zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; cd '$RM18'; gwt-rm wtT" >/dev/null 2>&1
 eq "plain gwt-rm closes no tab"          "$(grep -c 'CLOSE|' "$CC_FAKE_LOG")" "0"
 
-# — the retired text gate is really gone (file, registration, references) —
+# — BOTH retired PreToolUse text gates are really gone (files, registrations, references) —
+# The commit gate moved out of PreToolUse on 2026-08-16 too (§25): it is now git's own pre-commit
+# hook, so NOTHING this stack ships is registered on PreToolUse any more.
 eq "close gate file deleted"      "$([ -e "$CC/hooks/block-unsafe-close.sh" ] && echo present || echo gone)" "gone"
-eq "no live script references it" "$(grep -rl 'block-unsafe-close' "$CC"/*.sh "$CC"/hooks/*.sh 2>/dev/null | grep -v 'install.sh' | grep -vc 'test.sh')" "0"
-eq "commit gate survives"         "$([ -x "$CC/hooks/block-worktree-commit.sh" ] && echo yes || echo no)" "yes"
+eq "commit text gate file deleted" "$([ -e "$CC/hooks/block-worktree-commit.sh" ] && echo present || echo gone)" "gone"
+# A retired gate may still be NAMED in a comment (git-pre-commit.sh explains what it replaced, and
+# install.sh carries both bare names as sweep data) — what must be gone is any live CODE path that
+# still runs one, so comment lines don't count.
+eq "no live code path runs them" "$(grep -rn 'block-unsafe-close\|block-worktree-commit' "$CC"/*.sh "$CC"/hooks/* 2>/dev/null \
+  | grep -v '/install.sh:' | grep -v '/test.sh:' | grep -vc ':[0-9][0-9]*:[[:space:]]*#')" "0"
 
-# — the adopted commit gate still behaves (synthetic stdin) —
-CH="$(cn18 "$(mktemp -d)")"; CHH=$(mktemp -d)
-( cd "$CH"; git init -q; git config user.email t@t; git config user.name t; git commit -q --allow-empty -m i
-  mkdir .claude; git worktree add -q .claude/worktrees/wtC -b feat/C >/dev/null )
-CHW="$(cn18 "$CH/.claude/worktrees/wtC")"
-pay18(){ python3 -c "import json,sys;print(json.dumps({'tool_name':'Bash','tool_input':{'command':sys.argv[1]}}))" "$1"; }
-chrun(){ printf '%s' "$(pay18 "$1")" \
-  | ( cd "$CH" && env HOME="$CHH" bash "$CC/hooks/block-worktree-commit.sh" >/dev/null 2>&1; echo $? ); }
-eq "commit gate blocks a worktree commit" "$(chrun "git -C $CHW commit -m x")" "2"
-touch "$CHW/.commit-authorized"
-eq "commit gate allows with the sentinel"  "$(chrun "git -C $CHW commit -m x")" "0"
-eq "sentinel consumed (one grant, one commit)" "$([ -f "$CHW/.commit-authorized" ] && echo yes || echo no)" "no"
-eq "commit gate re-blocks once spent"      "$(chrun "git -C $CHW commit -m x")" "2"
-eq "commit gate ignores the primary checkout" "$(chrun "git -C $CH commit -m x")" "0"
-eq "commit gate ignores non-commit git"    "$(chrun "git -C $CHW status")" "0"
-
-# — install distributes the commit gate, registers ONLY it, and sweeps the retired close gate —
+# — install distributes the git hook body, registers NOTHING on PreToolUse, sweeps both retired gates —
 IH18=$(mktemp -d)
 HOME="$IH18" bash "$CC/install.sh" --yes --dir "$IH18/cc" >/dev/null 2>&1
 sn18(){ python3 -c 'import json,sys
 d=json.load(open(sys.argv[1]+"/.claude/settings.json"))
 print(sum(1 for g in d.get("hooks",{}).get("PreToolUse",[]) or [] for h in (g.get("hooks") or []) if sys.argv[2] in (h.get("command") or "")))' "$IH18" "$1"; }
-eq "install ships the commit hook"  "$([ -x "$IH18/cc/hooks/block-worktree-commit.sh" ] && echo yes || echo no)" "yes"
+eq "install ships the git-hook body" "$([ -x "$IH18/cc/hooks/git-pre-commit.sh" ] && echo yes || echo no)" "yes"
 eq "install ships standalone gwt-done" "$([ -x "$IH18/cc/gwt-done" ] && echo yes || echo no)" "yes"
-eq "install registers the commit hook" "$(sn18 'hooks/block-worktree-commit.sh')" "1"
+eq "install registers NO commit gate" "$(sn18 'block-worktree-commit.sh')" "0"
 eq "install registers NO close gate"   "$(sn18 'block-unsafe-close.sh')" "0"
 eq "install ships no close gate file"  "$([ -e "$IH18/cc/hooks/block-unsafe-close.sh" ] && echo present || echo gone)" "gone"
 eq "rules line reaches CLAUDE.md"   "$(grep -c 'cc-dispatch.sh close' "$IH18/.claude/CLAUDE.md")" "1"
 eq "rules line warns on short ids"  "$(grep -c 'NEVER hardcode a surface short id' "$IH18/.claude/CLAUDE.md")" "1"
 eq "rules line drops the hook claim" "$(grep -c 'PreToolUse hook blocks those forms' "$IH18/.claude/CLAUDE.md")" "0"
-HOME="$IH18" bash "$CC/install.sh" --yes --dir "$IH18/cc" >/dev/null 2>&1
-eq "re-install adds no duplicate hook" "$(sn18 'hooks/block-worktree-commit.sh')" "1"
-# a settings.json still carrying the RETIRED close gate (and the pre-repo commit-gate copy) is swept
+# a settings.json still carrying EITHER retired gate (repo path or the pre-repo ~/.claude/hooks/
+# copy) is swept, and the retired FILES are deleted from the install dir on the next run
 python3 -c 'import json,sys
 p=sys.argv[1]+"/.claude/settings.json"
 d=json.load(open(p))
-d["hooks"].setdefault("PreToolUse",[]).append({"matcher":"Bash","hooks":[{"type":"command","command":"bash ~/.claude/hooks/block-worktree-commit.sh"}]})
+d.setdefault("hooks",{}).setdefault("PreToolUse",[]).append({"matcher":"Bash","hooks":[{"type":"command","command":"bash ~/.claude/hooks/block-worktree-commit.sh"}]})
+d["hooks"]["PreToolUse"].append({"matcher":"Bash","hooks":[{"type":"command","command":"bash "+sys.argv[1]+"/cc/hooks/block-worktree-commit.sh"}]})
 d["hooks"]["PreToolUse"].append({"matcher":"Bash","hooks":[{"type":"command","command":"bash "+sys.argv[1]+"/cc/hooks/block-unsafe-close.sh"}]})
 json.dump(d,open(p,"w"))' "$IH18"
-touch "$IH18/cc/hooks/block-unsafe-close.sh"
+touch "$IH18/cc/hooks/block-unsafe-close.sh" "$IH18/cc/hooks/block-worktree-commit.sh"
+eq "the stale registrations are really there" "$(sn18 'block-worktree-commit.sh')" "2"
 HOME="$IH18" bash "$CC/install.sh" --yes --dir "$IH18/cc" >/dev/null 2>&1
 eq "strip removes the orphan registration" "$(sn18 '.claude/hooks/block-worktree-commit.sh')" "0"
+eq "strip removes the repo-path registration" "$(sn18 'block-worktree-commit.sh')" "0"
 eq "strip removes the retired close gate"  "$(sn18 'block-unsafe-close.sh')" "0"
-eq "strip removes the retired gate FILE"   "$([ -e "$IH18/cc/hooks/block-unsafe-close.sh" ] && echo present || echo gone)" "gone"
-eq "strip keeps the commit registration"   "$(sn18 'hooks/block-worktree-commit.sh')" "1"
-rm -rf "$CF" "$R18" "$R18OLD" "$RM18" "$FH18" "$IH18" "$WO7" "$DD" "$CH" "$CHH" "$HD18" "$PW18" "$DR18" "$WSD"
+eq "strip removes the close gate FILE"     "$([ -e "$IH18/cc/hooks/block-unsafe-close.sh" ] && echo present || echo gone)" "gone"
+eq "strip removes the commit gate FILE"    "$([ -e "$IH18/cc/hooks/block-worktree-commit.sh" ] && echo present || echo gone)" "gone"
+eq "the surviving hooks all survived"      "$(python3 -c 'import json,sys
+d=json.load(open(sys.argv[1]+"/.claude/settings.json"))
+h=d.get("hooks",{})
+print(sum(1 for ev in ("PostToolUse","UserPromptSubmit","Stop","Notification") for g in h.get(ev,[]) or [] for x in (g.get("hooks") or []) if "cc-hooks.sh" in (x.get("command") or "")))' "$IH18")" "4"
+rm -rf "$CF" "$R18" "$R18OLD" "$RM18" "$FH18" "$IH18" "$WO7" "$DD" "$HD18" "$PW18" "$DR18" "$WSD"
 rm -f "$TF18" "$TF18D" "$TF18O" "$TF18R" "$SF18R" "$TB18" "$TB18D" "$TB18O" "$TB18R" "$TF18P" "$TB18P" "$TF18E" "$TF18T" "$TB18T"
 unset CC_FAKE_LOG CF_SCREEN
+
+echo ""
+echo "== 25. commit gate: git's own pre-commit hook (migrated 2026-08-16) =="
+# The gate that says "a worktree sub-task may not commit without the human" used to be a PreToolUse
+# hook that parsed the TEXT of every Bash command and guessed the commit's target directory out of
+# it (hooks/block-worktree-commit.sh, retired with its §23 red/green suite). It is now git's own
+# pre-commit hook, mounted once per repo into the COMMON .git/hooks (shared by every linked
+# worktree). Three live 2026-08-16 incidents drove the migration and are pinned one-for-one below
+# as (a)/(b)/(c): the old gate blocked two things that were not commits at all, and let one real
+# worktree commit straight through.
+CG=$(mktemp -d); CGR="$(cn "$CG")"
+( cd "$CGR"; git init -q; git config user.email t@t; git config user.name t; git commit -q --allow-empty -m i
+  mkdir .claude
+  git worktree add -q .claude/worktrees/w25 -b feat/w25 >/dev/null
+  git worktree add -q .worktrees/v25       -b feat/v25 >/dev/null )
+CGW="$(cn "$CGR/.claude/worktrees/w25")"; CGV="$(cn "$CGR/.worktrees/v25")"
+# the DOWNSTREAM project's own hooks — the hard red line: they must keep working, both of them.
+# (docs/issues/cc-stack-issues.md records a real repo that enforces Conventional Commits through
+# commit-msg; core.hooksPath would have silently switched that off, which is why it is excluded.)
+cat > "$CGR/.git/hooks/pre-commit" <<CGHOOK
+#!/bin/sh
+echo project-pre-commit >> "$CGR/evidence"
+CGHOOK
+cat > "$CGR/.git/hooks/commit-msg" <<CGHOOK
+#!/bin/sh
+echo project-commit-msg >> "$CGR/evidence"
+CGHOOK
+chmod +x "$CGR/.git/hooks/pre-commit" "$CGR/.git/hooks/commit-msg"
+CGSHA="$(shasum -a 256 < "$CGR/.git/hooks/pre-commit" | awk '{print $1}')"
+cgn(){ git -C "$1" rev-list --count HEAD 2>/dev/null || echo 0; }   # commits on that checkout
+cgev(){ tr '\n' ' ' < "$CGR/evidence" 2>/dev/null | sed 's/ $//'; }  # which project hooks ran
+
+# — mount: preserve-and-chain, never overwrite —
+CGM="$(bash "$CC/cc-dispatch.sh" commit-gate mount "$CGW" 2>&1)"
+eq "mount reports the preserved hook" "$(printf '%s' "$CGM" | grep -c 'pre-commit.cc-stack-orig')" "1"
+eq "gate is installed and executable" "$([ -x "$CGR/.git/hooks/pre-commit" ] && echo yes || echo no)" "yes"
+eq "gate is identifiable"             "$(grep -c 'cc-stack:commit-gate' "$CGR/.git/hooks/pre-commit")" "1"
+eq "the project's hook was PRESERVED" "$(shasum -a 256 < "$CGR/.git/hooks/pre-commit.cc-stack-orig" | awk '{print $1}')" "$CGSHA"
+eq "commit-msg was never touched"     "$(grep -c 'project-commit-msg' "$CGR/.git/hooks/commit-msg")" "1"
+# idempotence: a second mount is silent, adds no second copy of the logic, and does NOT swallow
+# its own hook into the saved original (that is how a chain turns into a matryoshka)
+CGM2="$(bash "$CC/cc-dispatch.sh" commit-gate mount "$CGW" 2>&1)"; cgrc2=$?
+eq "re-mount is silent"               "$CGM2" ""
+eq "re-mount rc 0"                    "$cgrc2" "0"
+eq "still exactly one gate body"      "$(grep -c 'cc-stack:commit-gate' "$CGR/.git/hooks/pre-commit")" "1"
+eq "saved original is still theirs"   "$(grep -c 'cc-stack:commit-gate' "$CGR/.git/hooks/pre-commit.cc-stack-orig")" "0"
+eq "no nested .cc-stack-orig"         "$([ -e "$CGR/.git/hooks/pre-commit.cc-stack-orig.cc-stack-orig" ] && echo present || echo gone)" "gone"
+
+# — the gate itself: blocked / granted / consumed / re-blocked —
+: > "$CGR/evidence"
+cgb="$(cgn "$CGW")"
+CGO="$( cd "$CGW" && git commit -q --allow-empty -m blocked 2>&1 )"; cgrc=$?
+eq "worktree commit is blocked (rc!=0)" "$([ "$cgrc" -ne 0 ] && echo y || echo n)" "y"
+eq "and NO commit was produced"         "$(cgn "$CGW")" "$cgb"
+eq "the block says how to authorize"    "$(printf '%s' "$CGO" | grep -c '\.commit-authorized')" "1"
+eq "a blocked commit runs no project hook" "$(cgev)" ""
+touch "$CGW/.commit-authorized"
+: > "$CGR/evidence"
+( cd "$CGW" && git commit -q --allow-empty -m granted ) >/dev/null 2>&1
+eq "sentinel lets exactly one through"  "$(cgn "$CGW")" "$((cgb + 1))"
+eq "sentinel is consumed"               "$([ -f "$CGW/.commit-authorized" ] && echo yes || echo no)" "no"
+eq "an allowed commit CHAINS both project hooks" "$(cgev)" "project-pre-commit project-commit-msg"
+cgb="$(cgn "$CGW")"
+( cd "$CGW" && git commit -q --allow-empty -m spent ) >/dev/null 2>&1
+eq "re-blocked once the grant is spent" "$(cgn "$CGW")" "$cgb"
+
+# — scope: the primary checkout is untouched, and .worktrees/ is gated exactly like .claude/worktrees/ —
+: > "$CGR/evidence"
+cgb="$(cgn "$CGR")"
+( cd "$CGR" && git commit -q --allow-empty -m primary ) >/dev/null 2>&1
+eq "primary checkout is NOT gated"      "$(cgn "$CGR")" "$((cgb + 1))"
+eq "and its project hooks still run"    "$(cgev)" "project-pre-commit project-commit-msg"
+cgb="$(cgn "$CGV")"
+( cd "$CGV" && git commit -q --allow-empty -m blocked ) >/dev/null 2>&1
+eq ".worktrees/ layout is gated too"    "$(cgn "$CGV")" "$cgb"
+# non-commit git is not even a code path any more — the hook only ever runs on a commit
+cgb="$(cgn "$CGW")"
+( cd "$CGW" && git status --porcelain ) >/dev/null 2>&1
+eq "git status is untouched (rc 0)"     "$( ( cd "$CGW" && git status --porcelain >/dev/null 2>&1; echo $? ) )" "0"
+
+# — the three live 2026-08-16 incidents, one assertion each —
+# (a) MIS-BLOCK: a command whose TEXT merely quotes `git … commit` while committing nothing. The
+# old gate's trigger grep could not tell prose from a command and blocked a sub-task writing a
+# file. The new gate never reads command text at all, so this is trivially true — which is exactly
+# the property worth pinning, both behaviourally and structurally.
+CGA="$( cd "$CGW" && cat > prose.txt <<'CGPROSE'
+example from the brief: git -C "$W" commit -m x   (and: cd /elsewhere && git commit -m y)
+CGPROSE
+echo $? )"
+eq "(a) prose quoting a commit is a no-op" "$CGA" "0"
+eq "(a) the file really got written"       "$(grep -c 'git -C' "$CGW/prose.txt")" "1"
+eq "(a) the gate parses no command text"   "$(grep -c 'tool_input\|json.load\|read -r cmd' "$CC/hooks/git-pre-commit.sh")" "0"
+rm -f "$CGW/prose.txt"
+# (b) MIS-ALLOW (the serious one): `git -C "$VAR" commit` from a session parked in the PRIMARY
+# checkout. The old gate saw the literal three characters $W, decided that was not a directory,
+# fell back to the session cwd, found the primary checkout, and waved the commit through with the
+# sentinel never read. git puts the hook's cwd inside the worktree no matter how it was named.
+cgb="$(cgn "$CGW")"; CGVAR="$CGW"
+( cd "$CGR" && git -C "$CGVAR" commit -q --allow-empty -m viavar ) >/dev/null 2>&1
+eq "(b) git -C \$VAR from the primary is BLOCKED" "$(cgn "$CGW")" "$cgb"
+eq "(b) and the sentinel still gates it"          "$( touch "$CGW/.commit-authorized"
+  ( cd "$CGR" && git -C "$CGVAR" commit -q --allow-empty -m viavar ) >/dev/null 2>&1; cgn "$CGW" )" "$((cgb + 1))"
+# (c) MIS-ALLOW: session cwd in the primary checkout, target reached by cd. Same fail-open in the
+# old gate whenever the walk could not resolve the cd target (an unbalanced quote, a glob, a
+# variable). Nothing to resolve here — the hook runs where the commit happens.
+cgb="$(cgn "$CGW")"
+( cd "$CGR" && cd "$CGW" && git commit -q --allow-empty -m viacd ) >/dev/null 2>&1
+eq "(c) cd-into-the-worktree is BLOCKED"  "$(cgn "$CGW")" "$cgb"
+
+# — accepted residue, pinned so nobody 'fixes' it by accident: --no-verify goes straight through —
+cgb="$(cgn "$CGW")"
+( cd "$CGW" && git commit -q --no-verify --allow-empty -m bypass ) >/dev/null 2>&1
+eq "--no-verify bypasses (accepted)"      "$(cgn "$CGW")" "$((cgb + 1))"
+eq "and the hook says so in writing"      "$([ "$(grep -c 'no-verify' "$CC/hooks/git-pre-commit.sh")" -ge 1 ] && echo y || echo n)" "y"
+
+# — unmount: fully reversible, byte-for-byte —
+CGU="$(bash "$CC/cc-dispatch.sh" commit-gate unmount "$CGW" 2>&1)"; cgurc=$?
+eq "unmount rc 0"                        "$cgurc" "0"
+eq "unmount restored the project's hook" "$(shasum -a 256 < "$CGR/.git/hooks/pre-commit" | awk '{print $1}')" "$CGSHA"
+eq "and removed the saved copy"          "$([ -e "$CGR/.git/hooks/pre-commit.cc-stack-orig" ] && echo present || echo gone)" "gone"
+cgb="$(cgn "$CGW")"
+( cd "$CGW" && git commit -q --allow-empty -m ungated ) >/dev/null 2>&1
+eq "ungated worktree commits again"      "$(cgn "$CGW")" "$((cgb + 1))"
+CGU2="$(bash "$CC/cc-dispatch.sh" commit-gate unmount "$CGW" 2>&1)"
+eq "unmount refuses a foreign hook"      "$(printf '%s' "$CGU2" | grep -c 'is not ours')" "1"
+eq "and left it in place"                "$(shasum -a 256 < "$CGR/.git/hooks/pre-commit" | awk '{print $1}')" "$CGSHA"
+
+# — a repo with NO pre-commit at all: mount writes one, unmount takes it away and leaves nothing —
+CGP=$(mktemp -d); CGPR="$(cn "$CGP")"
+( cd "$CGPR"; git init -q; git config user.email t@t; git config user.name t; git commit -q --allow-empty -m i
+  mkdir .claude; git worktree add -q .claude/worktrees/wp -b feat/wp >/dev/null )
+bash "$CC/cc-dispatch.sh" commit-gate mount "$CGPR/.claude/worktrees/wp" >/dev/null 2>&1
+eq "clean repo: gate mounted"            "$(grep -c 'cc-stack:commit-gate' "$CGPR/.git/hooks/pre-commit")" "1"
+eq "clean repo: nothing preserved"       "$([ -e "$CGPR/.git/hooks/pre-commit.cc-stack-orig" ] && echo present || echo gone)" "gone"
+bash "$CC/cc-dispatch.sh" commit-gate unmount "$CGPR/.claude/worktrees/wp" >/dev/null 2>&1
+eq "clean repo: unmount leaves nothing"  "$([ -e "$CGPR/.git/hooks/pre-commit" ] && echo present || echo gone)" "gone"
+
+# — core.hooksPath: refuse loudly, change nothing. Setting it ourselves would silently disable the
+# project's whole hook set (live-probed: its commit-msg stopped running); writing into the path it
+# names is no better, because git resolves a RELATIVE core.hooksPath per working tree, so the file
+# would land in the main checkout's working tree and be invisible to the worktrees being gated.
+CGH=$(mktemp -d); CGHR="$(cn "$CGH")"
+( cd "$CGHR"; git init -q; git config user.email t@t; git config user.name t; git commit -q --allow-empty -m i
+  git config core.hooksPath .githooks; mkdir .claude
+  git worktree add -q .claude/worktrees/wh -b feat/wh >/dev/null )
+CGHO="$(bash "$CC/cc-dispatch.sh" commit-gate mount "$CGHR/.claude/worktrees/wh" 2>&1)"; cghrc=$?
+eq "core.hooksPath repo is refused"      "$cghrc" "3"
+eq "the refusal names the reason"        "$(printf '%s' "$CGHO" | grep -c 'refusing to touch it')" "1"
+eq "and it wrote NOTHING"                "$([ -e "$CGHR/.git/hooks/pre-commit" ] || [ -e "$CGHR/.githooks/pre-commit" ] && echo wrote || echo clean)" "clean"
+
+# — a directory the repo does not list as a worktree is refused (fail-closed identity check) —
+# The accident this pins, in full: install.sh copied the source's `.git` — a FILE in a linked
+# worktree — into the install dir, so `git -C <install-dir> rev-parse` answered with the SOURCE
+# repo's git dir, and step 4b dutifully wrote a hook into a live checkout nobody had named. Both
+# ends are now closed: install.sh no longer copies `.git` (asserted below), and a mount whose
+# target the repo does not list as one of its worktrees is refused outright.
+CGX=$(mktemp -d); CGXR="$(cn "$CGX")"
+( cd "$CGXR"; git init -q; git config user.email t@t; git config user.name t; git commit -q --allow-empty -m i
+  mkdir .claude; git worktree add -q .claude/worktrees/wx -b feat/wx >/dev/null )
+CGXF=$(mktemp -d); CGXFR="$(cn "$CGXF")"; mkdir -p "$CGXFR/.claude/worktrees/fake"
+cp "$CGXR/.claude/worktrees/wx/.git" "$CGXFR/.claude/worktrees/fake/.git"   # the stray pointer
+eq "a stray .git really misdirects git" "$(cn "$(git -C "$CGXFR/.claude/worktrees/fake" rev-parse --git-common-dir 2>/dev/null)")" "$(cn "$CGXR/.git")"
+CGXO="$(bash "$CC/cc-dispatch.sh" commit-gate mount "$CGXFR/.claude/worktrees/fake" 2>&1)"; cgxrc=$?
+eq "unlisted worktree is refused"       "$cgxrc" "3"
+eq "the refusal explains why"           "$(printf '%s' "$CGXO" | grep -c 'does not list it as a worktree')" "1"
+eq "and the misdirected repo is clean"  "$([ -e "$CGXR/.git/hooks/pre-commit" ] && echo present || echo gone)" "gone"
+rm -rf "$CGX" "$CGXF"
+
+# — a foreign hook sitting on top of an already-saved original is ambiguous: refuse, touch nothing —
+CGF=$(mktemp -d); CGFR="$(cn "$CGF")"
+( cd "$CGFR"; git init -q; git config user.email t@t; git config user.name t; git commit -q --allow-empty -m i
+  mkdir .claude; git worktree add -q .claude/worktrees/wf -b feat/wf >/dev/null )
+printf '#!/bin/sh\nexit 0\n' > "$CGFR/.git/hooks/pre-commit"; chmod +x "$CGFR/.git/hooks/pre-commit"
+printf '#!/bin/sh\nexit 0\n' > "$CGFR/.git/hooks/pre-commit.cc-stack-orig"
+CGFO="$(bash "$CC/cc-dispatch.sh" commit-gate mount "$CGFR/.claude/worktrees/wf" 2>&1)"; cgfrc=$?
+eq "ambiguous state is refused"          "$cgfrc" "3"
+eq "the foreign hook is untouched"       "$(grep -c 'cc-stack:commit-gate' "$CGFR/.git/hooks/pre-commit")" "0"
+
+# — the dispatch paths mount it themselves: this is what makes the gate exist without a human —
+# Driven through the real `surface` subcommand against a fake cmux, the same harness §21 uses.
+CGS=$(mktemp -d); export CC_FAKE_LOG25="$CGS/log"; export CF_SCREEN25="$CGS/screen"
+cat > "$CGS/cmux" <<'CGCMUX'
+#!/usr/bin/env bash
+case "$1" in
+  ping) exit 0 ;;
+  identify) echo '{ "caller": {} }' ;;
+  list-pane-surfaces) printf '* surface:901\t99999999-BBBB-BBBB-BBBB-999999999999\tthis session\n' ;;
+  new-surface) printf 'OK surface:901 (99999999-BBBB-BBBB-BBBB-999999999999) pane:1 (P) workspace:1 (W)\n' ;;
+  send|send-key|notify|close-surface) : ;;
+  read-screen) cat "$CF_SCREEN25" 2>/dev/null ;;
+esac
+exit 0
+CGCMUX
+chmod +x "$CGS/cmux"
+{ echo "RDY22"; echo "? for shortcuts"; } > "$CF_SCREEN25"
+OP25="$PATH"; FH25=$(mktemp -d); mkdir -p "$FH25/.config"; cp -R "$CC" "$FH25/.config/cc-stack"
+CGD=$(mktemp -d); CGDR="$(cn "$CGD")"
+( cd "$CGDR"; git init -q; git config user.email t@t; git config user.name t; git commit -q --allow-empty -m i
+  mkdir .claude; git worktree add -q .claude/worktrees/wd -b feat/wd >/dev/null )
+CGDW="$(cn "$CGDR/.claude/worktrees/wd")"
+( cd "$CGDR" && env HOME="$FH25" PATH="$CGS:$OP25" CC_TASKS_FILE="$CC_TEST_SANDBOX/25-tasks.tsv" \
+    CC_TABS_FILE="$CC_TEST_SANDBOX/25-tabs.tsv" CC_WT_PRETRUST=0 CC_WT_SHARE="" CC_SEND_VERIFY_SEC=0.1 \
+    CC_SEND_FAILLOG="$CGS/fail" bash "$CC/cc-dispatch.sh" surface "$CGDW" ) >/dev/null 2>&1
+eq "surface mounts the gate"             "$(grep -c 'cc-stack:commit-gate' "$CGDR/.git/hooks/pre-commit" 2>/dev/null || echo 0)" "1"
+cgb="$(cgn "$CGDW")"
+( cd "$CGDW" && git commit -q --allow-empty -m x ) >/dev/null 2>&1
+eq "and a dispatched worktree is gated"  "$(cgn "$CGDW")" "$cgb"
+# a MAIN checkout handed to the public `surface` subcommand gets no hook it never asked for
+CGT=$(mktemp -d); CGTR="$(cn "$CGT")"
+( cd "$CGTR"; git init -q; git config user.email t@t; git config user.name t; git commit -q --allow-empty -m i )
+( cd "$CGDR" && env HOME="$FH25" PATH="$CGS:$OP25" CC_TASKS_FILE="$CC_TEST_SANDBOX/25-tasks.tsv" \
+    CC_TABS_FILE="$CC_TEST_SANDBOX/25-tabs.tsv" CC_WT_PRETRUST=0 CC_WT_SHARE="" CC_SEND_VERIFY_SEC=0.1 \
+    CC_SEND_FAILLOG="$CGS/fail" bash "$CC/cc-dispatch.sh" surface "$CGTR" ) >/dev/null 2>&1
+eq "a plain main checkout is left alone" "$([ -e "$CGTR/.git/hooks/pre-commit" ] && echo present || echo gone)" "gone"
+# and the workspace path (gwt-new / gwt-adopt) mounts it too
+CGN=$(mktemp -d); CGNR="$(cn "$CGN")"
+( cd "$CGNR"; git init -q; git config user.email t@t; git config user.name t; git commit -q --allow-empty -m i
+  mkdir .claude; git worktree add -q .claude/worktrees/wn -b feat/wn >/dev/null )
+( cd "$CGNR" && env HOME="$FH25" PATH="$CGS:$OP25" CC_TABS_FILE="$CC_TEST_SANDBOX/25-tabs.tsv" \
+    bash "$CC/cc-dispatch.sh" workspace "$CGNR/.claude/worktrees/wn" wn false ) >/dev/null 2>&1
+eq "workspace mounts the gate"           "$(grep -c 'cc-stack:commit-gate' "$CGNR/.git/hooks/pre-commit" 2>/dev/null || echo 0)" "1"
+
+# — install.sh step 4b gates the INSTALL DIR, and nothing else it merely read files from —
+# Regression, caught by this suite on 2026-08-16 during the migration itself: step 4b originally
+# also mounted into LOCAL_SRC (the clone install.sh was launched from). Run from a cc-stack
+# WORKTREE — which is what `bash test.sh` does — that arm resolved the worktree to its PARENT repo
+# and wrote a pre-commit hook into the live cc-stack checkout, a repo nobody had named. An
+# installer writes into the directory it was given; a source it only read files from is not a target.
+CGI=$(mktemp -d); CGIH="$CGI/home"; CGID="$CGI/dest"; mkdir -p "$CGIH" "$CGID"
+( cd "$CGID"; git init -q; git config user.email t@t; git config user.name t; git commit -q --allow-empty -m i )
+CGISRC="$(cn "$CC")"                                   # the clone install.sh is launched FROM
+CGIB="$( [ -e "$CGISRC/.git" ] && bash -c 'cd "$1" && git rev-parse --git-common-dir' _ "$CGISRC" 2>/dev/null )"
+CGIB="$( [ -n "$CGIB" ] && cn "$CGIB" )"               # its shared .git — the thing that must stay untouched
+CGIPRE="$([ -n "$CGIB" ] && [ -e "$CGIB/hooks/pre-commit" ] && echo present || echo gone)"
+HOME="$CGIH" bash "$CC/install.sh" --yes --dir "$CGID" >/dev/null 2>&1
+eq "install gates its own install dir"   "$(grep -c 'cc-stack:commit-gate' "$CGID/.git/hooks/pre-commit" 2>/dev/null || echo 0)" "1"
+eq "install leaves the SOURCE repo alone" "$([ -n "$CGIB" ] && [ -e "$CGIB/hooks/pre-commit" ] && echo present || echo gone)" "$CGIPRE"
+# the other end of the same accident: the copy must never carry the source's `.git`. In a linked
+# worktree that is a FILE, so `! -path ./.git/*` alone never excluded it, and the install dir came
+# out looking to git like a worktree of the source repo.
+eq "install never copies the source .git" "$(git -C "$CGID" rev-parse --git-common-dir 2>/dev/null | grep -c 'cc-stack')" "0"
+HOME="$CGIH" bash "$CC/install.sh" --yes --dir "$CGID" >/dev/null 2>&1
+eq "re-install adds no second gate body" "$(grep -c 'cc-stack:commit-gate' "$CGID/.git/hooks/pre-commit")" "1"
+# a dispatched worktree of THAT repo is really gated end to end, through the installed copy
+( cd "$CGID" && mkdir -p .claude && git worktree add -q .claude/worktrees/wi -b feat/wi >/dev/null 2>&1 )
+cgb="$(cgn "$CGID/.claude/worktrees/wi")"
+( cd "$CGID/.claude/worktrees/wi" && git commit -q --allow-empty -m x ) >/dev/null 2>&1
+eq "installed gate blocks for real"      "$(cgn "$CGID/.claude/worktrees/wi")" "$cgb"
+# --dry-run changes nothing
+CGJ=$(mktemp -d); CGJH="$CGJ/home"; CGJD="$CGJ/dest"; mkdir -p "$CGJH" "$CGJD"
+( cd "$CGJD"; git init -q; git config user.email t@t; git config user.name t; git commit -q --allow-empty -m i )
+HOME="$CGJH" bash "$CC/install.sh" --yes --dry-run --dir "$CGJD" >/dev/null 2>&1
+eq "--dry-run mounts nothing"            "$([ -e "$CGJD/.git/hooks/pre-commit" ] && echo present || echo gone)" "gone"
+( cd "$CGID" && git worktree remove --force .claude/worktrees/wi >/dev/null 2>&1 )
+
+# surface leaves a contentless dedup marker in the real TMPDIR (hash-keyed) — sweep ours
+rm -f "${TMPDIR:-/tmp}/cc-cmux-tabs/$(printf '%s' "$CGDW" | shasum -a 1 | cut -d' ' -f1)" \
+      "${TMPDIR:-/tmp}/cc-cmux-tabs/$(printf '%s' "$CGTR" | shasum -a 1 | cut -d' ' -f1)" 2>/dev/null
+rm -rf "$CG" "$CGP" "$CGH" "$CGF" "$CGS" "$FH25" "$CGD" "$CGT" "$CGN" "$CGI" "$CGJ"
+unset CC_FAKE_LOG25 CF_SCREEN25
 
 echo ""
 echo "== 19. gwt-done as a standalone command (no zsh, no sourcing) =="
@@ -1849,55 +2105,6 @@ W4="$(grep -F '(4) When you finish implementing' "$CC/cc-dispatch.sh" | head -1)
 eq "clause 4 teaches the absolute path" "$(printf '%s' "$W4" | grep -c '~/.config/cc-stack/gwt-done')" "1"
 eq "clause 4 warns the bare name is zsh-only" "$(printf '%s' "$W4" | grep -c 'zsh function')" "1"
 rm -rf "$GD"
-echo ""
-echo "== 23. commit gate: command-text parsing (block-worktree-commit.sh v2.1) =="
-# The gate reads the commit's effective directory out of the command TEXT. Three parsing holes let
-# the walk name a directory the command never contained. The hook's hard rule is that an
-# unresolvable command falls back to the SESSION CWD — the conservative verdict — so every case
-# below also asserts that the fallback is what happens, never a silent allow.
-# (2 = blocked, 0 = allowed.)
-G23="$(cn "$(mktemp -d)")"; H23=$(mktemp -d)            # H23: fake HOME, the gate never reads the live one
-( cd "$G23"; git init -q; git config user.email t@t; git config user.name t; git commit -q --allow-empty -m i
-  mkdir .claude; git worktree add -q .claude/worktrees/w23 -b feat/w23 >/dev/null )
-W23="$(cn "$G23/.claude/worktrees/w23")"
-pay23(){ python3 -c "import json,sys;print(json.dumps({'tool_name':'Bash','tool_input':{'command':sys.argv[1]}}))" "$1"; }
-# g23 <session-cwd> <command> [extra env assignment…] → exit code
-g23(){ local d="$1" c="$2"; shift 2
-  printf '%s' "$(pay23 "$c")" | ( cd "$d" && env HOME="$H23" ${1+"$@"} bash "$CC/hooks/block-worktree-commit.sh" >/dev/null 2>&1; echo $? ); }
-
-# (a) pathname expansion. `for tok in $cmd` was an unquoted expansion with no `set -f`, so the
-# shell globbed the command text against the HOOK's cwd. Constructed exactly as it bites: the
-# worktree holds a file named `cd` and a symlink `p` → the primary checkout, so the `*` in an
-# unrelated part of the command expands to `cd p` and the walker reads a `cd` that was never
-# there. Fail-OPEN — a real worktree commit walks straight through the gate.
-: > "$W23/cd"; ln -s "$G23" "$W23/p"
-eq "cwd files cannot forge a cd target"   "$(g23 "$W23" 'git add * && git commit -m x')" "2"
-rm -f "$W23/cd" "$W23/p"
-eq "same verdict once they are gone"      "$(g23 "$W23" 'git add * && git commit -m x')" "2"
-
-# (b) quote stripping. Only TRAILING quotes were stripped (single twice, double once); a LEADING
-# single quote survived, so `cd '<dir>'` never resolved to a directory. Both directions were wrong:
-# it mis-blocked the parent committing in the primary checkout (b1) and it let a quoted `-C
-# <worktree>` out of a parent shell escape the gate entirely (b3).
-eq "cd '<primary>' resolves"              "$(g23 "$W23" "cd '$G23' && git commit -m x")" "0"
-eq "cd \"<primary>\" still resolves"      "$(g23 "$W23" "cd \"$G23\" && git commit -m x")" "0"
-eq "-C '<worktree>' is blocked"           "$(g23 "$G23" "git -C '$W23' commit -m x")" "2"
-eq "unbalanced quote → session cwd"       "$(g23 "$W23" "cd '$G23 x' && git commit -m y")" "2"
-eq "bare path still resolves"             "$(g23 "$W23" "cd $G23 && git commit -m x")" "0"
-
-# (c) `top` was read by `[ -z "$top" ]` without ever being assigned. The hook has no `set -u` and
-# `top` is a plain variable, so an inherited `top` from the caller's environment replaced the
-# session-cwd fallback outright — fail-OPEN again.
-eq "inherited \$top cannot replace the fallback" "$(g23 "$W23" 'git commit -m x' top="$G23")" "2"
-
-# the hard rule, restated: none of the above may become a silent allow, and the sentinel stays the
-# only way through
-eq "unparseable command still blocks"     "$(g23 "$W23" 'git commit -m "see docs/*.md"')" "2"
-touch "$W23/.commit-authorized"
-eq "sentinel is still the only way out"   "$(g23 "$W23" 'git commit -m x')" "0"
-eq "sentinel consumed"                    "$([ -f "$W23/.commit-authorized" ] && echo yes || echo no)" "no"
-rm -rf "$G23" "$H23"
-
 echo ""
 echo "== 19b. fail-closed path guards (partial-shell incident 2026-08-16) =="
 # Real incident: a partially-loaded shell had gwt-rm but not _gwt_dir → wtpath="/<name>" (fs ROOT)
@@ -1954,6 +2161,10 @@ grep -q "opened-tabs.tsv" "$CC/README.md" && grep -q "CC_TABS_FILE" "$CC/README.
   && ok "opened-tabs ledger documented" || no "opened-tabs ledger documented" missing present
 grep -qxF "opened-tabs.tsv" "$CC/.gitignore" \
   && ok "opened-tabs.tsv gitignored" || no "opened-tabs.tsv gitignored" missing present
+grep -q "hooks/git-pre-commit.sh" "$CC/README.md" && grep -q "commit-authorized" "$CC/README.md" \
+  && ok "commit gate documented" || no "commit gate documented" missing present
+grep -q "no-verify" "$CC/README.md" \
+  && ok "the accepted --no-verify residue is documented" || no "the accepted --no-verify residue is documented" missing present
 
 echo ""
 echo "== 24. live-state isolation (the suite must not write the human's real files) =="

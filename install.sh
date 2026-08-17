@@ -96,7 +96,13 @@ if [ -n "$SRC" ] && [ "$SRC" != "$DEST" ]; then
   if [ -n "$DRY" ]; then say "  [dry-run] copy $(tilde "$SRC")/* → $(tilde "$DEST")/ (excluding .git/*.bak/generated)"
   else
     mkdir -p "$DEST"
-    ( cd "$SRC" && find . -type f ! -path './.git/*' ! -name '*.bak.*' \
+    # `! -name .git` is not redundant with `! -path ./.git/*`: in a LINKED WORKTREE .git is a FILE
+    # (`gitdir: …/.git/worktrees/<name>`), which the path filter does not catch. Copying it made the
+    # install dir look to git like a worktree of the SOURCE repo — `git -C <dest> rev-parse` then
+    # answered with the source's git dir, and everything keyed off that (step 4b wrote a hook into
+    # the source repo; a gwt-* run from the install dir would have operated on it too). Caught
+    # 2026-08-16 by the commit-gate migration, whose own test run leaked a hook this way.
+    ( cd "$SRC" && find . -type f ! -path './.git/*' ! -name '.git' ! -name '*.bak.*' \
         ! -name 'worktree-tasks.tsv' ! -name 'worktree-tasks-archive.tsv' ! -name 'worktree-status.tsv' \
         ! -name 'opened-tabs.tsv' ! -name 'cc-failures.log' ! -name '.DS_Store' -print0 ) \
       | while IFS= read -r -d '' f; do mkdir -p "$DEST/$(dirname "$f")"; cp -p "$SRC/$f" "$DEST/$f"; done
@@ -108,13 +114,17 @@ fi
 
 CC="$DEST"; CCT="$(tilde "$CC")"
 
-# Retired artifacts: a copy-based install never deletes what a previous version shipped, so the
-# retired tab-close gate would sit in the install dir forever, unregistered but present (and
-# confusing). Its registration is swept in step 4; the file goes here.
-if [ -f "$CC/hooks/block-unsafe-close.sh" ]; then
-  if [ -n "$DRY" ]; then say "  [dry-run] remove retired hooks/block-unsafe-close.sh"
-  else rm -f "$CC/hooks/block-unsafe-close.sh" && say "  ✓ removed retired hooks/block-unsafe-close.sh (tab-close gate retired 2026-08-16)"; fi
-fi
+# Retired artifacts: a copy-based install never deletes what a previous version shipped, so a
+# retired PreToolUse gate would sit in the install dir forever, unregistered but present (and
+# confusing). Their registrations are swept in step 4; the files go here.
+#   block-unsafe-close.sh    — tab-close text gate, retired 2026-08-16 (ledgers + sanctioned paths)
+#   block-worktree-commit.sh — commit text gate, retired 2026-08-16; replaced by hooks/git-pre-commit.sh,
+#                              which git itself runs at commit time (step 4b)
+for retired in block-unsafe-close.sh block-worktree-commit.sh; do
+  [ -f "$CC/hooks/$retired" ] || continue
+  if [ -n "$DRY" ]; then say "  [dry-run] remove retired hooks/$retired"
+  else rm -f "$CC/hooks/$retired" && say "  ✓ removed retired hooks/$retired (PreToolUse text gate, retired 2026-08-16)"; fi
+done
 
 # ── 1. Executable bits ──
 say "▸ 1. executable bits"
@@ -162,12 +172,10 @@ SET_NEW=""
 # changing anything" still holds — a no-op re-run of a deliberately re-runnable installer just
 # stops growing one more generation of *.bak.<ts> every time.
 CC_SET="$SET" CC_HOOK="$CCT/cc-hooks.sh worktree" CC_STAT="$CCT/cc-hooks.sh status" \
-CC_PRE_COMMIT="$CCT/hooks/block-worktree-commit.sh" \
 CC_TS="$ts" CC_CREATED="$SET_NEW" \
 CC_DRY="$DRY" python3 - <<'PY'
 import json,os,shutil,sys,tempfile
 p=os.environ["CC_SET"];hook=os.environ["CC_HOOK"];stat=os.environ["CC_STAT"];dry=os.environ.get("CC_DRY","")
-pre=[os.environ["CC_PRE_COMMIT"]]
 TS=os.environ.get("CC_TS","");HM=os.environ.get("HOME","");created=os.environ.get("CC_CREATED","")
 def tilde(q): return "~"+q[len(HM):] if HM and q.startswith(HM+"/") else q
 def bak(q):                        # call only once the write is decided; a file this run created itself has no prior state
@@ -191,26 +199,24 @@ if not has("PostToolUse",hook): hk.setdefault("PostToolUse",[]).append({"matcher
 # Lifecycle events, not tool events → no matcher key.
 for ev in ("UserPromptSubmit","Stop","Notification"):
     if not has(ev,stat): hk.setdefault(ev,[]).append({"hooks":[{"type":"command","command":stat}]}); added.append(ev)
-# PreToolUse gate (Bash): the commit gate — worktree sub-tasks may not commit without the human's
-# sentinel. It lives in the repo under hooks/ and is installed with everything else; it used to
-# sit UNVERSIONED in ~/.claude/hooks/, whose registration is swept below.
-# (The tab-close gate that used to be registered here — hooks/block-unsafe-close.sh, a
-# PreToolUse text parser over every Bash command — was RETIRED on 2026-08-16: the close policy
-# now lives in the ledgers + the sanctioned paths + the CLAUDE.md rules, with no mechanical
-# interception layer. Its registration is swept below like any other stale hook.)
-for cmd_ in pre:
-    if not has("PreToolUse",cmd_):
-        hk.setdefault("PreToolUse",[]).append({"matcher":"Bash","hooks":[{"type":"command","command":cmd_}]})
-        added.append("PreToolUse:"+os.path.basename(cmd_))
+# NOTHING is registered on PreToolUse any more. Both text-parsing gates that used to live there
+# were retired on 2026-08-16 and are swept below:
+#   block-unsafe-close.sh    — tab-close gate; the close policy now lives in the two ledgers + the
+#                              sanctioned `cc-dispatch.sh close` path + the CLAUDE.md rules.
+#   block-worktree-commit.sh — commit gate; it now runs where git itself runs it, as the repo's
+#                              pre-commit hook (step 4b). A PreToolUse hook could only ever guess
+#                              the commit's target out of the command TEXT, and on 2026-08-16 it
+#                              guessed wrong in both directions on one day — blocking briefs that
+#                              merely quoted `git … commit`, waving through a real
+#                              `git -C "$W" commit` whose directory hid inside a variable.
 # Migration: strip stale hook commands from older layouts, wherever they appear — cc-notify.sh
 # (long gone), cc-worktree-cmux-hook.sh / cc-status-hook.sh (absorbed into cc-hooks.sh by the
-# cc-* consolidation), the pre-repo ~/.claude/hooks/ copy of the commit gate, and the retired
-# tab-close gate (block-unsafe-close.sh, matched on the BARE file name so both the repo and the
-# old ~/.claude/hooks/ registration go). Only matching
-# commands are removed; every other hook is left untouched (the registrations above share these
-# events and must survive the sweep — note the stale entry is matched on the OLD .claude/hooks/
-# path, which the new <cc-stack>/hooks/ command never contains).
-STALE=("cc-notify","cc-worktree-cmux-hook.sh","cc-status-hook.sh",".claude/hooks/block-worktree-commit.sh","block-unsafe-close.sh")
+# cc-* consolidation), and the two retired gates, each matched on the BARE file name so every
+# registration goes: the repo copy, and the pre-repo ~/.claude/hooks/ one. Only matching commands
+# are removed; every other hook is left untouched (the registrations above share these events and
+# must survive the sweep — and no surviving registration contains either bare name, so the sweep
+# cannot bite the live stack).
+STALE=("cc-notify","cc-worktree-cmux-hook.sh","cc-status-hook.sh","block-worktree-commit.sh","block-unsafe-close.sh")
 removed=[]
 for ev in list(hk.keys()):
     groups=hk.get(ev,[]) or []
@@ -240,6 +246,33 @@ if added: msg.append("added: "+", ".join(added))
 if removed: msg.append("removed stale hooks on: "+", ".join(removed))
 print("  ✓ "+"; ".join(msg))
 PY
+
+# ── 4b. Commit gate (git's own pre-commit hook) ──
+# Every OTHER repo gets the gate the moment cc-stack opens a tab for a worktree in it
+# (cc-dispatch.sh surface / workspace mount it). What this step covers is the INSTALL DIR, so
+# cc-stack's own sub-tasks are gated without waiting for the first dispatch.
+# .git/hooks is shared by every linked worktree, so this is once per repo, and re-running is a
+# no-op. A repo with core.hooksPath, or with a pre-commit that is not ours, is reported and left
+# to the human — the mount logic never overwrites someone else's hook.
+#
+# ONLY $DEST, deliberately — never the clone the installer happened to be run from. That version
+# lasted one test run: `bash test.sh` from a cc-stack WORKTREE runs install.sh with --dir <tmp>,
+# and the source-clone arm resolved the worktree to its parent repo and mounted a hook in the
+# live cc-stack checkout that nobody asked for. An installer writes into the directory it was
+# given; a repo it merely read files from is not a target. A dev clone gets the gate at its first
+# dispatch anyway, exactly like every other repo.
+say "▸ 4b. commit gate (git pre-commit)"
+if [ -n "$DRY" ]; then
+  say "  [dry-run] would mount $CCT/hooks/git-pre-commit.sh as $CCT/.git/hooks/pre-commit (if the install dir is a repo)"
+elif ! git -C "$CC" rev-parse --git-dir >/dev/null 2>&1; then
+  say "  – $CCT is not a git repo, nothing to gate here (every repo cc-stack dispatches into still gets it)"
+else
+  out="$(bash "$CC/cc-dispatch.sh" commit-gate mount "$CC" 2>&1)"; rc=$?
+  if [ -n "$out" ]; then printf '%s\n' "$out" | sed 's/^  ↳ commit gate: /  ✓ /'
+  elif [ "$rc" = 0 ]; then say "  ✓ already mounted on $CCT"; fi
+  [ "$rc" = 0 ] || say "  ⚠ not mounted on $CCT (see above) — every other repo is still gated at dispatch time"
+  say "  note: --no-verify bypasses this by design; the gate stops a slip, it is not a security boundary"
+fi
 
 # ── 5. Global CLAUDE.md rules ──
 say "▸ 5. global CLAUDE.md rules"

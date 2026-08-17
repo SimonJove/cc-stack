@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# cc-dispatch.sh · THE dispatch pipeline — one script, eight subcommands.
+# cc-dispatch.sh · THE dispatch pipeline — one script, nine subcommands.
 #   wt-claude <name> <prompt> [--prefix <p>] [--base <b>]   gwt-claude implementation: build/reuse
 #                                                             the worktree, then delegate to surface
 #                                                             [absorbs cc-worktree-claude.sh]
@@ -26,7 +26,17 @@
 #                                                             rows whose tab is still gone, replaying
 #                                                             the RECORDED launch args (uuid/provider/
 #                                                             pm/model) in the RECORDED dir verbatim
+#   commit-gate mount|unmount <dir>                          THE commit gate: install/remove git's own
+#                                                             pre-commit hook on the repo that contains
+#                                                             <dir> (once per repo — .git/hooks is shared
+#                                                             by every linked worktree). Called from
+#                                                             surface/workspace on every worktree open
 set -u
+
+# This script's own directory. The hook body the commit gate installs is read from here, so a
+# worktree checkout mounts ITS OWN copy (the same "a worktree tests itself" contract test.sh has).
+CC_SELF="$( (CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd -P) 2>/dev/null )"
+[ -n "$CC_SELF" ] || CC_SELF="$HOME/.config/cc-stack"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # cc-send — the collision-safe send primitive (roadmap 2b, design finalized 2026-08-15).
@@ -349,6 +359,134 @@ _cc_gitroot(){ # $1 = a directory
   printf '%s' "$_ccgr"
 }
 
+# _cc_gitcommon — a DIRECTORY → the repo's COMMON git dir, always ABSOLUTE. Same cd-inside-the-target
+# discipline as _cc_gitroot above, and for the same reason (a main checkout answers `.git`, relative).
+# The common dir is what every linked worktree SHARES — which is why the commit gate mounts once per
+# repo and not once per worktree (live-probed 2026-08-16: a hook in <main>/.git/hooks fires for
+# commits made inside a linked worktree).
+_cc_gitcommon(){ # $1 = a directory
+  [ -n "${1:-}" ] || return 1
+  _ccgc="$( (CDPATH= cd -- "$1" 2>/dev/null || exit 1
+             _ccg="$(git rev-parse --git-common-dir 2>/dev/null)" || exit 1
+             [ -n "$_ccg" ] || exit 1
+             CDPATH= cd -- "$_ccg" 2>/dev/null || exit 1
+             pwd -P) 2>/dev/null )"
+  [ -n "$_ccgc" ] || return 1
+  printf '%s' "$_ccgc"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# THE COMMIT GATE (2026-08-16, feat/commit-gate-git) — mount/unmount hooks/git-pre-commit.sh as
+# <repo-common-git-dir>/hooks/pre-commit. See that file's header for WHY it is a git hook and not a
+# PreToolUse text parser, and for the deliberately accepted `--no-verify` bypass.
+#
+# COEXISTENCE (the hard red line: a downstream project's own hooks must not stop working).
+#   • core.hooksPath configured → REFUSE, loudly, and change nothing. Setting it ourselves would
+#     silently disable the project's entire hook set (probed: its commit-msg stopped running); and
+#     writing into the path it names is no better — git resolves a RELATIVE core.hooksPath against
+#     each working tree separately, so the file would land in the main checkout's WORKING TREE and
+#     be invisible to the very worktrees we mean to gate. Rare enough to hand to a human.
+#   • a foreign pre-commit already there → PRESERVED as pre-commit.cc-stack-orig (git only ever
+#     runs the exact name `pre-commit`, so the saved copy is inert) and exec'd by our hook once the
+#     gate passes. Nothing is ever overwritten, and commit-msg / every other hook is untouched.
+#   • already ours → replaced only when the body actually differs (upgrade), so re-mounting is
+#     silent and can never nest a second copy of the logic.
+#   • ours displaced by a stranger while a saved original is still on disk → ambiguous, REFUSE.
+# Output discipline: silent + rc 0 when already in place (this runs on every dispatch), one line
+# when something changes, a loud stderr refusal + rc 3 when it will not touch the repo.
+_ccgate_marker='cc-stack:commit-gate'
+_ccgate_hooksdir(){ # $1 = a directory inside the repo → the hooks dir to mount into (rc!=0 = don't)
+  _cgcommon="$(_cc_gitcommon "${1:-}")" || return 1
+  _cghp="$(git -C "$1" config --get core.hooksPath 2>/dev/null)"
+  [ -z "$_cghp" ] || return 2
+  # The working tree we resolved must be one this repo actually KNOWS. A stray or copied `.git`
+  # pointer file makes an arbitrary directory answer `rev-parse` with somebody else's git dir — and
+  # then a hook meant for that directory lands in a repo nobody named. (Not hypothetical: install.sh
+  # used to copy a worktree's `.git` file into the install dir, and that is exactly how this
+  # migration's own test run wrote a hook into the live cc-stack checkout.) `git worktree list` is
+  # the repo's own answer to "is this really mine", so ask it and fail closed.
+  _cgtop="$(git -C "$1" rev-parse --show-toplevel 2>/dev/null)" || return 4
+  [ -n "$_cgtop" ] || return 4
+  git -C "$1" worktree list --porcelain 2>/dev/null | grep -qxF "worktree $_cgtop" || return 4
+  printf '%s' "$_cgcommon/hooks"
+}
+_ccgate_install(){ # $1 = src, $2 = dest — write then rename, so a half-copied hook is never runnable
+  _cgtmp="$2.cc-stack.$$"
+  cp -- "$1" "$_cgtmp" 2>/dev/null || return 1
+  chmod +x "$_cgtmp" 2>/dev/null
+  mv -f -- "$_cgtmp" "$2" 2>/dev/null || { rm -f "$_cgtmp" 2>/dev/null; return 1; }
+}
+_cc_commit_gate(){ # $1 = mount|unmount, $2 = a directory inside the target repo
+  _cgact="${1:-}"; _cgdir="${2:-}"
+  [ -d "$_cgdir" ] || { echo "✗ commit gate: not a directory: $_cgdir" >&2; return 1; }
+  _cghd="$(_ccgate_hooksdir "$_cgdir")"; _cgrc=$?
+  if [ "$_cgrc" = 2 ]; then
+    echo "✗ commit gate: $_cgdir routes hooks through core.hooksPath — refusing to touch it." >&2
+    echo "  cc-stack never overrides core.hooksPath (it silently disables the project's own hooks)." >&2
+    echo "  Mount by hand if you want the gate here: copy $CC_SELF/hooks/git-pre-commit.sh into that dir as pre-commit." >&2
+    return 3
+  fi
+  if [ "$_cgrc" = 4 ]; then
+    echo "✗ commit gate: $_cgdir resolves to a git dir that does not list it as a worktree — refusing." >&2
+    echo "  A stray or copied .git pointer file does this; mounting would put a hook in a repo nobody named." >&2
+    return 3
+  fi
+  [ "$_cgrc" = 0 ] && [ -n "$_cghd" ] || { echo "✗ commit gate: not inside a git repo: $_cgdir" >&2; return 1; }
+  _cgtgt="$_cghd/pre-commit"; _cgorig="$_cghd/pre-commit.cc-stack-orig"
+  _cgmine=""; [ -f "$_cgtgt" ] && grep -q "$_ccgate_marker" "$_cgtgt" 2>/dev/null && _cgmine=1
+
+  case "$_cgact" in
+    unmount)
+      if [ ! -e "$_cgtgt" ]; then echo "  ↳ commit gate: not mounted on $_cghd"; return 0; fi
+      if [ -z "$_cgmine" ]; then
+        echo "✗ commit gate: $_cgtgt is not ours — left untouched." >&2; return 3
+      fi
+      if [ -e "$_cgorig" ]; then
+        mv -f -- "$_cgorig" "$_cgtgt" 2>/dev/null || { echo "✗ commit gate: could not restore $_cgorig" >&2; return 1; }
+        echo "  ↳ commit gate: removed, restored the project's original pre-commit"
+      else
+        rm -f -- "$_cgtgt" 2>/dev/null || { echo "✗ commit gate: could not remove $_cgtgt" >&2; return 1; }
+        echo "  ↳ commit gate: removed from $_cghd"
+      fi
+      return 0 ;;
+    mount) : ;;
+    *) echo "usage: cc-dispatch.sh commit-gate mount|unmount <dir>" >&2; return 2 ;;
+  esac
+
+  _cgsrc="$CC_SELF/hooks/git-pre-commit.sh"
+  [ -r "$_cgsrc" ] || { echo "✗ commit gate: hook body missing: $_cgsrc" >&2; return 1; }
+  mkdir -p "$_cghd" 2>/dev/null || { echo "✗ commit gate: cannot create $_cghd" >&2; return 1; }
+
+  if [ -n "$_cgmine" ]; then
+    cmp -s "$_cgsrc" "$_cgtgt" 2>/dev/null && { chmod +x "$_cgtgt" 2>/dev/null; return 0; }   # already in place
+    _ccgate_install "$_cgsrc" "$_cgtgt" || { echo "✗ commit gate: cannot update $_cgtgt" >&2; return 1; }
+    echo "  ↳ commit gate: updated $_cgtgt"
+    return 0
+  fi
+  if [ -e "$_cgtgt" ]; then
+    if [ -e "$_cgorig" ]; then
+      echo "✗ commit gate: $_cgtgt is a foreign hook but $_cgorig already exists — refusing to guess." >&2
+      echo "  Resolve by hand: keep the one you want as pre-commit, delete or rename the other." >&2
+      return 3
+    fi
+    mv -f -- "$_cgtgt" "$_cgorig" 2>/dev/null || { echo "✗ commit gate: cannot preserve $_cgtgt" >&2; return 1; }
+    _ccgate_install "$_cgsrc" "$_cgtgt" || { mv -f -- "$_cgorig" "$_cgtgt" 2>/dev/null; echo "✗ commit gate: cannot write $_cgtgt" >&2; return 1; }
+    echo "  ↳ commit gate: mounted on $_cghd (kept the project's pre-commit as pre-commit.cc-stack-orig; it still runs)"
+    return 0
+  fi
+  _ccgate_install "$_cgsrc" "$_cgtgt" || { echo "✗ commit gate: cannot write $_cgtgt" >&2; return 1; }
+  echo "  ↳ commit gate: mounted on $_cghd"
+  return 0
+}
+# Dispatch-path entry: gate the repo behind a worktree we are about to open a tab for. Deliberately
+# scoped to the gated LAYOUT — `surface <dir>` is a public subcommand and may be handed a plain main
+# checkout, which has no sub-task to gate and no business receiving a hook it never asked for.
+_cc_commit_gate_auto(){ # $1 = the directory a tab is being opened for
+  case "${1:-}" in
+    */.claude/worktrees/*|*/.worktrees/*) _cc_commit_gate mount "$1" || true ;;
+  esac
+}
+
 case "${1:-}" in
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -426,6 +564,11 @@ path="${1:-}"; prompt="${2:-}"
 abspath="$(cd "$path" 2>/dev/null && pwd -P)" || exit 2
 # Resume mode (gwt-resume reopen): CC_WT_LAUNCH_CMD carries the fully composed replay command.
 rsmode="${CC_WT_LAUNCH_CMD:+1}"
+
+# ── Commit gate ── mount git's own pre-commit on this worktree's repo. Deliberately BEFORE the cmux
+# checks below: the worktree already exists by now, and a cmux hiccup that costs us the tab must not
+# also cost us the gate. Idempotent and silent once mounted (once per repo — .git/hooks is shared).
+_cc_commit_gate_auto "$abspath"
 
 # Failure breadcrumb: log + best-effort cmux desktop notification, so "built a worktree but no tab" is discoverable (gwt-status surfaces it)
 _fail() {
@@ -1324,6 +1467,11 @@ abspath="$(cd "$path" 2>/dev/null && pwd -P)" || exit 2
 name="${2:-$(basename "$abspath")}"
 focus="${3:-false}"
 
+# ── Commit gate ── same as the surface path: gwt-new / gwt-adopt reach a brand-new worktree through
+# here, so this is the second (and last) place a cc-stack worktree gets created. Before the dedup
+# below, so a re-run on an already-open workspace still repairs a missing gate.
+_cc_commit_gate_auto "$abspath"
+
 # Dedup (best effort): if this absolute path already shows up in the workspace list, don't open again
 if cmux list-workspaces 2>/dev/null | grep -qF "$abspath"; then
   exit 0
@@ -1354,6 +1502,17 @@ _cctabs_log "$wsuuid" "${CC_CALLER_SURFACE_UUID:-${CMUX_SURFACE_ID:-}}" "$abspat
 exit 0
 ;;
 
+# ─────────────────────────────────────────────────────────────────────────────
+# commit-gate — mount/unmount THE commit gate on the repo that contains <dir>. The dispatch paths
+#   call the same code automatically; this subcommand is the human's handle on it (install.sh uses
+#   it too, and `unmount` makes the whole mechanism reversible without hand-editing .git/hooks).
+# Usage: cc-dispatch.sh commit-gate mount|unmount <dir>
+commit-gate)
+shift
+[ $# -ge 2 ] || { echo "usage: cc-dispatch.sh commit-gate mount|unmount <dir>" >&2; exit 2; }
+_cc_commit_gate "$1" "$2"; exit $?
+;;
+
 *)
-  echo "usage: cc-dispatch.sh wt-claude <name> <prompt> [--prefix <p>] [--base <b>] | surface <path> [prompt] | send <surface-ref> \"<text>\" | calibrate <surface-ref> [label] | close <worktree-dir> | tabs [--all] | resume [--all] | workspace <path> [name] [focus]" >&2; exit 2 ;;
+  echo "usage: cc-dispatch.sh wt-claude <name> <prompt> [--prefix <p>] [--base <b>] | surface <path> [prompt] | send <surface-ref> \"<text>\" | calibrate <surface-ref> [label] | close <worktree-dir> | tabs [--all] | resume [--all] | workspace <path> [name] [focus] | commit-gate mount|unmount <dir>" >&2; exit 2 ;;
 esac
