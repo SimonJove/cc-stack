@@ -844,6 +844,85 @@ grep -q 'cc-dispatch.sh send \$caller_surface' "$CC/cc-dispatch.sh" && ok "backc
 PATH="$OPATH"; unset CC_FAKE_LOG CC_FAKE_SCREEN CC_SEND_VERIFY_SEC; rm -rf "$FS"
 
 echo ""
+echo "== 22. install.sh CLI / idempotence / backups + the rules doc's gwt-done form =="
+# Audit findings F3 / F11 / F15 (install.sh), F8 (claude-rules.md), F17 (README anchors).
+# HARD RULE for this whole section: every install run is HOME-overridden into a scratch dir, so
+# the live ~/.zshrc, ~/.claude/settings.json and ~/.claude/CLAUDE.md are never read or written.
+I22=$(mktemp -d); I22="$(CDPATH= cd -- "$I22" && pwd -P)"
+# F3 needs a hard timeout: the pre-fix arg loop spins forever on a value-less flag (bash `shift 2`
+# with $#<2 returns 1 WITHOUT shifting, and the script sets only -u), which would wedge the suite.
+tmo(){ local __s="$1"; shift
+  if command -v timeout  >/dev/null 2>&1; then timeout  "$__s" "$@"; return $?; fi
+  if command -v gtimeout >/dev/null 2>&1; then gtimeout "$__s" "$@"; return $?; fi
+  "$@" & local __p=$!; ( sleep "$__s"; kill -9 "$__p" 2>/dev/null ) >/dev/null 2>&1 & local __k=$!
+  wait "$__p" 2>/dev/null; local __r=$?; kill "$__k" 2>/dev/null; return "$__r"; }
+A22="$(tmo 10 env HOME="$I22" bash "$CC/install.sh" --dir 2>&1)"; RA22=$?
+eq "F3 --dir without a value exits 2"          "$RA22" "2"
+eq "F3 --dir without a value names the flag"   "$(printf '%s' "$A22" | grep -c -- '--dir')" "1"
+A22="$(tmo 10 env HOME="$I22" bash "$CC/install.sh" --repo 2>&1)"; RA22=$?
+eq "F3 --repo without a value exits 2"         "$RA22" "2"
+eq "F3 a value-less flag installs nothing"     "$([ -e "$I22/.zshrc" ] || [ -e "$I22/.claude" ] && echo touched || echo clean)" "clean"
+# F11: step 3's idempotence check must judge THIS target's line only. A .zshrc line pointing at
+# some OTHER cc-stack copy used to satisfy it (the first grep matched the bare substring
+# "cc-stack/worktree.zsh"), so moving the install with `--dir <new place>` left the new location
+# never sourced at all — while the README advertises installing anywhere. Both dirs are therefore
+# named cc-stack here: that IS the collision.
+H22="$I22/home"; mkdir -p "$H22"
+env HOME="$H22" bash "$CC/install.sh" --yes --dir "$H22/one/cc-stack" >/dev/null 2>&1
+eq "F11 first install sources its own dir"     "$(grep -cF 'one/cc-stack/worktree.zsh' "$H22/.zshrc" 2>/dev/null)" "1"
+B22="$(env HOME="$H22" bash "$CC/install.sh" --yes --dir "$H22/two/cc-stack" 2>&1)"
+eq "F11 a second dir gets its own source line" "$(grep -cF 'two/cc-stack/worktree.zsh' "$H22/.zshrc" 2>/dev/null)" "1"
+eq "F11 the other copy's line is kept"         "$(grep -cF 'one/cc-stack/worktree.zsh' "$H22/.zshrc" 2>/dev/null)" "1"
+eq "F11 and it says so instead of silently"    "$(printf '%s' "$B22" | grep -c 'already sources another cc-stack')" "1"
+env HOME="$H22" bash "$CC/install.sh" --yes --dir "$H22/two/cc-stack" >/dev/null 2>&1
+eq "F11 re-running the same dir adds no dup"   "$(grep -cF 'two/cc-stack/worktree.zsh' "$H22/.zshrc" 2>/dev/null)" "1"
+eq "F8 installed CLAUDE.md carries the path"   "$(grep -c '~/.config/cc-stack/gwt-done' "$H22/.claude/CLAUDE.md" 2>/dev/null)" "1"
+# F15: bak() used to fire before the three python blocks decided whether anything changes, so every
+# re-run of an installer README sells as "idempotent, re-runnable" grew one more generation of
+# ~/.zshrc.bak.* / settings.json.bak.* / CLAUDE.md.bak.*.
+H15="$I22/home15"; mkdir -p "$H15"
+nb(){ ls -1 "$H15"/.zshrc.bak.* "$H15"/.claude/settings.json.bak.* "$H15"/.claude/CLAUDE.md.bak.* 2>/dev/null | wc -l | tr -d ' '; }
+env HOME="$H15" bash "$CC/install.sh" --yes --dir "$H15/cc" >/dev/null 2>&1
+eq "F15 fresh install backs up nothing"        "$(nb)" "0"
+sleep 1                                        # the .bak suffix has 1s resolution
+env HOME="$H15" bash "$CC/install.sh" --yes --dir "$H15/cc" >/dev/null 2>&1
+eq "F15 no-op re-run backs up nothing"         "$(nb)" "0"
+# …but a run that really changes something still backs up first (README: "backs up before changing
+# anything") — seed a stale registration so step 4 has to rewrite settings.json
+python3 -c 'import json,sys
+p=sys.argv[1]+"/.claude/settings.json"
+d=json.load(open(p)); d["hooks"]["Stop"]=[{"hooks":[{"type":"command","command":"~/old/cc-notify.sh"}]}]
+json.dump(d,open(p,"w"))' "$H15"
+sleep 1
+env HOME="$H15" bash "$CC/install.sh" --yes --dir "$H15/cc" >/dev/null 2>&1
+eq "F15 a real change still backs up first"    "$(ls -1 "$H15"/.claude/settings.json.bak.* 2>/dev/null | wc -l | tr -d ' ')" "1"
+eq "F15 the backup holds the PRE state"        "$(grep -c 'cc-notify' "$H15"/.claude/settings.json.bak.* 2>/dev/null)" "1"
+eq "F15 the live file was really rewritten"    "$(grep -c 'cc-notify' "$H15/.claude/settings.json")" "0"
+sleep 1
+env HOME="$H15" bash "$CC/install.sh" --yes --dry-run --dir "$H15/cc" >/dev/null 2>&1
+eq "F15 dry-run writes no backup either"       "$(nb)" "1"
+# F8: claude-rules.md is the single source of the ~/.claude/CLAUDE.md managed block, and a sub-task
+# reads it as often as the working agreement — so it must teach the same deterministic form §19
+# guards for cc-dispatch.sh clause 4: a bare gwt-done is a zsh function that does not exist in the
+# sub-task's non-interactive bash (incident 2026-08-16).
+R22="$(grep -F 'gwt-done' "$CC/claude-rules.md" | grep -F 'Do run' | head -1)"
+eq "rules teach the absolute gwt-done path"    "$(printf '%s' "$R22" | grep -c '~/.config/cc-stack/gwt-done')" "1"
+eq "rules warn the bare name is zsh-only"      "$(printf '%s' "$R22" | grep -c 'zsh function')" "1"
+eq "rules never say to run a bare gwt-done"    "$(grep -c 'run `gwt-done`' "$CC/claude-rules.md")" "0"
+# F17: every in-page README anchor must resolve to a real heading (the TOC still pointed at
+# "#three-channels" after the section was renamed "Two channels").
+BR22="$(python3 - "$CC/README.md" <<'PY'
+import re,sys
+t=re.sub(r"(?ms)^```.*?^```","",open(sys.argv[1],encoding="utf-8").read())
+def slug(h): return "".join(c for c in h.strip().lower() if c.isalnum() or c in " -_").replace(" ","-")
+hd=set(slug(m.group(1)) for m in re.finditer(r"(?m)^#+\s+(.*)$",t))
+print(" ".join(sorted(set(a for a in re.findall(r"\]\(#([^)]+)\)",t) if a not in hd))))
+PY
+)"
+eq "F17 every README anchor resolves"          "$BR22" ""
+rm -rf "$I22"
+
+echo ""
 echo "== 17. gwt-resume (roadmap 2: recorded-args session resume) =="
 # fake cmux (PATH shim): every call lands in $RF/log; list-pane-surfaces serves $RF/live,
 # new-surface mints surface:101+ recording its args, read-screen serves a screen that is a

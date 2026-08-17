@@ -17,14 +17,21 @@
 #     --cmux                         hint about recommended cmux.json settings
 set -u
 
+say(){ printf '%s\n' "$*"; }
+
 DEFAULT_REPO="https://github.com/SimonJove/cc-stack.git"
 DEFAULT_DEST="$HOME/.config/cc-stack"
 
+# A value-taking flag given no value used to HANG the installer: bash's `shift 2` with $# < 2
+# returns 1 without shifting, and this script sets only -u (no -e), so $# stayed 1 forever.
+# Taking "${2:-}" silently would be worse than stopping — `--dir` with no path would install into
+# the default dir, i.e. somewhere the caller did not ask for. Fail loudly instead.
+need(){ [ "$1" -ge 2 ] || { say "✗ $2 needs $3"; exit 2; }; }
 DEST=""; REPO=""; YES=""; DRY=""; CMUX=""
 while [ $# -gt 0 ]; do
   case "$1" in
-    --dir) DEST="${2:-}"; shift 2;;
-    --repo) REPO="${2:-}"; shift 2;;
+    --dir) need $# --dir "a path (e.g. --dir ~/.config/cc-stack)"; DEST="$2"; shift 2;;
+    --repo) need $# --repo "a URL (e.g. --repo $DEFAULT_REPO)"; REPO="$2"; shift 2;;
     --yes|-y) YES=1; shift;;
     --dry-run) DRY=1; shift;;
     --cmux) CMUX=1; shift;;
@@ -35,7 +42,6 @@ DEST="${DEST:-${CC_STACK_DIR:-}}"
 REPO="${REPO:-${CC_STACK_REPO:-$DEFAULT_REPO}}"
 ts="$(date +%Y%m%d-%H%M%S)"
 
-say(){ printf '%s\n' "$*"; }
 tilde(){ case "$1" in "$HOME"/*) printf '~%s' "${1#$HOME}";; *) printf '%s' "$1";; esac; }
 # Interactive input (reads from /dev/tty even when stdin is a pipe, e.g. curl|bash); --yes or no tty → take default
 ask(){ local __v="$1" __p="$2" __d="$3" __a=""
@@ -125,9 +131,22 @@ ext=""; for c in cmux claude; do command -v "$c" >/dev/null 2>&1 || ext="$ext $c
 # ── 3. zsh loading ──
 say "▸ 3. zsh auto-source"
 RC="$HOME/.zshrc"
-if [ -f "$RC" ] && grep -qF "cc-stack/worktree.zsh" "$RC" 2>/dev/null; then say "  ✓ already configured, skipping"
-elif [ -f "$RC" ] && grep -qF "$CCT/worktree.zsh" "$RC" 2>/dev/null; then say "  ✓ already configured, skipping"
+# Idempotence judges the line for THIS target only, in either spelling we ever write it. The old
+# check also accepted the bare substring "cc-stack/worktree.zsh", so an .zshrc left over from an
+# install into a DIFFERENT directory satisfied it and the new location was never sourced at all —
+# while the README advertises --dir <anywhere>.
+if [ -f "$RC" ] && { grep -qF "$CCT/worktree.zsh" "$RC" 2>/dev/null || grep -qF "$CC/worktree.zsh" "$RC" 2>/dev/null; }; then
+  say "  ✓ already sourcing $CCT, skipping"
 else
+  OTHERS=""
+  [ -f "$RC" ] && OTHERS="$(grep -F '/worktree.zsh' "$RC" 2>/dev/null | grep -vF "$CCT/worktree.zsh" | grep -vF "$CC/worktree.zsh")"
+  # Old lines are KEPT: a second copy can be deliberate, and pruning someone's .zshrc is not the
+  # installer's call. But never silently — ours is appended last, so this target is the one that wins.
+  if [ -n "$OTHERS" ]; then
+    say "  ⚠ $(tilde "$RC") already sources another cc-stack copy:"
+    printf '%s\n' "$OTHERS" | sed 's/^/      /'
+    say "    kept as-is; this install is appended after it, so $CCT wins. Delete the old line by hand if you meant to move."
+  fi
   bak "$RC"
   if [ -z "$DRY" ]; then { printf '\n# cc-stack: cmux + git worktree dev stack\nfor f in %s/worktree.zsh %s/aliases.zsh; do\n  [ -r "$f" ] && source "$f"\ndone\n' "$CCT" "$CCT"; } >> "$RC"; fi
   say "  ✓ added to $(tilde "$RC")"
@@ -136,14 +155,27 @@ fi
 # ── 4. Claude Code hooks ──
 say "▸ 4. Claude Code hooks (settings.json)"
 SET="$HOME/.claude/settings.json"; mkdir -p "$HOME/.claude"
-[ -f "$SET" ] || { [ -n "$DRY" ] || echo '{}' > "$SET"; say "  (created settings.json)"; }
-bak "$SET"
+SET_NEW=""
+[ -f "$SET" ] || { [ -n "$DRY" ] || echo '{}' > "$SET"; SET_NEW=1; say "  (created settings.json)"; }
+# No `bak` here any more. Steps 4/5/6 each already compute whether the content changes at all;
+# the backup now happens inside that python, right before the write. README's "backs up before
+# changing anything" still holds — a no-op re-run of a deliberately re-runnable installer just
+# stops growing one more generation of *.bak.<ts> every time.
 CC_SET="$SET" CC_HOOK="$CCT/cc-hooks.sh worktree" CC_STAT="$CCT/cc-hooks.sh status" \
 CC_PRE_COMMIT="$CCT/hooks/block-worktree-commit.sh" \
+CC_TS="$ts" CC_CREATED="$SET_NEW" \
 CC_DRY="$DRY" python3 - <<'PY'
-import json,os,sys,tempfile
+import json,os,shutil,sys,tempfile
 p=os.environ["CC_SET"];hook=os.environ["CC_HOOK"];stat=os.environ["CC_STAT"];dry=os.environ.get("CC_DRY","")
 pre=[os.environ["CC_PRE_COMMIT"]]
+TS=os.environ.get("CC_TS","");HM=os.environ.get("HOME","");created=os.environ.get("CC_CREATED","")
+def tilde(q): return "~"+q[len(HM):] if HM and q.startswith(HM+"/") else q
+def bak(q):                        # call only once the write is decided; a file this run created itself has no prior state
+    if created or not os.path.exists(q): return
+    if dry: print("  [dry-run] back up "+tilde(q)); return
+    b=q+".bak."+TS
+    try: shutil.copy2(q,b); print("  backed up → "+tilde(b))
+    except Exception as e: print("  ⚠ backup failed ("+str(e)+"), changing anyway")
 try: d=json.load(open(p,encoding="utf-8"))
 except Exception: d={}
 if not isinstance(d,dict): d={}
@@ -194,6 +226,7 @@ for ev in list(hk.keys()):
         if new_groups: hk[ev]=new_groups
         else: hk.pop(ev,None)            # event emptied → drop the key, keep settings.json tidy
 if not added and not removed: print("  ✓ already in place (all hooks present, nothing stale)"); sys.exit(0)
+bak(p)
 if dry:
     msg=[]
     if added: msg.append("would add: "+", ".join(added))
@@ -212,10 +245,17 @@ PY
 say "▸ 5. global CLAUDE.md rules"
 CMD="$HOME/.claude/CLAUDE.md"; RULES="$CC/claude-rules.md"
 if [ ! -f "$RULES" ]; then say "  ✗ claude-rules.md missing, skipping"; else
-  bak "$CMD"
-  CC_CMD="$CMD" CC_RULES="$RULES" CC_DRY="$DRY" python3 - <<'PY'
-import os,sys,re,tempfile
+  CC_CMD="$CMD" CC_RULES="$RULES" CC_TS="$ts" CC_DRY="$DRY" python3 - <<'PY'
+import os,shutil,sys,re,tempfile
 cmd=os.environ["CC_CMD"];rules=os.environ["CC_RULES"];dry=os.environ.get("CC_DRY","")
+TS=os.environ.get("CC_TS","");HM=os.environ.get("HOME","")
+def tilde(q): return "~"+q[len(HM):] if HM and q.startswith(HM+"/") else q
+def bak(q):                        # backup happens only once we know the managed block really changes
+    if not os.path.exists(q): return
+    if dry: print("  [dry-run] back up "+tilde(q)); return
+    b=q+".bak."+TS
+    try: shutil.copy2(q,b); print("  backed up → "+tilde(b))
+    except Exception as e: print("  ⚠ backup failed ("+str(e)+"), changing anyway")
 B="<!-- cc-stack:begin (managed by install.sh; content comes from ~/.config/cc-stack/claude-rules.md, don't edit this block by hand) -->"
 E="<!-- cc-stack:end -->"
 body=open(rules,encoding="utf-8").read().rstrip("\n"); block=B+"\n"+body+"\n"+E+"\n"
@@ -225,6 +265,7 @@ if B in cur and E in cur: new=re.sub(re.escape(B)+r".*?"+re.escape(E)+r"\n?",blo
 elif cur.strip(): new=cur.rstrip("\n")+"\n\n"+block; act="appended managed block (kept existing content)"
 else: new=block; act="created CLAUDE.md"
 if new==cur: print("  ✓ already up to date"); sys.exit(0)
+bak(cmd)
 if dry: print("  [dry-run]",act); sys.exit(0)
 fd,tmp=tempfile.mkstemp(dir=os.path.dirname(cmd) or ".",prefix=".CLAUDE.cc.")
 with os.fdopen(fd,"w",encoding="utf-8") as f: f.write(new)
@@ -240,10 +281,17 @@ elif [ ! -f "$CC/config/cmux.json" ]; then
   say "  ✗ config/cmux.json missing, skipping"
 else
   CMUXDST="$HOME/.config/cmux/cmux.json"; mkdir -p "$HOME/.config/cmux"
-  bak "$CMUXDST"
-  CC_SRC="$CC/config/cmux.json" CC_DST="$CMUXDST" CC_DRY="$DRY" python3 - <<'PY'
-import json,os,sys,tempfile
+  CC_SRC="$CC/config/cmux.json" CC_DST="$CMUXDST" CC_TS="$ts" CC_DRY="$DRY" python3 - <<'PY'
+import json,os,shutil,sys,tempfile
 src=os.environ["CC_SRC"];dst=os.environ["CC_DST"];dry=os.environ.get("CC_DRY","")
+TS=os.environ.get("CC_TS","");HM=os.environ.get("HOME","")
+def tilde(q): return "~"+q[len(HM):] if HM and q.startswith(HM+"/") else q
+def bak(q):                        # backup happens only once the deep-merge really changes something
+    if not os.path.exists(q): return
+    if dry: print("  [dry-run] back up "+tilde(q)); return
+    b=q+".bak."+TS
+    try: shutil.copy2(q,b); print("  backed up → "+tilde(b))
+    except Exception as e: print("  ⚠ backup failed ("+str(e)+"), changing anyway")
 def load(p):
     try:
         with open(p,encoding="utf-8") as f: return json.load(f)
@@ -257,7 +305,8 @@ def merge(a,b):  # deep-merge b into a (b wins on leaves); returns merged copy
 cur=load(dst); add=load(src)
 new=merge(cur,add)
 if new==cur: print("  ✓ already up to date"); sys.exit(0)
-if dry: print("  [dry-run] would deep-merge workflow cmux.json (yours is backed up)"); sys.exit(0)
+bak(dst)
+if dry: print("  [dry-run] would deep-merge workflow cmux.json (yours would be backed up first)"); sys.exit(0)
 fd,tmp=tempfile.mkstemp(dir=os.path.dirname(dst),prefix=".cmux.cc.")
 with os.fdopen(fd,"w",encoding="utf-8") as f: json.dump(new,f,ensure_ascii=False,indent=2)
 os.replace(tmp,dst); print("  ✓ merged workflow settings into cmux.json (restart cmux, or run: cmux reload-config)")

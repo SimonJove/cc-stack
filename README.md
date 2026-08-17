@@ -7,7 +7,7 @@ Around that: a task board (`gwt-status`), lifecycle management (`gwt-*`), a one-
 ---
 
 ## Contents
-- [Three channels](#three-channels)
+- [Two channels](#two-channels)
 - [Quick start / install](#quick-start--install)
 - [Core: worktree parallel sub-tasks](#core-worktree-parallel-sub-tasks)
 - [Command cheatsheet](#command-cheatsheet)
