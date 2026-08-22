@@ -513,3 +513,45 @@ dispatcher/hook 运行态当时跑的是半成品——rules-docs 线在窗口�
 文件」;② surface 注入子任务的 working agreement 新增第 (6) 条「只在 worktree 内编辑,主
 checkout / 安装目录只读」(dispatch-fixes 线在加)。长期根治归 backlog 队列 #2
 (P1 · 硬编码路径推广自解析)。
+
+## 子任务被 API 错误/休眠打断后静默停摆,板上与"正在干活"完全同形(OPEN)
+
+**现象**(2026-08-22 实测,campaign `feature/audit-0821`):`feat/dispatch-fixes` 那条线在回复中途
+撞上 `API Error: Your computer went to sleep mid-response`,claude 停在空输入框、todo 还开着,
+**再也不会自己继续**。板上那一行显示 `working(2h)`——与"确实在跑一个长任务"一模一样。
+父会话是靠"这条线两个多小时没回报"起疑,再 `cmux read-screen` 才看到那行 API Error 的。
+
+**根因**:STATUS 列的语义是"最后一次生命周期事件是什么",不是"现在还活着吗"。
+`cc-hooks.sh status` 在 UserPromptSubmit 写 `working`、Stop 写 `idle`;一次中途夭折的回复
+**两个事件都不会再来**,于是 `working` 连同它那个旧时间戳一直挂着。sidecar 里的 ts 是唯一线索,
+而板把它渲染成 `working(2h)` 这种读起来像"忙了两小时"的形式,不是"两小时没动静"。
+
+**为什么不能靠 tab 存活判**:tab 是活的(TUI 在、进程在、`S+` 0% CPU),`✔live` 完全正确。
+死的是那一轮对话,不是进程。
+
+**修复方向**(未做):
+- 板侧最省事:给 `working` 加一个陈旧阈值(比如 >30m)渲染成 `working?(2h)` 或 `stalled?(2h)`——
+  纯显示层,不需要新数据。长任务确实会误报,但"可能卡住了,去看一眼"正是这时候该做的事。
+- 更准:`Stop` 之外再挂一个 `SubagentStop`/错误类事件(若 Claude Code 暴露),或让 hook 记录
+  `working` 时的 PID,板侧核对进程是否还在推进(CPU 时间是否增长)。
+- 无论哪种,**恢复手段已经有了且实测可用**:`cc-dispatch.sh send <ref> "继续"` 就能把它推回去
+  (本次即如此);真卡死到键盘不响应时走 `close` + `resume`(见下一条)。
+
+## cc-send 的 parked 报警有真阳性:长多行消息把 TUI 打到键盘无响应(2026-08-22 实测)
+
+**现象**:父会话用 `cc-dispatch.sh send` 往一个 **接近 auto-compact**(76% 会话)的子任务 tab
+发一条约 1100 字、多行的打回清单。输入框里**只出现了第一行、约一屏宽的字**,其余全丢;
+随后 `send-key Enter` ×3、`Escape`、`Ctrl-C` **全部无响应**,进程 `S+` 0% CPU 并非在忙。
+`cc-send` 的 post-send verify 正确判定为 parked 并写了面包屑——**这次是真阳性**
+(与「cc-send parked 面包屑无失败证据」那条记的 16/16 假阳性并存,所以证据字段是必要的)。
+
+**恢复路径**(实测一次通过,值得记住):
+```
+cc-dispatch.sh close <worktree-dir>      # 按记录的 stable uuid 关掉,不碰键盘
+cc-dispatch.sh resume                    # 按板行记录的 --resume <uuid> 重开,上下文完整
+```
+重开后是新 surface(本次 surface:4 → surface:20),板行的 ref 由 resume 自动刷新;
+随后把同一份内容**写成文件、只发一个指针**(`读 <abs-path> 并按其中的清单执行`)即刻送达。
+
+**教训**:给运行中的 tab 发长指令一律走文件指针。技能文档对"简报"已经这么要求,
+但**打回清单、追加说明这类中途消息**同样适用,而且正是最容易图省事直接内联的地方。
