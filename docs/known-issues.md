@@ -165,7 +165,8 @@ status.tsv——拿它们当断言会假阳性,而假阳性的门卫最后都会
 awk→shell 的交接用 **US (0x1f)** 而非 TAB:TAB 是 IFS whitespace,`read` 必塌缩;US 不是,空字段能原样读回。
 顺带补了两处数据安全:archive / gwt-prune 的 awk 或管道失败时不再把半成品 `mv` 覆盖任务表(原来会)。
 
-**仍未修的同类残留**:`cc-dispatch.sh` resume 段用 awk 抽 5 字段之后,又用 `IFS=$'\t' read` 读回去
+**同类残留(修于 2026-08-21,feature/audit-0821,dispatch-fixes 线;backlog 原 #4 结项)**:
+`cc-dispatch.sh` resume 段用 awk 抽 5 字段之后,又用 `IFS=$'\t' read` 读回去
 ——`$2`/`$3` 为空时同样错位,把 `r_task`/`r_largs` 挪位。dir 排第一所以不会错仓库,影响面是
 resume 误读 uuid;两个字段写侧都有 `?` 兜底,概率低。`cc-hooks.sh` 已全程 awk,无此问题。
 
@@ -387,12 +388,128 @@ capture 分支跟着跑,`CC_CALLER_CWD` 是子任务自己的 cwd,于是把
 拒绝并返回 rc 2,`gwt-merge` 连 `--force` 也不放行 —— 此前它会四项全绿、把分支合进自己、拿
 `skipped: already merged` **rc 0** 当作落地并**归档板行**,一次空操作被完整包装成一次成功。
 
-**仍未覆盖**:发起方站错目录 **且** 没给显式 base 时,记的仍是 cwd 的分支(ff 之后依旧无从分辨)。
-派发时永远带 `--base`,或派完立刻 `cc-merge.sh set-parent` 钉死。
+**仍未覆盖 → 修于 2026-08-21(feature/audit-0821,merge-target 线)**:发起方站错目录 **且** 没给
+显式 base 时,记的仍是 cwd 的分支(ff 之后依旧无从分辨)。该线把 capture 契约定死:显式本地分支
+base = merge target;其余情况(省略 / `HEAD` / tag / sha)按回落链记录,但**记了什么必须回显给派发方**
+—— gwt-claude / hook 两条路径的具体回显形态由该线实现,文档只钉住这个契约(核对回显,别赌回落);
+板行 PARENT 列即记录到的 target,复用已有分支时非显式 base 不再覆盖已记录的 target。
+同线还在处理(以 gate 后形态为准):非本地 base / detached-HEAD 回落 trunk 的记录、gwt-tree 节点来源、
+hook 性能。规则文档(claude-rules.md)随之改为"记了什么会告诉你——核对它"。
+止损纪律不变:派发永远带显式 `--base`。
 
-## gwt-tree 的 tab 存活标记仍是单 workspace(跨 workspace 问题的第五面,未修)
+## ~~gwt-tree 的 tab 存活标记仍是单 workspace(跨 workspace 问题的第五面,未修)~~ 已修(2026-08-21,feature/audit-0821,wtz-guards 线)
 
 `worktree.zsh` 的 `gwt-tree` 自己调 `cmux list-pane-surfaces` 判 `✔live`/`⌫closed`,
 **没有走** 2026-08-16 修好的跨 workspace 并集(`_cctabs_livemap`)。
 所以别的 workspace 里活着的子任务,在 `gwt-tree` 上仍会显示成 `⌫closed`。
 `cc-board.sh` / `cc-dispatch.sh`(prune / close / resume)四面都已修,只剩这一面。
+
+**修法(2026-08-21,wtz-guards 线,5e69955 落地)**:存活探测改走跨全部 workspace 并集(逐
+`--workspace` 枚举),别 workspace 里活着的子任务不再误显 `⌫closed`;匹配前剥掉选中行的前导 `*`
+再按字段精确匹配——子串匹配会把已关的 tab 显示成 live,不剥 `*` 则当前选中的那个反显示成
+closed(与 cc-dispatch.sh:334 同一 sed);workspace 枚举不完整时渲染 `?` 并打脚注,不猜。
+
+---
+
+## 2026-08-21 追记:audit-0821 campaign 转写
+
+以下条目来自 `docs/plans/audit-0821.md`(gitignored,只在主 checkout)的审计结论,由 rules-docs
+线转写入库(2026-08-21)。行号/证据按 audit 时点;标「修于」的是本轮各子任务线的计划落地,
+⚠ 一律以该线 gate 后的实际形态为准。
+
+## gwt-rm 对脏 worktree 无条件 `--force` 强删
+
+**现象**:`gwt-rm <name>` 在 worktree 有未提交改动时直接丢弃,无确认、无提示。
+**根因**:`worktree.zsh` 的 gwt-rm 实现:`git worktree remove … || git worktree remove --force …`
+—— 第一次失败(脏树)就无条件回退到 `--force`,把"删不动"当成"那就硬删"。
+**修法/修于**:修于 2026-08-21(feature/audit-0821,wtz-guards 线,5e69955 落地):拒绝判据不靠
+事后反推——预检在 shared-corpus collect **之前**拦两类:**脏树**(`git status --short` 非空,打印
+头 20 行 + `--force` 提示)与 **locked**(`worktree list --porcelain` 检出——locked 的树是干净的,
+会绕过脏检查,必须单拦),拒绝时 rc 1、主仓零改动;探测本身失败也按拒绝处理(fail-closed)。
+submodule 有意不探(git 2.55 对未填充 gitlink 的干净树本来就会删,自判反而更严、误拦常规 rm)。
+其余情形交给 git 本身:`git worktree remove` 失败原样打印 stderr,无 `--force` 一律 rc 1、什么都
+不清。`--branch` 判已合并:target 取 `cc-merge.sh get-parent`,merged = `git merge-base
+--is-ancestor` 或 target log 里有 do-merge squash 写的 Child-Tip trailer;target 分支已删则回落
+trunk 再判一次;分支本就不存在时顺手清 `branch.<b>.*` config section 并说明——已合并直接删并打
+`merged into <target>`,未合并保留 + 提示。`--force` 是唯一破坏性开关,同时管工作树和分支
+(`--branch --force` 才 `-D`)。
+
+## `CC_WT_COPY` 复制语义漂移:gwt-claude 无条件覆盖,hook 路径跳过已存在文件
+
+**现象**:同一个 `$CC_WT_COPY` 清单,两条派发路径的复制语义相反——worktree 里已存在的文件
+(比如子任务已改过的 `.env`),gwt-claude 路径会直接覆盖掉本地改动,hook 路径则跳过;行为取决于
+谁派发,覆盖那半边会静默吃掉子任务的修改。
+**根因**:`worktree.zsh:76` `cp -p "$root/$f" "$wtpath/$f"` 无条件覆盖;`cc-dispatch.sh:689`
+`[ -e "$abspath/$f" ] && continue`(注释直言 don't overwrite if it already exists)跳过已存在。
+两处各写各的语义,互不知情。
+**修法/修于**:修于 2026-08-21(feature/audit-0821,wtz-guards 线 F3,5e69955 落地):
+`_gwt_bootstrap_wt` 不再覆盖 worktree 里已有的文件(存在即 `kept worktree's own`,与
+cc-dispatch.sh surface 路径一致);seeding 全程 best-effort、rc 不外漏,`CC_WT_SHARE` 为空或
+seed 失败都不再让 bootstrap 失败(旧写法 `[[ ]] &&` 在导出空值时 rc=1,gwt-new/gwt-adopt 会在
+worktree 建好之后整个 bail)。(默认清单写在三处的结构性问题另记 backlog 队列 #5,本轮无人认领。)
+
+## surface prompt 临时文件按超时删,held/failed 投递可能读到空
+
+**现象**:launch 行经 cc-send 投递;若 cc-send 因目标输入框有字而 hold,或投递失败重试,
+读到的 `$pf` 临时文件可能已被删——launch 收到空 prompt,子任务起在空简报上。
+**根因**:`cc-dispatch.sh` surface 路径:`pf="${TMPDIR:-/tmp}/cc-wt-prompt.$$.txt"`(:846),
+launch 用 `ccteam "$(cat '$pf')"` 投递;`rm -f "$pf"` 在 ≤6s 的 trust-scan 循环之后**按时间
+无条件执行**——删除只由循环超时推动,不证明 launch 行已被 shell 消费(held/failed 恰是没消费)。
+**修法/修于**:修于 2026-08-21(feature/audit-0821,dispatch-fixes 线):临时文件生命周期改为
+跟随投递确认,不再按超时删。⚠ 以该线 gate 后形态为准。
+
+## cc-send parked 面包屑无失败证据(audit 实测 16/16)
+
+**现象**:audit-0821 实测 16 个 parked 面包屑,无一个对应真实失败的 send——报警本身可能是误报。
+**根因**:`cc-dispatch.sh:188-189` 写面包屑的动作与 TUI 消费队列文本的时机竞争:crumb 在 send
+结果未定时就落盘,排查时把"写了 crumb"当"send 失败"。
+**修法/修于**:修于 2026-08-21(feature/audit-0821,dispatch-fixes 线):面包屑只在确认失败后写。
+⚠ 以该线 gate 后形态为准。
+
+## 任务板仓库过滤在 linked worktree 下滤掉同仓全部兄弟行
+
+**现象**:从 worktree 里跑 `cc-board.sh`,本仓库其它子任务的行一行都不显示。
+**根因**:`cc-board.sh:143-149` 调用方仓库根用 PWD 起 `git rev-parse --show-toplevel`——在
+linked worktree 里它返回 **worktree 自己的根**,不是主 checkout 根;:328-331
+`case "$cdir" in "$root"|"$root"/*)` 于是把所有兄弟行滤掉。
+**修法/修于**:修于 2026-08-21(feature/audit-0821,dispatch-fixes 线):过滤键改用主 checkout
+根(`--git-common-dir` 一类),同仓 worktree 行全部可见。⚠ 以该线 gate 后形态为准。
+
+## mkdir 锁 10 处副本、无 stale 恢复(OPEN)
+
+**现象**:并发写 TSV/状态文件的互斥靠 `mkdir` 自旋锁;锁目录残留(进程被杀)后,后续写入全部
+等满超时再 fail-open 写——竞态窗口被拉长,且无提示。
+**根因**:10 处副本各自实现:`cc-dispatch.sh:278/1398/1427`、`cc-hooks.sh:333`、`cc-board.sh:76/137`、
+`worktree.zsh:118/154/192/349`。均为「60 × 0.05s 自旋 + 超时 fail-open 写」,无 pid/年龄记录、
+无 stale 回收(`cc-hooks.sh:330` 注释直言 "if the lock never frees we still write")。
+**计划**:单一实现(pid + 年龄回收)全部改用;碰所有文件 → 所有并行线落地后独占一轮做
+(backlog 队列 #1,audit-0821 的「第二波」)。
+
+## cc-send 的 "never dropped" 承诺与调用方 Bash 工具超时互相矛盾(OPEN)
+
+**现象**:cc-send 语义是「永不丢消息」(目标忙就等),但子任务经 Claude 的 Bash 工具调用它,
+默认 120s 被工具超时杀掉——等待中的 send 连同消息一起死,承诺落空。
+**根因**:承诺在进程内,超时在进程外(调用方工具层),两者之间无协议;`cc-dispatch.sh:226-227`
+的 notify 文案宣称 never dropped,但没有对应的超时预算。
+**计划**:短期纪律——关键回传一律 `run_in_background` / 调大 `CC_SEND_TIMEOUT`;根治归架构项 C
+(文件邮箱 + hook 注入,屏幕抓取只作 fallback),不单独立线(backlog 队列 #4)。
+
+## 2026-08-21 23:00 事故:三条子任务线把草稿写进主 checkout,污染活安装目录
+
+**现象**:2026-08-21 23:00–23:52,三条子任务线先后通过绝对路径 `~/.config/cc-stack/` 把草稿写进
+父会话的主 checkout(按恢复后的文件 mtime 定线,内容现已全部等于 HEAD):`worktree.zsh`
+23:16:21(wtz-guards 线);`cc-dispatch.sh` / `cc-board.sh` / `test.sh` 同为 23:20:10——一次
+`git checkout --` 恢复的痕迹(dispatch-fixes 线);`cc-hooks.sh` / `cc-merge.sh` 直到 23:52 才由
+父会话恢复(merge-target 线)。主 checkout 同时是**活的安装目录**,本机所有会话的
+dispatcher/hook 运行态当时跑的是半成品——rules-docs 线在窗口期调用活的 `cc-dispatch.sh send`
+撞到的 :885 语法错误,就是 dispatch-fixes 线改到一半的主 checkout 副本;兄弟线(worktree)的
+测试经硬编码路径读到脏副本,树渲染相关 8 项断言失败,污染源恢复到 HEAD 后消失。
+**根因(两层)**:
+1. 简报和文档里到处是 `~/.config/cc-stack/` 绝对路径,而主 checkout 兼任安装目录——子任务照抄
+   绝对路径编辑,写的就是运行态本身;
+2. `worktree.zsh` / `cc-hooks.sh` 内部硬编码该路径,worktree 无法真正自测,只能被动读到主
+   checkout 的状态(与 known P1「硬编码路径」同根)。
+**止损**:① 派发简报必须写明「只在 cwd(自己的 worktree)里编辑,绝不写 `~/.config/cc-stack/` 下的
+文件」;② surface 注入子任务的 working agreement 新增第 (6) 条「只在 worktree 内编辑,主
+checkout / 安装目录只读」(dispatch-fixes 线在加)。长期根治归 backlog 队列 #2
+(P1 · 硬编码路径推广自解析)。

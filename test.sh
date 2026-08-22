@@ -944,6 +944,48 @@ grep -q 'cc-worktree-shared.sh" seed' "$CC/cc-dispatch.sh" && ok "surface script
 rm -rf "$SR"
 
 echo ""
+echo "== 31. rules docs: one <base> placeholder, direct-parent semantics, archived roadmap =="
+# ── rules-docs line (2026-08-21, feat/rules-docs): the dispatch rule names <base> ONCE, defines
+# it as the direct parent branch, and keeps the post-mortem in known-issues. These pin that
+# wording so the four-placeholder form (<campaign-branch>/<base>/<campaign>…), the "forces an
+# explicit base" claim, the no-base README example, or an un-archived roadmap can't quietly come
+# back. grep-level on purpose (bash 3.2, no new deps) — same pattern as §11.
+R31="$CC/claude-rules.md"
+grep -q -- '-b feat/<name> <base>' "$R31" \
+  && ok "rules: dispatch form ends in <base>" || no "rules: dispatch form ends in <base>" missing present
+eq "rules: no 'forces an explicit base' claim left (C2)" "$(grep -c 'forces an explicit base' "$R31")" 0
+eq "rules: <campaign-branch> placeholder gone (C3)" "$(grep -c '<campaign-branch>' "$R31")" 0
+eq "rules: <campaign> placeholder gone (C3)" "$(grep -c '<campaign>' "$R31")" 0
+grep -q 'direct parent branch' "$R31" \
+  && ok "rules: <base> = the direct parent branch (nested dispatch)" \
+  || no "rules: <base> = the direct parent branch (nested dispatch)" missing present
+grep -q 'defaults to `HEAD`' "$R31" \
+  && ok "rules: gwt-claude --base default (HEAD = cwd fallback) stated" \
+  || no "rules: gwt-claude --base default (HEAD = cwd fallback) stated" missing present
+grep -q 'known-issues' "$R31" \
+  && ok "rules: post-mortem is a known-issues pointer, not inline narrative" \
+  || no "rules: post-mortem is a known-issues pointer, not inline narrative" missing present
+grep -q -- '-b feat/<name> <base>' "$CC/README.md" \
+  && ok "README: dispatch example names <base>" || no "README: dispatch example names <base>" missing present
+grep -q 'missing `CC_WT_PROMPT`' "$CC/README.md" \
+  && ok "README: no-tab row names missing CC_WT_PROMPT" \
+  || no "README: no-tab row names missing CC_WT_PROMPT" missing present
+grep -q 're-run `install.sh`' "$CC/README.md" \
+  && ok "README: rules/hooks runtime migrates only on install.sh re-run" \
+  || no "README: rules/hooks runtime migrates only on install.sh re-run" missing present
+grep -q '已归档' "$CC/docs/roadmap.md" \
+  && ok "roadmap: archived banner, backlog is the live queue" \
+  || no "roadmap: archived banner, backlog is the live queue" missing present
+grep -q 'audit-0821 campaign 转写' "$CC/docs/known-issues.md" \
+  && ok "known-issues: audit-0821 transcription section present" \
+  || no "known-issues: audit-0821 transcription section present" missing present
+grep -q '锁 10 处副本' "$CC/docs/known-issues.md" \
+  && ok "known-issues: mkdir-lock stale-recovery entry (2nd-wave queue)" \
+  || no "known-issues: mkdir-lock stale-recovery entry (2nd-wave queue)" missing present
+grep -q 'cc-state' "$CC/docs/backlog.md" \
+  && ok "backlog: architecture-campaign section transcribed from audit-0821" \
+  || no "backlog: architecture-campaign section transcribed from audit-0821" missing present
+echo ""
 echo "== 26. workspace scope: liveness probed across ALL workspaces, never just the caller's =="
 # `cmux list-pane-surfaces` lists ONE workspace — the caller's ($CMUX_WORKSPACE_ID) — and the CLI
 # has NO all-workspaces flag (live-probed 2026-08-16: 8 surfaces from the default call, 13 when the

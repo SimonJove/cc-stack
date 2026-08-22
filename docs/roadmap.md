@@ -1,5 +1,7 @@
 # cc-stack roadmap — 2026-08-15 存档
 
+**已归档,活动队列见 docs/backlog.md**。
+
 当日已完成(详见 git log):A 状态追踪(hook 侧列)、B 非交互看板(cc-board.sh,PARENT 列 / merge 归档 / gwt-log)、
 cc-* 脚本 10→6 收拢重构(install 自动迁移)、审计修复 P1-P4、hook 过滤误伤修复、rules 精简 30%。
 测试 92 → 180。剩余工作如下,按建议顺序:

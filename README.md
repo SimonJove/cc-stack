@@ -75,7 +75,7 @@ Matching env vars: `CC_STACK_DIR` / `CC_STACK_REPO`.
 Just tell the main Claude: **"open a worktree and fix X", "spin off a sub-task to do Y in parallel"**, etc. Following the `CLAUDE.md` rules it runs a Bash command:
 
 ```bash
-CC_WT_PROMPT='the full first instruction for the task (may be multi-line)' git worktree add .claude/worktrees/<name> -b feat/<name>
+CC_WT_PROMPT='the full first instruction for the task (may be multi-line)' git worktree add .claude/worktrees/<name> -b feat/<name> <base>
 ```
 
 ### What happens
@@ -351,7 +351,7 @@ closing tabs: cc-dispatch.sh close <dir>   ① dir → stable surface uuid: boar
 
 | Symptom | Cause / fix |
 |---|---|
-| **Worktree built but no tab opened** | Usually **cmux is restarting / transiently unstable**. The script already retries; a hard failure is logged to `cc-failures.log` and `gwt-status` warns at the top. Fix by hand: `gwt-claude <name> "<prompt>"`. |
+| **Worktree built but no tab opened** | Usually **missing `CC_WT_PROMPT`** — the hook only opens a tab when this env var is set. Redo via `gwt-claude <name> "<prompt>" --base <base>` (it sets `CC_WT_PROMPT` automatically; `--base` names the merge target). Otherwise cmux was restarting / transiently unstable: it retries; a hard failure logs to `cc-failures.log` (`gwt-status` warns at the top). |
 | **Main Claude "does it in the background", no tab** | It used `EnterWorktree` instead of Bash `git worktree add`. Make sure the global `CLAUDE.md` rules block is present (`install.sh` installs it) and it's a **newly started session** (CLAUDE.md is read at session start). |
 | **Sub-task edits code right away** | Not in plan mode. Check `CC_WT_PERMISSION_MODE` isn't set to a non-plan value; only newly spawned sub-tasks pick it up. |
 | **Sub-task auto-merges / removes the worktree** | The superpowers `finishing-a-development-branch` skill picked "merge" by itself in an autonomous sub-task. The CLAUDE.md rules forbid this; make sure the rules block is present and it's a new session. |
@@ -359,6 +359,7 @@ closing tabs: cc-dispatch.sh close <dir>   ① dir → stable surface uuid: boar
 | **Sub-task stuck on `blocked(...)`** | It's waiting on a permission prompt in its tab — go answer there; the state refreshes on the sub-task's next event. |
 | **Sub-task can't run without `.env`** | Ensure `$CC_WT_COPY` includes the needed files; the hook path now copies them automatically. **Port collisions** between parallel dev servers must be handled by parameterizing ports in each worktree's `.env`. |
 | **Afraid of breaking cc-stack when editing it** | `gwt-test` runs the smoke test (hook parsing / registration / prune / trust) in one command. |
+| **Edited `claude-rules.md` / `hooks/`, but sessions still behave the old way** | The runtime copies under `~/.claude/` migrate only when you **re-run `install.sh`** — by hand, after such a change lands. The main checkout IS the install dir, so behavior flips the moment the change merges into the campaign branch, not at `main`; and only newly started sessions re-read `CLAUDE.md`. |
 
 ---
 
