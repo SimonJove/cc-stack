@@ -73,10 +73,19 @@ _gwt_bootstrap_wt() {
   local f
   for f in ${(s: :)CC_WT_COPY}; do
     if [[ -f "$root/$f" ]]; then
+      # never overwrite: a REUSED branch/worktree may carry its own .env etc. — cc-dispatch.sh's
+      # surface path skips existing files too, and the zsh side silently clobbered them (2026-08-21)
+      if [[ -e "$wtpath/$f" ]]; then echo "  ↳ kept worktree's own $f"; continue; fi
       mkdir -p "$wtpath/${f:h}"; cp -p "$root/$f" "$wtpath/$f" && echo "  ↳ copied $f"
     fi
   done
-  [[ -n "$CC_WT_SHARE" ]] && ~/.config/cc-stack/cc-worktree-shared.sh seed "$root" "$wtpath" ${(s: :)CC_WT_SHARE}
+  # if-block, NOT `[[ ... ]] && ...`: that one-liner leaves the function rc=1 whenever
+  # CC_WT_SHARE is empty (README:276 supports exported-empty as the off switch), and
+  # gwt-new / gwt-adopt bail on it AFTER the worktree is built — no capture, no workspace, no cd.
+  if [[ -n "$CC_WT_SHARE" ]]; then
+    ~/.config/cc-stack/cc-worktree-shared.sh seed "$root" "$wtpath" ${(s: :)CC_WT_SHARE}
+  fi
+  return 0   # seeding is best-effort: its rc must not leak out and fail a finished bootstrap
 }
 
 # ── TSV access discipline (2026-08-16 audit, F1) ─────────────────────────────
@@ -377,7 +386,12 @@ _gwt_tree_render() {
     local doneflag=""; [[ "$dn" == done ]] && doneflag="✓done"
     local rf="${_gt_ref[$kid]:-}" tab=""
     if [[ -z "$_gt_live" ]]; then tab="?"
-    elif [[ -n "$rf" ]] && grep -qF "$rf" <<<"$_gt_live"; then tab="✔live"
+    # exact-field match on the first column, with the '*' SELECTED marker stripped first
+    # (real cmux prefixes the selected row — cc-dispatch.sh:334 does the same sed) — a bare
+    # substring grep (surface:3) would also hit surface:30 now that the union probe widens
+    # the candidate pool, marking a closed tab live
+    elif [[ -n "$rf" ]] && awk -v r="$rf" '{sub(/^\*/,"")} $1==r{f=1} END{exit !f}' <<<"$_gt_live"; then tab="✔live"
+    elif [[ -n "$rf" ]] && [[ -n "$_gt_live_partial" ]]; then tab="?"    # probe incomplete — unknown, not dead
     elif [[ -n "$rf" ]]; then tab="⌫closed"; else tab="-"; fi
     local ready=""
     # NOTE: tab= and ready= MUST keep initial values — a bare `local x` in this
@@ -403,11 +417,38 @@ gwt-tree() {
   local data; data="$(~/.config/cc-stack/cc-merge.sh tree "$root")"
   [[ -n "$data" ]] || { echo "no worktree branches (nothing to show)"; return 0 }
   local trunk; trunk="$(~/.config/cc-stack/cc-merge.sh trunk "$root")"
-  # tab liveness (best-effort)
+  # tab liveness (best-effort). `cmux list-pane-surfaces` answers ONE workspace — the caller's —
+  # so a single unscoped call (the old code) showed a live sub-task in another workspace as
+  # ⌫closed. Probe the UNION over `cmux list-workspaces` (same shape as cc-board.sh / the
+  # opened-tabs prune, 2026-08-16): 1+N cmux calls, one per workspace. Empty answer per workspace
+  # = a FAILED probe, not an empty workspace (cmux refuses to close a workspace's last surface, so
+  # one always exists) — that sets _gt_live_partial, and a miss under partial evidence renders "?"
+  # (liveness unknown), never ⌫closed: absence of evidence is not evidence of death.
   typeset -gA _gt_ref _gt_parent _gt_ahead _gt_dirty _gt_done _gt_kids _gt_seen
   _gt_ref=(); _gt_parent=(); _gt_ahead=(); _gt_dirty=(); _gt_done=(); _gt_kids=(); _gt_seen=()
-  _gt_live=""
-  command -v cmux >/dev/null 2>&1 && cmux ping >/dev/null 2>&1 && _gt_live="$(cmux list-pane-surfaces 2>/dev/null)"
+  _gt_live=""; _gt_live_partial=""
+  if command -v cmux >/dev/null 2>&1 && cmux ping >/dev/null 2>&1; then
+    # leading ref token only (a `grep -o` would mint a ref out of a workspace NAMED after one)
+    local _gt_wsrefs="" _gt_w="" _gt_wl=""
+    _gt_wsrefs="$(cmux list-workspaces 2>/dev/null | sed 's/^\*//' | awk '$1 ~ /^workspace:[0-9]+$/{print $1}')"
+    if [[ -n "$_gt_wsrefs" ]]; then
+      for _gt_w in ${=_gt_wsrefs}; do   # ${= }: zsh does NOT word-split unquoted $var (cc-board.sh is bash and does)
+        _gt_wl="$(cmux list-pane-surfaces --workspace "$_gt_w" 2>/dev/null)"
+        if [[ -n "$_gt_wl" ]]; then
+          _gt_live="$_gt_live$_gt_wl
+"
+        else
+          _gt_live_partial=1
+        fi
+      done
+    else
+      # no workspace list at all (older CLI / failed call): the unscoped call still resolves what
+      # it can see, but we cannot even count what went unlooked-at — least complete evidence there
+      # is, so it counts as partial too (same call the opened-tabs prune falls back to).
+      _gt_live="$(cmux list-pane-surfaces 2>/dev/null)"
+      [[ -n "$_gt_live" ]] && _gt_live_partial=1
+    fi
+  fi
   local f; f="$(_gwt_tasks_file)"
   if [[ -f "$f" ]]; then
     local br="" rf=""
@@ -443,14 +484,18 @@ gwt-tree() {
       doneflag=""; [[ "$dn" == done ]] && doneflag="✓done"
       rf="${_gt_ref[$b]:-}"
       if [[ -z "$_gt_live" ]]; then tab="?"
-      elif [[ -n "$rf" ]] && grep -qF "$rf" <<<"$_gt_live"; then tab="✔live"
+      elif [[ -n "$rf" ]] && awk -v r="$rf" '{sub(/^\*/,"")} $1==r{f=1} END{exit !f}' <<<"$_gt_live"; then tab="✔live"   # exact-field, '*' stripped (see render)
+      elif [[ -n "$rf" ]] && [[ -n "$_gt_live_partial" ]]; then tab="?"    # probe incomplete — unknown, not dead
       elif [[ -n "$rf" ]]; then tab="⌫closed"; else tab="-"; fi
       if [[ "$dirty" == clean && "$dn" == done ]]; then ready="ready ✅"; else ready="not ready ⏳"; fi
       printf '   ✗  %-14s ↑%-3s %-5s %-6s [%s]  → %s   (merge target %s: %s)\n' \
         "$b" "$ahead" "$dirty" "$doneflag" "$tab" "$ready" "$pb" "$why"
     done
   fi
-  unset _gt_ref _gt_parent _gt_ahead _gt_dirty _gt_done _gt_kids _gt_seen _gt_live
+  # cc-board.sh's trailing note, same reason here: a "?" tab means this probe could not reach
+  # every workspace — unknown, NOT dead.
+  [[ -n "$_gt_live_partial" ]] && echo "(note: cmux workspace enumeration was incomplete — liveness partial, so a tab this probe did not reach shows '?' rather than ⌫closed)"
+  unset _gt_ref _gt_parent _gt_ahead _gt_dirty _gt_done _gt_kids _gt_seen _gt_live _gt_live_partial
 }
 
 # gwt-done / gwt-undone — mark the current worktree's branch ready (harmless annotation, no gate).
@@ -579,6 +624,8 @@ cc-stack · worktree sub-task commands
   gwt-tabs [--all]                       opened-tabs inventory: every tab this stack opened — ref, stable uuid,
                                          alive/dead, the surface that opened it, dir (--all = every session's rows)
   gwt-rm <name> [--branch] [--close]     remove worktree (+ clear task record + pre-trust; optionally the branch);
+                                         [--force]                            refuses a dirty worktree / an unmerged
+                                         branch unless --force (the one destructive switch) is given;
                                          --close also closes its cmux tab through cc-dispatch.sh close (by the
                                          RECORDED stable surface uuid — never a short ref, which drifts)
   gwt-prune                              compact the task list (drop dead records + keep newest per dir)
@@ -594,14 +641,17 @@ EOF
 gwt-rm() {
   emulate -L zsh
   local name="$1"
-  [[ -n "$name" ]] || { echo "usage: gwt-rm <name> [--branch] [--close]"; return 1 }
-  # flags in any order (the legacy `gwt-rm <name> --branch` positional form still works)
-  local want_branch="" want_close="" _a
+  [[ -n "$name" ]] || { echo "usage: gwt-rm <name> [--branch] [--close] [--force]"; return 1 }
+  # flags in any order (the legacy `gwt-rm <name> --branch` positional form still works).
+  # --force is THE destructive switch, and the only one: without it a dirty worktree is refused
+  # (nothing deleted at all) and an unmerged branch survives `--branch`; with it both fall.
+  local want_branch="" want_close="" want_force="" _a
   for _a in "${@:2}"; do
     case "$_a" in
       --branch) want_branch=1 ;;
       --close)  want_close=1 ;;
-      *) echo "usage: gwt-rm <name> [--branch] [--close]"; return 1 ;;
+      --force)  want_force=1 ;;
+      *) echo "usage: gwt-rm <name> [--branch] [--close] [--force]"; return 1 ;;
     esac
   done
   local wtpath; wtpath="$(_gwt_wt_path "$name")" || return 1
@@ -620,18 +670,67 @@ gwt-rm() {
   fi
   local wtabs; wtabs="$(cd "$wtpath" 2>/dev/null && pwd -P)"   # canonical path (before removal) for bookkeeping
   local wtbranch; wtbranch="$(git -C "$wtpath" symbolic-ref --short HEAD 2>/dev/null)"   # real branch, any prefix (captured before removal)
+  # repo root resolved BEFORE the removal: gwt-rm may run from INSIDE the worktree being
+  # removed (gwt-new cd's you there), and once that directory is gone every bare `git` in the
+  # dead cwd fails — a fully-merged branch was misreported as "not merged". Every git from
+  # here on carries -C "$gwtroot".
+  local gwtroot; gwtroot="$(_gwt_root 2>/dev/null)"
+  [[ -n "$gwtroot" ]] || { echo "✗ cannot resolve repo root" >&2; return 1; }
+  # Refusal pre-flight (2026-08-22 gate) — runs BEFORE the corpus collect so a refused rm
+  # leaves the ROOT untouched too. It gates only what remove itself would refuse AFTER the
+  # collect had already been paid for: a dirty tree, and a locked one. Submodules are
+  # deliberately NOT probed: git 2.55 removes a clean tree carrying an unpopulated gitlink, so
+  # judging submodules ourselves was stricter than git and blocked routine rms. remove's own
+  # refusal below stays the fail-closed authority; a failed probe here reads as refusal.
+  if [[ -z "$want_force" && -d "$wtpath" ]]; then
+    local _pd=""
+    if ! _pd="$(git -C "$wtpath" status --short 2>/dev/null)"; then
+      echo "✗ cannot probe $wtpath (git status failed) — refusing to remove" >&2
+      echo "   fix the probe, or re-run as: gwt-rm $name --force" >&2
+      return 1
+    fi
+    if [[ -n "$_pd" ]]; then
+      echo "✗ worktree has uncommitted changes — refusing to remove:" >&2
+      printf '%s\n' "$_pd" | head -20 >&2
+      echo "   commit or stash them first, or re-run as: gwt-rm $name --force" >&2
+      return 1
+    fi
+    # a LOCKED worktree is clean, so the probes above sail past it and remove refuses only
+    # AFTER the collect would have touched the root — catch the lock up here instead
+    if git -C "$wtpath" worktree list --porcelain 2>/dev/null \
+      | awk -v w="$wtpath" '$1=="worktree"{inw=($2==w); next} inw && $1=="locked"{f=1} END{exit !f}'; then
+      echo "✗ worktree is locked (git worktree lock) — refusing to remove:" >&2
+      echo "   unlock it first (git worktree unlock '$wtpath'), or re-run as: gwt-rm $name --force" >&2
+      return 1
+    fi
+  fi
   # Merge the worktree's shared corpus (new e2e tests) back into the main repo BEFORE removal, so
   # nothing is lost. Same-name-different-content clashes are preserved as <name>.from-<branch>.<ext>.
   if [[ -n "$CC_WT_SHARE" && -d "$wtpath" ]]; then
-    local _root _b _has=""
-    _root="$(_gwt_root 2>/dev/null)" || { echo "✗ cannot resolve repo root for the corpus merge-back" >&2; return 1; }
+    local _b _has=""
     for _b in ${(s: :)CC_WT_SHARE}; do [[ -d "$wtpath/${_b%/}" ]] && { _has=1; break }; done
     if [[ -n "$_has" ]]; then
       echo "  ↳ merging shared corpus back into main…"
-      ~/.config/cc-stack/cc-worktree-shared.sh collect "$_root" "$wtpath" ${(s: :)CC_WT_SHARE}
+      ~/.config/cc-stack/cc-worktree-shared.sh collect "$gwtroot" "$wtpath" ${(s: :)CC_WT_SHARE}
     fi
   fi
-  git worktree remove "$wtpath" 2>/dev/null || git worktree remove --force "$wtpath" || return 1
+  # The removal itself (2026-08-21 guard, 2026-08-22 gate rewrite): on refusal print git's OWN
+  # stderr and stop (rc 1, NOTHING cleaned) — never second-guess the refusal with a status
+  # probe, because "probe reads empty" ≠ clean. --force is the only way past a refusal.
+  local _rmerr; _rmerr="$(mktemp)"
+  if ! git -C "$gwtroot" worktree remove "$wtpath" 2>"$_rmerr"; then
+    if [[ -z "$want_force" ]]; then
+      echo "✗ git worktree remove refused $wtpath:" >&2
+      head -20 "$_rmerr" >&2
+      git -C "$wtpath" status --short 2>/dev/null | head -20 | sed 's/^/     /' >&2   # reference only, never the verdict
+      echo "   resolve the above, or re-run as: gwt-rm $name --force" >&2
+      rm -f "$_rmerr"; return 1
+    fi
+    rm -f "$_rmerr"
+    git -C "$gwtroot" worktree remove --force "$wtpath" || return 1
+  else
+    rm -f "$_rmerr"
+  fi
   echo "✔ removed worktree: $wtpath"
   # --close: route the tab close through the sanctioned primitive (resolves the dir to a live
   # surface by its RECORDED stable uuid, prints the resolution, enforces the close policy).
@@ -642,9 +741,47 @@ gwt-rm() {
   ~/.config/cc-stack/cc-trust.sh --remove "${wtabs:-$wtpath}" >/dev/null 2>&1   # clear the pre-trust entry (only pure-trust-signature ones)
   if [[ -n "$want_branch" ]]; then
     local br="${wtbranch:-feat/$name}"   # real branch when readable; default prefix as fallback (dir without HEAD)
-    if git branch -D "$br" 2>/dev/null; then echo "✔ deleted branch $br"
-    else echo "⚠ could not delete branch $br (already gone / merged elsewhere?)"; fi
-    git config --remove-section "branch.$br" 2>/dev/null   # drop ccMergeInto/ccDone
+    if ! git -C "$gwtroot" show-ref --verify --quiet "refs/heads/$br"; then
+      # no such branch (reclaim path fell back to feat/$name, or it was deleted out of band):
+      # nothing to judge — clear the merge record so it cannot linger as a ghost tree node
+      echo "  ↳ branch $br already gone — clearing its merge record"
+      git -C "$gwtroot" config --remove-section "branch.$br" 2>/dev/null
+    else
+      # "Merged" must mean: into the branch's RECORDED merge target, not the caller's HEAD —
+      # `git branch -d` only proves the latter, and do-merge squashes in a temp worktree (the
+      # caller's HEAD never moves), so -d refuses every properly-merged campaign branch. Evidence
+      # instead: ancestry against the target, or the Child-Tip trailer do-merge stamps into the
+      # squash commit (a squash carries no ancestry). --force stays the only override.
+      # (Child-Tip proves the squash HAPPENED — a later revert of it still reads as merged;
+      # accepted, the trailer is do-merge's own receipt.)
+      local _tgt="" _tip="" _merged=0 _brgone=""
+      _tgt="$(~/.config/cc-stack/cc-merge.sh get-parent "$gwtroot" "$br" 2>/dev/null)"
+      if [[ -n "$_tgt" ]] && ! git -C "$gwtroot" show-ref --verify --quiet "refs/heads/$_tgt"; then
+        # recorded target was deleted (README's own gwt-merge <parent>; gwt-rm <parent> --branch
+        # sequence) — the child's history lives on in the trunk that target merged into
+        _tgt="$(~/.config/cc-stack/cc-merge.sh trunk "$gwtroot" 2>/dev/null)"
+      fi
+      _tip="$(git -C "$gwtroot" rev-parse --quiet --verify "$br" 2>/dev/null)"
+      if [[ -n "$_tip" && -n "$_tgt" ]]; then
+        if git -C "$gwtroot" merge-base --is-ancestor "$br" "$_tgt" 2>/dev/null; then
+          _merged=1
+        elif [[ -n "$(git -C "$gwtroot" log --format=%H --fixed-strings --grep="Child-Tip: $_tip" "$_tgt" 2>/dev/null)" ]]; then
+          _merged=1
+        fi
+      fi
+      if (( _merged )); then
+        if git -C "$gwtroot" branch -D "$br" 2>/dev/null; then echo "✔ deleted branch $br (merged into $_tgt)"; _brgone=1
+        else echo "⚠ could not delete branch $br (already gone?)"; fi
+      elif [[ -n "$want_force" ]]; then
+        if git -C "$gwtroot" branch -D "$br" 2>/dev/null; then echo "✔ force deleted branch $br (unmerged commits dropped)"; _brgone=1
+        else echo "⚠ could not delete branch $br (already gone?)"; fi
+      else
+        echo "⚠ branch $br is not merged into ${_tgt:-its target} — kept. Re-run with --force to drop its commits."
+      fi
+      # ccMergeInto / ccDone fall only WITH the branch — a KEPT branch still needs its tree row
+      # and merge target (a remove-section on the kept branch erased both and hid it from gwt-tree).
+      [[ -n "$_brgone" ]] && git -C "$gwtroot" config --remove-section "branch.$br" 2>/dev/null
+    fi
   fi
   return 0
 }

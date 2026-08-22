@@ -2449,6 +2449,295 @@ rm -rf "$CG" "$CGP" "$CGH" "$CGF" "$CGS" "$FH25" "$CGD" "$CGT" "$CGN" "$CGI" "$C
 unset CC_FAKE_LOG25 CF_SCREEN25
 
 echo ""
+echo "== 30. wtz-guards: gwt-rm destructive-path guards + gwt-tree cross-workspace liveness + CC_WT_COPY no-overwrite =="
+# F1 (data-loss, 2026-08-21): `gwt-rm` fell back to `git worktree remove --force` on a dirty
+# tree and deleted uncommitted work with NO confirmation — the exact opposite of the project's
+# "never silently lose anything" line. The fallback is now earned: a refused remove prints the
+# status and stops (rc 1, nothing cleaned) unless --force names the deletion. --force is THE one
+# destructive switch: it also gates `git branch -D` (--branch now tries -d first — its success
+# IS the merged-proof).
+# F2: gwt-tree probed ONE workspace (the caller's) — a live sub-task in another workspace
+# rendered ⌫closed. Same union fix cc-board.sh / the tabs prune got on 2026-08-16, and the same
+# partial-evidence rule: a miss under an incomplete probe renders "?", never dead.
+# F3: CC_WT_COPY overwrote a reused worktree's own .env etc. — cc-dispatch.sh's copy skips
+# existing files; the zsh side now matches.
+W30_CN(){ CDPATH= cd -- "$1" >/dev/null 2>&1 && pwd -P; }
+W30_T=$(mktemp -u); W30_S=$(mktemp -u); W30_TRUST=$(mktemp -u); : > "$W30_T"; : > "$W30_S"; : > "$W30_TRUST"
+# every zsh -c below carries its OWN sandbox overrides (the suite's rule: never the live TSVs /
+# ~/.claude.json) and disables CC_WT_SHARE so the real cc-worktree-shared.sh is never reached.
+w30env(){ echo "CC_TASKS_FILE='$W30_T' CC_STATUS_FILE='$W30_S' CC_TRUST_CFG_OVERRIDE='$W30_TRUST' CC_WT_SHARE=''"; }
+
+# ── F1: dirty worktree refused without --force ───────────────────────────────────────────────
+W30_D=$(mktemp -d); W30_D="$(W30_CN "$W30_D")"
+( cd "$W30_D"; git init -q; git config user.email t@t; git config user.name t; git commit -q --allow-empty -m i; git branch -M main
+  mkdir -p .claude; git worktree add -q .claude/worktrees/dirty -b feat/dirty >/dev/null )
+W30_W="$W30_D/.claude/worktrees/dirty"
+echo "uncommitted work" > "$W30_W/untracked.txt"
+printf '2026-01-01 00:00:01\tfeat/dirty\tsurface:61\t%s\tsurface:1\tdirty row\tmain\n' "$W30_W" > "$W30_T"
+W30_O="$(zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; cd '$W30_D'; $(w30env) gwt-rm dirty" 2>&1)"; W30_RC=$?
+eq "30 dirty tree: rc!=0"              "$([ "$W30_RC" -ne 0 ] && echo y || echo n)" "y"
+eq "30 dirty tree: says uncommitted"   "$(echo "$W30_O" | grep -c 'uncommitted changes')" "1"
+eq "30 dirty tree: lists the files"    "$(echo "$W30_O" | grep -c 'untracked.txt')" "1"
+eq "30 dirty tree: worktree survives"  "$([ -d "$W30_W" ] && echo y || echo n)" "y"
+eq "30 dirty tree: board row survives" "$(grep -c 'dirty row' "$W30_T")" "1"
+eq "30 dirty tree: sidecar untouched"  "$([ -f "$W30_S" ] && echo y || echo n)" "y"
+# --force names the deletion: worktree AND its uncommitted file fall, branch stays (no --branch)
+W30_O="$(zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; cd '$W30_D'; $(w30env) gwt-rm dirty --force" 2>&1)"; W30_RC=$?
+eq "30 --force: rc=0"                  "$W30_RC" "0"
+eq "30 --force: worktree gone"         "$([ -d "$W30_W" ] && echo y || echo n)" "n"
+eq "30 --force: branch kept (no --branch)" "$(git -C "$W30_D" branch --list 'feat/dirty' | wc -l | tr -d ' ')" "1"
+# cat-first: a successful gwt-rm may leave the TSV deleted (_gwt_drop_lines removes an emptied file)
+eq "30 --force: board row dropped"     "$(cat "$W30_T" 2>/dev/null | grep -c 'dirty row')" "0"
+
+# ── F1: unmerged branch survives --branch unless --force ─────────────────────────────────────
+W30_DB=$(mktemp -d); W30_DB="$(W30_CN "$W30_DB")"
+( cd "$W30_DB"; git init -q; git config user.email t@t; git config user.name t; git commit -q --allow-empty -m i; git branch -M main
+  mkdir -p .claude; git worktree add -q .claude/worktrees/um -b feat/um >/dev/null )
+( cd "$W30_DB/.claude/worktrees/um"; echo x > f.txt; git add f.txt; git commit -q -m "unmerged work" )
+git -C "$W30_DB" config branch.feat/um.ccMergeInto main
+W30_O="$(zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; cd '$W30_DB'; $(w30env) gwt-rm um --branch" 2>&1)"; W30_RC=$?
+eq "30 unmerged branch: kept"          "$(git -C "$W30_DB" branch --list 'feat/um' | wc -l | tr -d ' ')" "1"
+eq "30 unmerged branch: says not merged" "$(echo "$W30_O" | grep -c 'not merged')" "1"
+eq "30 unmerged branch: names --force" "$(echo "$W30_O" | grep -c -- '--force')" "1"
+eq "30 unmerged branch: merge target kept" "$(git -C "$W30_DB" config --get branch.feat/um.ccMergeInto)" "main"
+eq "30 unmerged branch: worktree went (clean tree)" "$([ -d "$W30_DB/.claude/worktrees/um" ] && echo y || echo n)" "n"
+# --branch --force is what drops the unmerged commits — SEPARATE repo: the one above already
+# removed its worktree, so a second gwt-rm there would only hit the "no worktree named" path
+W30_DB2=$(mktemp -d); W30_DB2="$(W30_CN "$W30_DB2")"
+( cd "$W30_DB2"; git init -q; git config user.email t@t; git config user.name t; git commit -q --allow-empty -m i; git branch -M main
+  mkdir -p .claude; git worktree add -q .claude/worktrees/um2 -b feat/um2 >/dev/null )
+( cd "$W30_DB2/.claude/worktrees/um2"; echo x > f.txt; git add f.txt; git commit -q -m "unmerged work" )
+W30_O="$(zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; cd '$W30_DB2'; $(w30env) gwt-rm um2 --branch --force" 2>&1)"; W30_RC=$?
+eq "30 --branch --force: branch gone"  "$(git -C "$W30_DB2" branch --list 'feat/um2' | wc -l | tr -d ' ')" "0"
+eq "30 --branch --force: worktree gone" "$([ -d "$W30_DB2/.claude/worktrees/um2" ] && echo y || echo n)" "n"
+eq "30 --branch --force: says dropped" "$(echo "$W30_O" | grep -c 'unmerged commits dropped')" "1"
+# ...and a MERGED branch goes with plain --branch — "merged" judged against the RECORDED target
+# (ancestry here; the squash/Child-Tip path has its own scenario below), never via branch -d
+W30_D2=$(mktemp -d); W30_D2="$(W30_CN "$W30_D2")"
+( cd "$W30_D2"; git init -q; git config user.email t@t; git config user.name t; git commit -q --allow-empty -m i; git branch -M main
+  mkdir -p .claude; git worktree add -q .claude/worktrees/mg -b feat/mg >/dev/null; git merge -q feat/mg >/dev/null 2>&1
+  git config branch.feat/mg.ccMergeInto main )
+W30_O="$(zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; cd '$W30_D2'; $(w30env) gwt-rm mg --branch" 2>&1)"; W30_RC=$?
+eq "30 merged branch: judged+deleted"  "$([ "$W30_RC" -eq 0 ] && echo y || echo n)" "y"
+eq "30 merged branch: deleted"         "$(git -C "$W30_D2" branch --list 'feat/mg' | wc -l | tr -d ' ')" "0"
+eq "30 merged branch: says merged into" "$(echo "$W30_O" | grep -c 'merged into main')" "1"
+eq "30 merged branch: target config gone" "$(git -C "$W30_D2" config --get branch.feat/mg.ccMergeInto)" ""
+
+# ── F2: gwt-tree liveness across ALL workspaces (fake cmux, §26-style) ────────────────────────
+W30_WS=$(mktemp -d)
+cat > "$W30_WS/cmux" <<'CMUX30'
+#!/usr/bin/env bash
+# two workspaces; the UNSCOPED list-pane-surfaces answers workspace:1 alone (what the real CLI
+# does under $CMUX_WORKSPACE_ID). The SELECTED row carries the leading '*' the real cmux prints
+# (every other fake cmux in this suite does too). CC_FAKE_WSDOWN=<ref> makes that workspace
+# unreachable (rc 1).
+w=""; prev=""
+for a in "$@"; do case "$prev" in --workspace) w="$a" ;; esac; prev="$a"; done
+cmd="$1"; shift
+case "$cmd" in
+  ping) exit 0 ;;
+  list-workspaces)
+    printf '* workspace:1  alpha  [selected]\n'
+    printf '  workspace:2  beta\n' ;;
+  list-pane-surfaces)
+    [ -n "$w" ] || w=workspace:1
+    [ "$w" = "${CC_FAKE_WSDOWN:-}" ] && exit 1
+    case "$w" in
+      workspace:1) printf '* surface:3\t33333333-3333-3333-3333-333333333333\tchild D (selected)\n'
+                    printf '  surface:101\t11111111-1111-1111-1111-111111111111\tchild A\n' ;;
+      workspace:2) printf '  surface:202\t22222222-2222-2222-2222-222222222222\tchild B elsewhere\n' ;;
+    esac ;;
+esac
+exit 0
+CMUX30
+chmod +x "$W30_WS/cmux"
+W30_R=$(mktemp -d); W30_R="$(W30_CN "$W30_R")"
+( cd "$W30_R"; git init -q; git config user.email t@t; git config user.name t; git commit -q --allow-empty -m i; git branch -M main
+  mkdir -p .claude
+  git worktree add -q .claude/worktrees/wtA -b feat/w30A >/dev/null
+  git worktree add -q .claude/worktrees/wtB -b feat/w30B >/dev/null
+  git worktree add -q .claude/worktrees/wtC -b feat/w30C >/dev/null
+  git worktree add -q .claude/worktrees/wtD -b feat/w30D >/dev/null )
+W30_TT=$(mktemp -u)
+printf '2026-01-01 00:00:01\tfeat/w30A\tsurface:101\t%s\tsurface:1\ttask A\tmain\n' "$W30_R/.claude/worktrees/wtA" > "$W30_TT"
+printf '2026-01-01 00:00:02\tfeat/w30B\tsurface:202\t%s\tsurface:1\ttask B\tmain\n' "$W30_R/.claude/worktrees/wtB" >> "$W30_TT"
+printf '2026-01-01 00:00:03\tfeat/w30C\tsurface:10\t%s\tsurface:1\ttask C\tmain\n' "$W30_R/.claude/worktrees/wtC" >> "$W30_TT"
+printf '2026-01-01 00:00:04\tfeat/w30D\tsurface:3\t%s\tsurface:1\ttask D\tmain\n' "$W30_R/.claude/worktrees/wtD" >> "$W30_TT"
+w30tree(){ ( cd "$W30_R" && PATH="$W30_WS:$PATH" CC_FAKE_WSDOWN="${1:-}" CC_TASKS_FILE="$W30_TT" \
+    zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; gwt-tree" ) 2>/dev/null; }
+W30_TO="$(w30tree)"
+eq "30 tree: caller-workspace tab live"   "$(echo "$W30_TO" | grep -c 'feat/w30A.*✔live')" "1"
+eq "30 tree: OTHER-workspace tab live"    "$(echo "$W30_TO" | grep -c 'feat/w30B.*✔live')" "1"
+eq "30 tree: no false ⌫closed"            "$(echo "$W30_TO" | grep -c 'feat/w30B.*⌫closed')" "0"
+# the SELECTED row carries a leading '*' in real cmux output — it must still match its ref
+eq "30 tree: selected '*' row still live" "$(echo "$W30_TO" | grep -c 'feat/w30D.*✔live')" "1"
+# exact-field match: surface:10 must NOT ride on surface:101's substring — a closed tab is closed
+eq "30 tree: substring not a match"       "$(echo "$W30_TO" | grep -c 'feat/w30C.*⌫closed')" "1"
+eq "30 tree: closed ≠ live"               "$(echo "$W30_TO" | grep -c 'feat/w30C.*✔live')" "0"
+eq "30 tree: no footnote when full"       "$(echo "$W30_TO" | grep -c 'enumeration was incomplete')" "0"
+# partial probe (workspace:2 unreachable): the miss renders "?" — unknown, NOT dead
+W30_TO="$(w30tree workspace:2)"
+eq "30 tree: partial miss renders ?"      "$(echo "$W30_TO" | grep -c 'feat/w30B.*\[?\]')" "1"
+eq "30 tree: partial miss not ⌫closed"    "$(echo "$W30_TO" | grep -c 'feat/w30B.*⌫closed')" "0"
+eq "30 tree: partial still sees its own"  "$(echo "$W30_TO" | grep -c 'feat/w30A.*✔live')" "1"
+eq "30 tree: partial footnote printed"    "$(echo "$W30_TO" | grep -c 'enumeration was incomplete')" "1"
+
+# ── F3: CC_WT_COPY never overwrites a file the worktree already has ──────────────────────────
+# tracked-.env construction: HEAD carries .env ("committed"); the ROOT working tree drifts to a
+# newer "root snapshot" afterwards. A fresh bootstrap checks out HEAD into the worktree — the
+# buggy code then clobbered that checkout with the root's newer snapshot (and a REUSED worktree's
+# own edits fared the same); the fixed code skips, like cc-dispatch.sh's surface copy does.
+W30_F=$(mktemp -d); W30_F="$(W30_CN "$W30_F")"
+( cd "$W30_F"; git init -q; git config user.email t@t; git config user.name t; git commit -q --allow-empty -m i; git branch -M main
+  echo "committed" > .env; git add .env; git commit -q -m "track .env"
+  mkdir -p .claude )
+echo "root snapshot" > "$W30_F/.env"
+echo "absent file still gets copied" > "$W30_F/.env2"
+W30_BO="$(zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; $(w30env) CC_WT_COPY='.env .env2' _gwt_bootstrap_wt '$W30_F' '$W30_F/.claude/worktrees/reuse' feat/reuse" 2>&1)"
+eq "30 copy: checkout's .env kept"        "$(cat "$W30_F/.claude/worktrees/reuse/.env" 2>/dev/null)" "committed"
+eq "30 copy: absent file copied"          "$(cat "$W30_F/.claude/worktrees/reuse/.env2" 2>/dev/null)" "absent file still gets copied"
+eq "30 copy: kept line printed"           "$(printf '%s' "$W30_BO" | grep -c "kept worktree's own .env")" "1"
+
+# ── gate round (2026-08-22): refusal must be fail-closed, a kept branch keeps its metadata,
+# squash merges count, liveness matches exactly, collect runs after the guard, empty share OK ──
+# submodule trees: an UNPOPULATED gitlink (worktree add never populates submodules) is removed
+# fine by git itself — the pre-flight must not be stricter than git and block it. Only a
+# POPULATED submodule makes remove refuse, and that refusal is handled by the stderr path.
+W30_G1=$(mktemp -d); W30_G1="$(W30_CN "$W30_G1")"
+( cd "$W30_G1"; git init -q; git config user.email t@t; git config user.name t; git commit -q --allow-empty -m i; git branch -M main
+  mkdir sub && ( cd sub; git init -q; git config user.email t@t; git config user.name t; git commit -q --allow-empty -m s )
+  git update-index --add --cacheinfo 160000,"$(git -C sub rev-parse HEAD)",vendored
+  git commit -q -m gitlink
+  mkdir -p .claude; git worktree add -q .claude/worktrees/sub -b feat/sub >/dev/null )
+W30_GW="$W30_G1/.claude/worktrees/sub"
+eq "30 submod premise: status reads empty" "$(git -C "$W30_GW" status --short 2>/dev/null)" ""
+W30_O="$(zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; cd '$W30_G1'; $(w30env) gwt-rm sub" 2>&1)"; W30_RC=$?
+eq "30 unpop. gitlink: removed fine"      "$([ "$W30_RC" -eq 0 ] && echo y || echo n)" "y"
+eq "30 unpop. gitlink: worktree gone"     "$([ -d "$W30_GW" ] && echo y || echo n)" "n"
+# populated submodule: git itself refuses — its stderr shows, rc 1, nothing deleted
+W30_G1B=$(mktemp -d); W30_G1B="$(W30_CN "$W30_G1B")"
+( cd "$W30_G1B"; git init -q; git config user.email t@t; git config user.name t; git commit -q --allow-empty -m i; git branch -M main
+  mkdir sub && ( cd sub; git init -q; git config user.email t@t; git config user.name t; git commit -q --allow-empty -m s )
+  mkdir -p .claude; git worktree add -q .claude/worktrees/pop -b feat/pop >/dev/null )
+( cd "$W30_G1B/.claude/worktrees/pop"; git -c protocol.file.allow=always submodule add -q "$W30_G1B/sub" vendored
+  git add .gitmodules vendored; git commit -q -m sub )
+W30_O="$(zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; cd '$W30_G1B'; $(w30env) gwt-rm pop" 2>&1)"; W30_RC=$?
+eq "30 pop. submod: rc!=0"                "$([ "$W30_RC" -ne 0 ] && echo y || echo n)" "y"
+eq "30 pop. submod: worktree survives"    "$([ -d "$W30_G1B/.claude/worktrees/pop" ] && echo y || echo n)" "y"
+eq "30 pop. submod: git's stderr shown"   "$(echo "$W30_O" | grep -c 'submodule')" "1"
+
+# squash merge: no ancestry in the target, but do-merge stamps the child tip into the squash
+# commit — that trailer counts as the merge proof
+W30_SQ=$(mktemp -d); W30_SQ="$(W30_CN "$W30_SQ")"
+( cd "$W30_SQ"; git init -q; git config user.email t@t; git config user.name t; git commit -q --allow-empty -m i; git branch -M main
+  mkdir -p .claude; git worktree add -q .claude/worktrees/sq -b feat/sq >/dev/null )
+( cd "$W30_SQ/.claude/worktrees/sq"; echo y > g.txt; git add g.txt; git commit -q -m "child work" )
+W30_SQTIP="$(git -C "$W30_SQ/.claude/worktrees/sq" rev-parse HEAD)"
+( cd "$W30_SQ"; git config branch.feat/sq.ccMergeInto main
+  git merge -q --squash feat/sq >/dev/null 2>&1; git commit -q -m "chore: merge feat/sq into main" -m "Child-Tip: $W30_SQTIP" )
+W30_O="$(zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; cd '$W30_SQ'; $(w30env) gwt-rm sq --branch" 2>&1)"; W30_RC=$?
+eq "30 squash: rc=0 (judged merged)"      "$W30_RC" "0"
+eq "30 squash: branch deleted"            "$(git -C "$W30_SQ" branch --list 'feat/sq' | wc -l | tr -d ' ')" "0"
+eq "30 squash: says merged into"          "$(echo "$W30_O" | grep -c 'merged into main')" "1"
+
+# a REFUSED rm must leave the root untouched too — the corpus collect runs after the guard
+W30_G5=$(mktemp -d); W30_G5="$(W30_CN "$W30_G5")"
+( cd "$W30_G5"; git init -q; git config user.email t@t; git config user.name t; git commit -q --allow-empty -m i; git branch -M main
+  mkdir -p .claude; git worktree add -q .claude/worktrees/share -b feat/share >/dev/null )
+mkdir -p "$W30_G5/e2e" "$W30_G5/.claude/worktrees/share/e2e"
+echo "old corpus" > "$W30_G5/e2e/old.spec.ts"
+echo "new corpus" > "$W30_G5/.claude/worktrees/share/e2e/new.spec.ts"
+echo "uncommitted" > "$W30_G5/.claude/worktrees/share/dirty.txt"
+W30_O="$(zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; cd '$W30_G5'; $(w30env) CC_WT_SHARE='e2e' gwt-rm share" 2>&1)"; W30_RC=$?
+eq "30 collect: refused rc!=0"            "$([ "$W30_RC" -ne 0 ] && echo y || echo n)" "y"
+eq "30 collect: root untouched"           "$([ -e "$W30_G5/e2e/new.spec.ts" ] && echo y || echo n)" "n"
+eq "30 collect: worktree survives"        "$([ -d "$W30_G5/.claude/worktrees/share" ] && echo y || echo n)" "y"
+
+# LOCKED clean worktree: the status/submodule probes read clean, so without a lock check the
+# collect would run FIRST and only then would remove refuse — a refused rm must leave the root
+# with zero new files. Corpus file is COMMITTED so the tree is genuinely clean.
+W30_LK=$(mktemp -d); W30_LK="$(W30_CN "$W30_LK")"
+( cd "$W30_LK"; git init -q; git config user.email t@t; git config user.name t; git commit -q --allow-empty -m i; git branch -M main
+  mkdir -p .claude; git worktree add -q .claude/worktrees/lk -b feat/lk >/dev/null )
+mkdir -p "$W30_LK/e2e"
+echo "old corpus" > "$W30_LK/e2e/old.spec.ts"
+( cd "$W30_LK/.claude/worktrees/lk"; mkdir e2e; echo "new corpus" > e2e/new.spec.ts; git add e2e; git commit -q -m corpus )
+git -C "$W30_LK" worktree lock "$W30_LK/.claude/worktrees/lk"
+W30_O="$(zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; cd '$W30_LK'; $(w30env) CC_WT_SHARE='e2e' gwt-rm lk" 2>&1)"; W30_RC=$?
+eq "30 locked: rc!=0"                     "$([ "$W30_RC" -ne 0 ] && echo y || echo n)" "y"
+eq "30 locked: root share zero new"       "$([ -e "$W30_LK/e2e/new.spec.ts" ] && echo y || echo n)" "n"
+eq "30 locked: worktree survives"         "$([ -d "$W30_LK/.claude/worktrees/lk" ] && echo y || echo n)" "y"
+eq "30 locked: says locked"               "$(echo "$W30_O" | grep -c 'locked')" "1"
+
+# CC_WT_SHARE exported-empty is a SUPPORTED off switch (README) — gwt-new must still finish:
+# record the merge target, open the workspace (a no-op without cmux), cd. The old one-liner
+# tail left rc=1 right after building the worktree, skipping all of that.
+W30_G8=$(mktemp -d); W30_G8="$(W30_CN "$W30_G8")"
+( cd "$W30_G8"; git init -q; git config user.email t@t; git config user.name t; git commit -q --allow-empty -m i; git branch -M main
+  mkdir -p .claude/worktrees )   # pick the .claude/worktrees convention, like every repo above
+# PATH carries the fake cmux (§26 pattern): gwt-new reaches cc-dispatch.sh workspace, which
+# only checks `command -v cmux` + ping — unshimmed it opened a REAL workspace and stole focus
+# (2026-08-22: eleven leaked workspaces had to be closed by hand)
+W30_O="$(cd "$W30_G8" && PATH="$W30_WS:$PATH" zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; $(w30env) CC_WT_SHARE='' gwt-new nx" 2>&1)"; W30_RC=$?
+eq "30 gwt-new: rc=0 with empty share"    "$W30_RC" "0"
+eq "30 gwt-new: worktree built"           "$([ -d "$W30_G8/.claude/worktrees/nx" ] && echo y || echo n)" "y"
+eq "30 gwt-new: target recorded"          "$(git -C "$W30_G8" config --get branch.feat/nx.ccMergeInto)" "main"
+
+# gwt-rm run from INSIDE the worktree it removes (gwt-new cd's you there): the root must be
+# resolved BEFORE the removal — afterwards every bare git runs in a dead cwd and a MERGED
+# branch reads as "not merged" (gate 5)
+W30_SL=$(mktemp -d); W30_SL="$(W30_CN "$W30_SL")"
+( cd "$W30_SL"; git init -q; git config user.email t@t; git config user.name t; git commit -q --allow-empty -m i; git branch -M main
+  mkdir -p .claude; git worktree add -q .claude/worktrees/sl -b feat/sl >/dev/null )
+( cd "$W30_SL/.claude/worktrees/sl"; echo z > s.txt; git add s.txt; git commit -q -m "sl work" )
+W30_SLTIP="$(git -C "$W30_SL/.claude/worktrees/sl" rev-parse HEAD)"
+( cd "$W30_SL"; git merge -q --squash feat/sl >/dev/null 2>&1; git commit -q -m "chore: merge" -m "Child-Tip: $W30_SLTIP"
+  git config branch.feat/sl.ccMergeInto main )
+W30_O="$(cd "$W30_SL/.claude/worktrees/sl" && zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; $(w30env) gwt-rm sl --branch" 2>&1)"; W30_RC=$?
+eq "30 self-rm: rc=0"                     "$W30_RC" "0"
+eq "30 self-rm: judged merged"            "$(echo "$W30_O" | grep -c 'merged into main')" "1"
+eq "30 self-rm: branch deleted"           "$(git -C "$W30_SL" branch --list 'feat/sl' | wc -l | tr -d ' ')" "0"
+
+# recorded target deleted by the README's own gwt-merge <parent>; gwt-rm <parent> --branch
+# sequence: fall back to the trunk — the merged child must still be judged merged (gate 6)
+W30_TD=$(mktemp -d); W30_TD="$(W30_CN "$W30_TD")"
+( cd "$W30_TD"; git init -q; git config user.email t@t; git config user.name t; git commit -q --allow-empty -m i; git branch -M main
+  mkdir -p .claude; git worktree add -q .claude/worktrees/td -b feat/td >/dev/null )
+( cd "$W30_TD/.claude/worktrees/td"; echo w > t.txt; git add t.txt; git commit -q -m "td work" )
+( cd "$W30_TD"; git branch gone; git merge -q feat/td >/dev/null 2>&1; git config branch.feat/td.ccMergeInto gone; git branch -D gone >/dev/null 2>&1 )
+W30_O="$(zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; cd '$W30_TD'; $(w30env) gwt-rm td --branch" 2>&1)"; W30_RC=$?
+eq "30 target-gone: rc=0 judged merged"   "$W30_RC" "0"
+eq "30 target-gone: merged into trunk"    "$(echo "$W30_O" | grep -c 'merged into main')" "1"
+eq "30 target-gone: branch deleted"       "$(git -C "$W30_TD" branch --list 'feat/td' | wc -l | tr -d ' ')" "0"
+
+# reclaim path on a name whose fallback branch never existed (dir name ≠ branch name): the
+# stale merge record under the fallback name must be cleared, not left forever (gate 7)
+W30_J=$(mktemp -d); W30_J="$(W30_CN "$W30_J")"
+( cd "$W30_J"; git init -q; git config user.email t@t; git config user.name t; git commit -q --allow-empty -m i; git branch -M main
+  git branch feat/real
+  mkdir -p .claude; git worktree add -q .claude/worktrees/gn feat/real >/dev/null
+  git config branch.feat/gn.ccMergeInto main    # stale record under the FALLBACK name
+  rm -rf .claude/worktrees/gn )                  # directory gone; registration stays (reclaim)
+W30_O="$(zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; cd '$W30_J'; $(w30env) gwt-rm gn --branch" 2>&1)"; W30_RC=$?
+eq "30 reclaim-gone: rc=0"                "$W30_RC" "0"
+eq "30 reclaim-gone: merge record cleared" "$(git -C "$W30_J" config --get branch.feat/gn.ccMergeInto)" ""
+eq "30 reclaim-gone: says already gone"   "$(echo "$W30_O" | grep -c 'clearing its merge record')" "1"
+
+# bootstrap with CC_WT_SHARE on: seeding is best-effort — even a seed command that CANNOT RUN
+# (HOME pointed at an empty dir, so the hard-coded ~/.config/cc-stack path is unreachable and
+# the seed call lands rc 127) must not fail the finished bootstrap. On the base build the
+# seed's rc leaked out through the function tail.
+W30_KH=$(mktemp -d)
+W30_K=$(mktemp -d); W30_K="$(W30_CN "$W30_K")"
+( cd "$W30_K"; git init -q; git config user.email t@t; git config user.name t; git commit -q --allow-empty -m i; git branch -M main
+  mkdir -p .claude/worktrees )
+HOME="$W30_KH" zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; $(w30env) CC_WT_SHARE='e2e' _gwt_bootstrap_wt '$W30_K' '$W30_K/.claude/worktrees/seed' feat/seed" >/dev/null 2>&1
+eq "30 seed-on: bootstrap rc=0"           "$?" "0"
+rm -rf "$W30_KH"
+
+rm -rf "$W30_D" "$W30_DB" "$W30_DB2" "$W30_D2" "$W30_R" "$W30_F" "$W30_WS" "$W30_G1" "$W30_G1B" "$W30_SQ" "$W30_G5" "$W30_LK" "$W30_G8" "$W30_SL" "$W30_TD" "$W30_J" "$W30_K" "$W30_T" "$W30_S" "$W30_TRUST" "$W30_TT"
+
+echo ""
 echo "== 19. gwt-done as a standalone command (no zsh, no sourcing) =="
 # Incident 2026-08-16: a sub-task ran `gwt-done` from its non-interactive Bash and got
 # "_gwt_root: command not found" — a zsh function does not exist in a shell that never sourced
