@@ -27,10 +27,11 @@
 #   it never rewrites either live file).
 # Reading the TSVs: awk -F'\t' only, and rewrites re-emit whole rows — see the discipline note
 #   below; a `read` loop collapses runs of TAB and fossilizes the shift on the next rewrite.
-# Repo filter: only rows under the caller's git root (git rev-parse --show-toplevel from
-#   PWD), BOTH sides canonicalized with pwd -P — git reports the physical /private/var/...
-#   form on macOS while a stored row can carry the logical /var/... form; outside any repo
-#   (or with --all) everything shows.
+# Repo filter: only rows under the caller's MAIN repo root (the _cc_gitroot discipline, see the
+#   F1 note below — git-common-dir resolved INSIDE the target dir, so a linked worktree maps to
+#   its parent repo; --show-toplevel would answer the worktree itself), BOTH sides canonicalized
+#   with pwd -P — git reports the physical /private/var/... form on macOS while a stored row can
+#   carry the logical /var/... form; outside any repo (or with --all) everything shows.
 set -u
 
 # ── log subcommand: append one worktree sub-task record (absorbs cc-tasks-log.sh) ─────────
@@ -141,11 +142,38 @@ ccb_lock(){    # <file> → take the shared mkdir lock (atomic; macOS lacks floc
 }
 
 # repo-filter root: the caller's git top-level from PWD, canonicalized ("" → no filter)
+# F1 fix: use the same discipline as _cc_gitroot in cc-dispatch.sh — a linked worktree must resolve
+# to the MAIN repo root, not to the worktree itself (git rev-parse --show-toplevel returns the
+# worktree directory in a linked worktree, which breaks the "from any shell" contract).
 root=""
 if [ -z "$all" ]; then
-  root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
-  if [ -n "$root" ]; then
-    root="$(ccb_canon1 "$root" || true)"
+  # Resolve the git common dir, then its parent — this works for both main checkouts and
+  # linked worktrees, and the relative path (when git-common-dir is ".git") resolves against
+  # the target directory, not the caller's pwd.
+  _cc_board_root="$( (CDPATH= cd -- "$PWD" 2>/dev/null || exit 1
+                      _ccg="$(git rev-parse --git-common-dir 2>/dev/null)" || exit 1
+                      [ -n "$_ccg" ] || exit 1
+                      CDPATH= cd -- "$_ccg/.." 2>/dev/null || exit 1
+                      pwd -P) 2>/dev/null )" || true
+  if [ -n "$_cc_board_root" ]; then
+    # submodule guard (same TWO criteria as _cc_gitroot, OR'd): (a) superproject non-empty —
+    # a submodule CHECKOUT; (b) the computed root doesn't CONTAIN this dir — a submodule's
+    # LINKED worktree, where the superproject check is empty but .git/modules still isn't a
+    # repo root and bec2f41's --show-toplevel showed that shape its own row. Either →
+    # --show-toplevel; --separate-git-dir keeps the resolution above (root contains the dir).
+    # The fallback cd's only on a NON-EMPTY toplevel: bash `cd -- ""` succeeds in place, so an
+    # empty answer must never reach the subshell or it hands back the CALLER's pwd.
+    _cbsup="$(git -C "$PWD" rev-parse --show-superproject-working-tree 2>/dev/null)"
+    _cbtgt="$(ccb_canon1 "$PWD" 2>/dev/null || true)"
+    case "$_cbtgt/" in ""|"$_cc_board_root"/*) _cbin="" ;; *) _cbin=1 ;; esac
+    if [ -n "$_cbsup" ] || [ -n "$_cbin" ]; then
+      _cbtop="$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null)"
+      if [ -n "$_cbtop" ]; then
+        _cbfb="$( (CDPATH= cd -- "$_cbtop" 2>/dev/null && pwd -P) 2>/dev/null )"
+        [ -n "$_cbfb" ] && _cc_board_root="$_cbfb"
+      fi
+    fi
+    root="$(ccb_canon1 "$_cc_board_root" || true)"
     [ -n "$root" ] || root=""
   fi
 fi
@@ -271,9 +299,13 @@ while IFS=$'\t' read -r _raw _c; do
   ccb_has "$ccb_roots" "$NL$_r$NL" && continue
   ccb_roots="$ccb_roots$_r$NL"
   # `<key> <value>` per line; the key is one token (branch names hold no spaces) and the value is
-  # the rest, so the branch is whatever sits between "branch." and ".ccMergeInto" — dots included.
+  # the rest. git normalizes the NAME part of a config key to lowercase in --get-regexp OUTPUT
+  # (branch.feat/x.ccMergeInto answers `branch.feat/x.ccmergeinto` — live-probed 2026-08-21), so
+  # the suffix strip must be case-insensitive; and since a branch name may itself hold dots, strip
+  # at the LAST dot-segment rather than at the literal suffix.
   ccb_pmap="$ccb_pmap$(git -C "$_r" config --get-regexp '^branch\..*\.ccMergeInto$' 2>/dev/null \
-      | awk -v r="$_r" '{k=$1; v=substr($0,length(k)+2); sub(/^branch\./,"",k); sub(/\.ccMergeInto$/,"",k)
+      | awk -v r="$_r" '{k=$1; v=substr($0,length(k)+2); sub(/^branch\./,"",k)
+                         if (tolower(k) ~ /\.ccmergeinto$/) sub(/\.[^.]*$/,"",k)
                          if (k != "" && v != "") print r "\t" k "\t" v}')
 "
   ccb_pwt="$ccb_pwt$(git -C "$_r" worktree list --porcelain 2>/dev/null \
@@ -348,7 +380,30 @@ while IFS="$US" read -r cdir br ref task parent state sts parcfg auth livehit ca
     par="$(git -C "$cdir" config --get "branch.$br.ccMergeInto" 2>/dev/null)"
     [ -n "$par" ] || par="$parent"
     if [ -z "$par" ]; then
-      repo="$(git -C "$cdir" rev-parse --show-toplevel 2>/dev/null)"
+      # F1-class fix (round 2): same discipline as the repo-filter root above — resolve
+      # git-common-dir INSIDE the row dir so a linked-worktree row maps to its MAIN repo root
+      # (--show-toplevel would answer the worktree itself and get-parent would then miss).
+      repo="$( (CDPATH= cd -- "$cdir" 2>/dev/null || exit 1
+                _ccg="$(git rev-parse --git-common-dir 2>/dev/null)" || exit 1
+                [ -n "$_ccg" ] || exit 1
+                CDPATH= cd -- "$_ccg/.." 2>/dev/null || exit 1
+                pwd -P) 2>/dev/null )"
+      # submodule guard, same TWO OR'd criteria as the repo-filter root above: (a) superproject
+      # non-empty — a submodule checkout; (b) the computed root doesn't CONTAIN $cdir — a
+      # submodule's LINKED worktree (superproject empty there, .git/modules still not a repo
+      # root). Either → --show-toplevel; --separate-git-dir keeps the resolution above. The
+      # fallback cd's only on a NON-EMPTY toplevel (`cd -- ""` succeeds in place and would
+      # hand back the caller's pwd).
+      _cnsup="$(git -C "$cdir" rev-parse --show-superproject-working-tree 2>/dev/null)"
+      _cntgt="$( (CDPATH= cd -- "$cdir" 2>/dev/null && pwd -P) 2>/dev/null )"
+      case "$_cntgt/" in ""|"$repo"/*) _cnin="" ;; *) _cnin=1 ;; esac
+      if [ -n "$_cnsup" ] || [ -n "$_cnin" ]; then
+        _cntop="$(git -C "$cdir" rev-parse --show-toplevel 2>/dev/null)"
+        if [ -n "$_cntop" ]; then
+          _cnfb="$( (CDPATH= cd -- "$_cntop" 2>/dev/null && pwd -P) 2>/dev/null )"
+          [ -n "$_cnfb" ] && repo="$_cnfb"
+        fi
+      fi
       [ -n "$repo" ] && par="$("$MERGE" get-parent "$repo" "$br" 2>/dev/null)"
     fi
   fi
@@ -368,10 +423,24 @@ if [ -z "$archive" ]; then
   elif [ -n "$live" ] && [ -z "$some_live" ]; then
     echo "(note: all registered surface refs are stale — cmux was probably restarted → status shows '?old-session'; dirs still exist, cleanup unaffected)"
   fi
-  # failure breadcrumb: "built a worktree but no tab" + cc-send fail-open/calibration lines, last 24h
-  flog="$HOME/.config/cc-stack/cc-failures.log"
+  # failure breadcrumb: "built a worktree but no tab" + cc-send fail-open/calibration lines, last 24h.
+  # H2: consecutive IDENTICAL messages (timestamp stripped) fold into ONE line + (×N) — a verify
+  # false-alarm firing on every child report otherwise floods this tail with a dozen copies of
+  # itself (16-in-a-row on 2026-08-21) and drowns the line that mattered. Fold the WHOLE
+  # time-filtered stream, THEN narrow to the display tail: round 2 killed tail-8-then-fold
+  # (a 16-run capped at (×8)); round 4 killed its successor tail -60 for the same reason —
+  # ANY window cap re-buries the old distinct line once the flood exceeds it. Display-side
+  # only; the log stays the
+  # append-only truth. CC_SEND_FAILLOG overrides the path (tests, log aggregation) — the same
+  # name _ccsend_crumb and cc-hooks.sh use, so all three readers agree.
+  flog="${CC_SEND_FAILLOG:-$HOME/.config/cc-stack/cc-failures.log}"
   if [ -f "$flog" ]; then
-    recent="$(awk -v cut="$(date -v-1d '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo 0)" '$0 >= "["cut' "$flog" 2>/dev/null | tail -3)"
+    recent="$(awk -v cut="$(date -v-1d '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo 0)" \
+      '$0 >= "["cut { print }' "$flog" 2>/dev/null | awk '
+      { raw = $0; msg = raw; sub(/^\[[^]]*\] /, "", msg)
+        if (n > 0 && msg == m[n]) { cnt[n]++; line[n] = raw }   # same as previous: bump, keep LATEST ts
+        else { n++; m[n] = msg; line[n] = raw; cnt[n] = 1 } }
+      END { for (i = 1; i <= n; i++) print line[i] (cnt[i] > 1 ? " (×" cnt[i] ")" : "") }' | tail -3)"
     if [ -n "$recent" ]; then
       echo "⚠ recent dispatch/cc-send failures (see cc-failures.log):"
       printf '%s\n' "$recent" | sed 's/^/   /'

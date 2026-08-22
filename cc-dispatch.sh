@@ -175,18 +175,22 @@ _ccsend_verify() {     # $1 = ref — post-send verification, EMPTY-path deliver
                        # the raw send DID return OK, and a cmux hiccup must not fail an honest
                        # delivery. CC_SEND_VERIFY_SEC (default 1) spaces the re-reads (tests
                        # shrink it).
-  local ref verdict w
+  local ref verdict w line_text _ccsend_crumb_txt
   ref="$1"
   w="${CC_SEND_VERIFY_SEC:-1}"; case "$w" in ''|*[!0-9.]*|.*|*.|*.*.*) w=1 ;; esac
   sleep "$w"
   verdict="$(cmux read-screen --surface "$ref" --lines "$CCSEND_LINES" 2>/dev/null | _ccsend_eval)"
+  line_text="${verdict#*$'\t'}"  # F2 fix: capture the matched line text for the breadcrumb
   case "${verdict%%$'\t'*}" in
     busy) cmux send-key --surface "$ref" Enter >/dev/null 2>&1 || true   # the ONE retry
           sleep "$w"
           verdict="$(cmux read-screen --surface "$ref" --lines "$CCSEND_LINES" 2>/dev/null | _ccsend_eval)"
+          line_text="${verdict#*$'\t'}"
           case "${verdict%%$'\t'*}" in
-            busy) echo "✗ cc-send: sent to $ref but the input line still holds text after one Enter retry — the message may be parked in the composer; finish it by hand (see docs/known-issues.md)" >&2
-                  _ccsend_crumb "$ref" "cc-send parked after send: input line still non-empty after one Enter retry (Enter swallowed twice?) — see docs/known-issues.md"
+            busy) # F2 fix: include the matched line text (truncated to 120 chars, TAB/newlines stripped) in the breadcrumb
+                  _ccsend_crumb_txt="$(printf '%s' "$line_text" | tr '\t' ' ' | tr '\n' ' ' | cut -c1-120)"
+                  echo "✗ cc-send: sent to $ref but the input line still holds text after one Enter retry — the message may be parked in the composer; finish it by hand (see docs/known-issues.md)" >&2
+                  _ccsend_crumb "$ref" "cc-send parked after send: input line still non-empty after one Enter retry (matched line: \"$_ccsend_crumb_txt\") — see docs/known-issues.md"
                   return 1 ;;
           esac ;;
   esac
@@ -231,7 +235,16 @@ _ccsend() {            # $1 = surface ref, $2 = text — the gate loop
     sleep 0.5
   done
   _ccsend_raw "$ref" "$text" || return 1
-  _ccsend_verify "$ref" || return 1
+  # H3: CC_SEND_NOVERIFY=1 skips the post-send verify for callers that knowingly target a SHELL
+  # (the two launch sends in `surface`): a ❯-prompt shell (starship / p10k default) echoes the
+  # typed launch command, the bottom-up scan reads that echo as a busy composer, and verify would
+  # false-alarm + Enter-retry a tab that never had a composer at all. The gate semantics above
+  # are untouched — only the empty-path verify is skippable, and only by explicit opt-in.
+  # Skipping verify also skips its ONE Enter retry — deliberate (round 2, gate question):
+  # _ccsend_raw already sends its own Enter, so parked launch text is submitted by that; and
+  # launch sends here were historically plain fail-open (no verify, no retry) with no known
+  # parking case the retry ever saved.
+  [ "${CC_SEND_NOVERIFY:-0}" = "1" ] || { _ccsend_verify "$ref" || return 1; }
   echo "✔ cc-send: delivered to $ref"
 }
 
@@ -433,6 +446,30 @@ _cc_gitroot(){ # $1 = a directory
              CDPATH= cd -- "$_ccg/.." 2>/dev/null || exit 1
              pwd -P) 2>/dev/null )"
   [ -n "$_ccgr" ] || return 1
+  # submodule guard — TWO criteria, OR'd (gate round 4): inside a SUBMODULE, --git-common-dir
+  # answers <super>/.git/modules/<name>, whose parent is .git/modules — neither the submodule
+  # worktree nor anything a repo filter wants, and every row would filter out ("no records").
+  #   (a) --show-superproject-working-tree non-empty — a submodule CHECKOUT (gate-verified
+  #       across six shapes: empty for a plain repo, in-repo/out-of-repo worktrees,
+  #       --separate-git-dir, and production worktrees);
+  #   (b) the computed root does not CONTAIN the target — catches a submodule's LINKED worktree
+  #       (/super/sub/.claude/worktrees/x): the superproject check is EMPTY there, yet the
+  #       common-dir parent (.git/modules) still isn't a repo root; bec2f41's --show-toplevel
+  #       showed that shape its own row, so not falling back there is a regression.
+  # Either criterion → fall back to --show-toplevel. --separate-git-dir keeps the resolution
+  # above (root contains the target, superproject empty) — bec2f41-identical. The fallback
+  # cd's only on a NON-EMPTY toplevel: bash `cd -- ""` succeeds in place, so an empty answer
+  # must never reach the subshell or it hands back the CALLER's pwd.
+  _ccsup="$(git -C "$1" rev-parse --show-superproject-working-tree 2>/dev/null)"
+  _cctgt="$( (CDPATH= cd -- "$1" 2>/dev/null && pwd -P) 2>/dev/null )"
+  case "$_cctgt/" in ""|"$_ccgr"/*) _ccin="" ;; *) _ccin=1 ;; esac
+  if [ -n "$_ccsup" ] || [ -n "$_ccin" ]; then
+    _cctop="$(git -C "$1" rev-parse --show-toplevel 2>/dev/null)"
+    if [ -n "$_cctop" ]; then
+      _ccfb="$( (CDPATH= cd -- "$_cctop" 2>/dev/null && pwd -P) 2>/dev/null )"
+      [ -n "$_ccfb" ] && _ccgr="$_ccfb"
+    fi
+  fi
   printf '%s' "$_ccgr"
 }
 
@@ -654,15 +691,20 @@ _cc_commit_gate_auto "$abspath"
 
 # Failure breadcrumb: log + best-effort cmux desktop notification, so "built a worktree but no tab" is discoverable (gwt-status surfaces it)
 _fail() {
-  echo "[$(date '+%F %T')] $abspath — $1" >> "$HOME/.config/cc-stack/cc-failures.log" 2>/dev/null || true
+  echo "[$(date '+%F %T')] $abspath — $1" >> "${CC_SEND_FAILLOG:-$HOME/.config/cc-stack/cc-failures.log}" 2>/dev/null || true
   command -v cmux >/dev/null 2>&1 && cmux ping >/dev/null 2>&1 \
     && cmux notify --title "cc-stack: worktree tab failed" --body "$abspath — $1" >/dev/null 2>&1 || true
 }
 
 # Must be able to reach cmux; short retry to ride out cmux's transient hiccups/restart window (don't rely on CMUX_SOCKET — often empty in CC's Bash env)
+# No cmux binary at all = the remote-SSH no-op case → exit 0 (plain worktree, no tab, nothing failed).
+# cmux PRESENT but unreachable after the retries = the tab genuinely failed to open → F6 fix: exit 1,
+# the SAME rc as the new-surface failure below. wt-claude exec's into this script, so this rc IS
+# gwt-claude's rc — the caller deserves to hear "no tab" instead of success. The hook path swallows
+# rc either way (cc-hooks.sh:267 redirects all output), so only the gwt-claude path is affected.
 command -v cmux >/dev/null 2>&1 || exit 0
 ok=""; for _ in 1 2 3 4 5 6; do cmux ping >/dev/null 2>&1 && { ok=1; break; }; sleep 0.4; done
-[ -n "$ok" ] || { _fail "cmux ping unreachable (likely restarting), no tab opened"; exit 0; }
+[ -n "$ok" ] || { _fail "cmux ping unreachable (likely restarting), no tab opened"; exit 1; }
 
 # Dedup (best effort): if a tab was opened for this dir within 120s, don't repeat. Only CHECK here;
 # write the marker after success (failures leave no blocking marker). SKIPPED in resume mode: a
@@ -793,6 +835,7 @@ if [ -n "$prompt" ]; then
   full="$full
 ——[Working agreement] $way1 (2) Follow this project's own CLAUDE.md and .claude config (harness) throughout; don't drift toward your own defaults. (3) After making changes, commit / rebase / merge / push / removing the worktree or branch ALL require human authorization — even if the finishing-a-development-branch skill prompts you, just stop at 'keep the branch'. (4) When you finish implementing and have reported back, run \`~/.config/cc-stack/gwt-done\` (the absolute path — \`gwt-done\` alone is a zsh function that does NOT exist in your non-interactive shell) to mark this branch ready; your merge target is already recorded, so you never choose where to merge, and you never merge without my authorization."
   [ -n "$caller_surface" ] && full="$full (5) To report back / ask the main task: ~/.config/cc-stack/cc-dispatch.sh send $caller_surface \"message\" — cc-send waits out any half-typed line instead of colliding; never use raw cmux send + Enter."
+  full="$full (6) Keep every edit inside THIS worktree (the cwd you started in — for this repo's own sub-tasks that path sits under ~/.config/cc-stack/.claude/worktrees/, so scope by your starting cwd, NEVER by the ~/.config/cc-stack prefix): everything outside it is read-only for a sub-task — the parent's main checkout, the live install dir, sibling worktrees — read freely, never write, even when a brief quotes an absolute path into them (the install dir is the LIVE dispatcher/hooks behind every session on this machine)."
 fi
 
 # Start the sub-task claude. Key point: don't type the prompt straight into the terminal (a very long line gets shredded,
@@ -823,7 +866,7 @@ if [ -n "$rsmode" ]; then
   # pm/model) — no prompt to send (the session IS the context), nothing to mint, no board row;
   # the resume caller refreshes the existing row's surface ref itself.
   pf=""
-  ( export CC_SEND_QUIET=1; _ccsend "$ref" "$CC_WT_LAUNCH_CMD" ) >/dev/null 2>&1 || true
+  ( export CC_SEND_QUIET=1 CC_SEND_NOVERIFY=1; _ccsend "$ref" "$CC_WT_LAUNCH_CMD" ) >/dev/null 2>&1 || true
 else
 # Provider for NEW sub-tasks: `gwt-provider` writes a provider name to $CC_LAUNCH_FILE (default anthropic).
 # anthropic/default → cmux claude-teams on the official/current-env provider; any other name → `cld <name>`,
@@ -833,7 +876,10 @@ _provider="$(cat "${CC_LAUNCH_FILE:-$HOME/.config/cc-stack/launch}" 2>/dev/null)
 prov_rec="anthropic"
 case "$_provider" in
   ""|anthropic|default) launch="ccteam" ;;
-  */*|*..*)             launch="ccteam" ;;     # path-traversal guard → safe default
+  # F4 fix (+round 2): the SAME whitelist _ccres_parse applies at resume time — allowed chars
+  # A-Za-z0-9._-, no leading dot (a `cld .kimi` launch would record, then be dropped back to
+  # ccteam on resume), no traversal. Divergence here = a launch the recorded args can't replay.
+  *[!A-Za-z0-9._-]*|.*|*/*|*..*) launch="ccteam" ;;   # invalid/leading-dot/traversal → safe default
   *)                    launch="cld $_provider"; prov_rec="$_provider" ;;
 esac
 # launch-args for the board's 8th TSV field — exactly what gwt-resume replays later, plus the two
@@ -845,16 +891,25 @@ largs="${largs:+$largs:}provider=$prov_rec:pm=$pm"
 [ -n "$csuuid" ] && largs="$largs:csuuid=$csuuid"
 [ -n "$suuid" ]  && largs="$largs:suuid=$suuid"
 [ -n "$mdl" ] && largs="$largs:model=$mdl"
+# Bounded sweep of pf leftovers (gate round 3): the common cause is NOT a failed send but a
+# TUI that painted too slowly for the probe — the shell evals $(cat pf) right away, ~6s before
+# the 24-round probe gives up — so the file outlives its dispatch as a world-readable copy of
+# the full brief. On every dispatch drop any cc-wt-prompt.* older than a day or two (-mtime
+# day-granularity rounds up; conservative on the fresh side, since a slow tab's shell may not
+# have read its file yet).
+find "${TMPDIR:-/tmp}" -maxdepth 1 -name 'cc-wt-prompt.*' -mtime +1 -exec rm -f {} + 2>/dev/null || true
 pf=""
 if [ -n "$full" ]; then
   pf="${TMPDIR:-/tmp}/cc-wt-prompt.$$.txt"
   printf '%s' "$full" > "$pf"
   # Routed through cc-send (the single injection exit point). The tab is still a SHELL here — no
   # claude input box yet — so CC_SEND_QUIET suppresses the fail-open breadcrumb that an
-  # unrecognized shell prompt would otherwise write on every dispatch.
-  ( export CC_SEND_QUIET=1; _ccsend "$ref" "$launch$sess --permission-mode $pm$mflag \"\$(cat '$pf')\"" ) >/dev/null 2>&1 || true
+  # unrecognized shell prompt would otherwise write on every dispatch, and CC_SEND_NOVERIFY=1
+  # (H3) skips the post-send verify: on a ❯-prompt shell the launch echo would read as a busy
+  # composer and false-alarm. Nothing is lost — there is no composer to verify on a shell.
+  ( export CC_SEND_QUIET=1 CC_SEND_NOVERIFY=1; _ccsend "$ref" "$launch$sess --permission-mode $pm$mflag \"\$(cat '$pf')\"" ) >/dev/null 2>&1 || true
 else
-  ( export CC_SEND_QUIET=1; _ccsend "$ref" "$launch$sess --permission-mode $pm$mflag" ) >/dev/null 2>&1 || true
+  ( export CC_SEND_QUIET=1 CC_SEND_NOVERIFY=1; _ccsend "$ref" "$launch$sess --permission-mode $pm$mflag" ) >/dev/null 2>&1 || true
 fi
 fi
 
@@ -866,14 +921,29 @@ fi
 # calibration never reads a pre-TUI screen and cries "renderer drift".
 tui=""
 for _ in $(seq 1 24); do
+  # F5 fix (round 2): match over the WHOLE 30-line capture — the trust dialog is a BOX whose
+  # question sits ~15-17 lines above the options/footer, so a bottom-15 window can miss it
+  # entirely (pre-auth failing → 24 idle spins → a tab stuck on an unanswered dialog, still
+  # exit 0). The safety lives in the PHRASES alone: the three REAL dialog wordings, lowercased —
+  # brief-echo PROSE ("if you trust that folder…") never matches them; the old loose
+  # *trust*folder* matched any prose at all.
+  # Gate follow-up (arm ORDER): TUI markers are checked BEFORE the trust phrases — a screen can
+  # carry BOTH (a brief or gate report VERBATIM-quoting the dialog in the transcript above a
+  # healthy TUI); trusting first would fire up to 24 stray Enters into the live session, which
+  # presses the default option if a permission dialog happens to be up. TUI markers up ⇒ claude
+  # is running ⇒ no pending trust dialog exists, so they win the race. The order is also what
+  # makes the *"do you trust"* catch-all (4th pattern, gate round 3) safe to keep: the F5
+  # wording can drift ("…this directory?", a rewrap) and the three exact phrases would miss it
+  # — pre-auth silently failing again — so anything asking "do you trust" gets answered, and
+  # the TUI-first arm keeps a transcript QUOTE of the question from being answered instead.
   scr="$(cmux read-screen --surface "$ref" --lines 30 2>/dev/null | tr 'A-Z' 'a-z')"
   case "$scr" in
-    *trust*folder*|*trust*file*|*trust*director*|*"do you trust"*)
+    *"esc to interrupt"*|*"? for shortcuts"*|*"ctrl+c to exit"*|*"-- insert --"*)
+      tui=1; break ;;                                       # claude TUI is up → no trust dialog coming
+    *"do you trust"*|*"do you trust the files in this folder"*|*"do you trust this folder"*|*"do you trust the files in the parent directory"*)
       cmux send-key --surface "$ref" Enter >/dev/null 2>&1   # keystroke-answering a dialog, NOT text
                                                              # injection — deliberately stays a raw send-key
       sleep 1 ;;                                            # dialog leaves; the loop then sees the TUI
-    *"esc to interrupt"*|*"? for shortcuts"*|*"ctrl+c to exit"*|*"-- insert --"*)
-      tui=1; break ;;                                       # claude TUI is up → no trust dialog coming
   esac
   sleep 0.25
 done
@@ -885,7 +955,18 @@ done
 [ -n "$tui" ] && _ccsend_calibrate "$ref" "$abspath" || true
 
 # claude is up and the prompt is already read into argv by the shell — the temp file can go
-[ -n "$pf" ] && rm -f "$pf" 2>/dev/null
+# F3 fix: only delete the prompt file when we're sure the TUI is up (tui=1). If the RDY probe timed
+# out and we "sent anyway", the shell might not have executed $(cat '$pf') yet — deleting it now means
+# claude starts with an empty prompt and no indication of failure. A few KB in TMPDIR is harmless.
+[ -n "$pf" ] && [ -n "$tui" ] && rm -f "$pf" 2>/dev/null
+# F3 (round 2): when the TUI was never confirmed the file is KEPT — say so, with the path, so a
+# tab that idles with an empty prompt is diagnosable instead of mysterious.
+if [ -n "$pf" ] && [ -z "$tui" ]; then
+  # round 4: also crumb it to cc-failures.log — the hook path discards stdout/stderr, so a
+  # stderr-only line never reaches the board; _ccsend_crumb is the channel that does.
+  _ccsend_crumb "$ref" "claude TUI never confirmed — prompt kept in $pf; if the tab idles with an empty prompt, submit it by hand"
+  echo "⚠ claude TUI never confirmed — prompt kept in $pf" >&2
+fi
 
 # ── Register into the task list (so gwt-status can show "which worktree is doing what") ──
 # F5: 5th arg = the merge target CAPTURE recorded (git config branch.<b>.ccMergeInto) — the same
@@ -1362,7 +1443,9 @@ fi
 [ -f "$tasks" ] || { echo "no registered worktree tasks (nothing to resume)"; exit 0; }
 repo_root=""
 if [ -z "$res_all" ]; then
-  repo_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+  # F1 fix: resolve to the main repo root, not the worktree itself (linked worktrees must see
+  # sibling lines, not just themselves). Use the same discipline as _cc_gitroot.
+  repo_root="$(_cc_gitroot "$PWD" 2>/dev/null || true)"
   if [ -n "$repo_root" ]; then
     repo_root="$(ccb_canon "$repo_root")"
     [ -n "$repo_root" ] || repo_root=""
@@ -1370,9 +1453,12 @@ if [ -z "$res_all" ]; then
 fi
 # Field extraction via awk, NOT a bash read loop: bash (and zsh) collapse consecutive TAB
 # delimiters, so a row with an empty caller field would shift every later field.
-task_rows="$(tail -r "$tasks" | awk -F'\t' '$4 != "" { print $4 "\t" $2 "\t" $3 "\t" $6 "\t" $8 }')"
+# F7 fix: use the same US (0x1f) delimiter discipline as cc-board.sh — TAB is IFS whitespace and
+# collapses runs of it, breaking empty fields. The awk→shell handoff uses US instead of TAB.
+task_rows="$(tail -r "$tasks" | awk -F'\t' '$4 != "" { print $4 "\037" $2 "\037" $3 "\037" $6 "\037" $8 }')"
 rows=""; seen_dirs=""
-while IFS=$'\t' read -r r_dir r_br r_ref r_task r_largs; do
+US="$(printf '\037')"
+while IFS="$US" read -r r_dir r_br r_ref r_task r_largs; do
   [ -n "$r_dir" ] || continue
   c="$(ccb_canon "$r_dir")"; [ -n "$c" ] || c="$r_dir"
   printf '%s\n' "$seen_dirs" | grep -qxF -- "$c" && continue     # newest row per dir wins
@@ -1382,7 +1468,7 @@ while IFS=$'\t' read -r r_dir r_br r_ref r_task r_largs; do
   if [ -n "$repo_root" ]; then
     case "$c" in "$repo_root"|"$repo_root"/*) ;; *) continue ;; esac
   fi
-  rows="${rows}${c}	${r_dir}	${r_br}	${r_ref}	${r_task}	${r_largs}
+  rows="${rows}${c}${US}${r_dir}${US}${r_br}${US}${r_ref}${US}${r_task}${US}${r_largs}
 "
 done <<< "$(printf '%s\n' "$task_rows")"
 
@@ -1467,9 +1553,11 @@ _ccres_parse(){ # $1 = launch-args field → _u/_p/_pm/_m globals; empty when ab
 }
 
 # ── disposition per row ──
-# "canon<TAB>dir<TAB>branch<TAB>task<TAB>action<TAB>ref-to-apply<TAB>launch-cmd"
+# "canon${US}dir${US}branch${US}task${US}action${US}ref-to-apply${US}launch-cmd" — the whole resume
+# chain keeps the US delimiter of the task_rows handoff above (F7: TAB collapses empty fields,
+# and a row with an empty surface ref would shift task/largs left and misread the uuid).
 plan=""; n_rest=0; n_re=0; n_live=0
-while IFS=$'\t' read -r c r_dir r_br r_ref r_task r_largs; do
+while IFS="$US" read -r c r_dir r_br r_ref r_task r_largs; do
   [ -n "$c" ] || continue
   _ccres_parse "$r_largs"
   live_ref=""
@@ -1486,13 +1574,13 @@ while IFS=$'\t' read -r c r_dir r_br r_ref r_task r_largs; do
     live_uuid="$(printf '%s\n' "$live_pairs" | awk -F'\t' -v r="$live_ref" '$2==r{print $1; exit}')"
     _ccres_setref "$c" "$live_ref" "$live_uuid"
     _ccres_dropstatus "$c"
-    plan="${plan}${c}	${r_dir}	${r_br}	${r_task}	${act}	${live_ref}
+    plan="${plan}${c}${US}${r_dir}${US}${r_br}${US}${r_task}${US}${act}${US}${live_ref}
 "
     n_rest=$((n_rest+1))
     continue
   fi
   if [ -n "$r_ref" ] && printf '%s\n' "$live_pairs" | awk -F'\t' -v r="$r_ref" '$2==r{f=1} END{exit f?0:1}'; then
-    plan="${plan}${c}	${r_dir}	${r_br}	${r_task}	already-live	${r_ref}
+    plan="${plan}${c}${US}${r_dir}${US}${r_br}${US}${r_task}${US}already-live${US}${r_ref}
 "
     n_live=$((n_live+1))
     continue
@@ -1511,7 +1599,7 @@ while IFS=$'\t' read -r c r_dir r_br r_ref r_task r_largs; do
     lcmd="ccteam"
     act="reopen-idle"
   fi
-  plan="${plan}${c}	${r_dir}	${r_br}	${r_task}	${act}	-	${lcmd}
+  plan="${plan}${c}${US}${r_dir}${US}${r_br}${US}${r_task}${US}${act}${US}-${US}${lcmd}
 "
   n_re=$((n_re+1))
 done <<< "$(printf '%s\n' "$rows")"
@@ -1528,7 +1616,7 @@ disp(){ case "$1" in
     already-live)  echo "✔ already live: $2" ;;
   esac; }
 res_list=""
-while IFS=$'\t' read -r c r_dir r_br r_task r_act r_ref r_cmd; do
+while IFS="$US" read -r c r_dir r_br r_task r_act r_ref r_cmd; do
   [ -n "$c" ] || continue
   res_list="${res_list}$(printf '%s|%s|%s|%s' "$r_br" "$r_task" "$r_dir" "$(disp "$r_act" "$r_ref" "$r_cmd")")"$'\n'
 done <<< "$(printf '%s\n' "$plan")"
@@ -1541,7 +1629,7 @@ if [ "$n_re" -gt 0 ]; then
     case "$ans" in y|Y) ;; *) echo "aborted — nothing re-opened (native restores above stand)"; exit 1 ;; esac
   fi
   echo "── ③ re-open with recorded args ──"
-  while IFS=$'\t' read -r c r_dir r_br r_task r_act r_ref r_cmd; do
+  while IFS="$US" read -r c r_dir r_br r_task r_act r_ref r_cmd; do
     [ -n "$c" ] || continue
     [ "$r_act" = "reopen" ] || [ "$r_act" = "reopen-idle" ] || continue
     # HARD INVARIANT: $r_dir is the board's RECORDED dir string, passed VERBATIM to surface

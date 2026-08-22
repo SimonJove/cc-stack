@@ -2048,6 +2048,366 @@ rm -rf "$SF21" "$FH21" "$CR21" "$TR21" "$MR21" "$PR21"; rm -f "$TF21" "$TB21" "$
 unset CC_FAKE_LOG21 CF_SCREEN21
 
 echo ""
+echo "== 29. dispatch-fixes (F1-F7 + H2/H3 + gate rounds 2-3) =="
+# Contract: every defect gets an assertion that FAILS against the code it fixed — measured:
+# 27 red vs the pre-round-1 product; 15 red vs the round-1 state; 13 red vs the round-2 final
+# state; 12 red vs the gate-round-2 fixes alone; 5 red vs the round-3 containment criterion;
+# 8 red vs the round-4 prelude (superproject-only) = the round-4 fixes: SUBmodule linked-
+# worktree regression ×1, out-of-repo-worktree OR semantics ×2, H2 window cap ×3, kept-pf
+# board crumb ×2. SUBWT and OUTWT-own are GREEN against pre-round-1 — bec2f41's
+# --show-toplevel showed those shapes their own rows, which is exactly the regression round
+# 4 closes; the remaining asserts pin guards that were already correct. Harness = §16's fake-cmux knobs (CC_FAKE_ON_SEND swaps the screen right after a send,
+# CC_FAKE_FLUSH_AT flips it to CC_FAKE_TUI29 on the Nth Enter — Enter count INCLUDES the raw RDY
+# probe's) + §17/§21's HOME-override surface runner (fake HOME holds a COPY of this checkout, so
+# $HOME-callchains never touch the live install). The shim skips the ON_SEND swap for the raw
+# RDY echo so the swap lands only after the LAUNCH send, which is the incident ordering.
+S29=$(mktemp -d); export CC_FAKE_LOG29="$S29/log"; export CC_FAKE_SCREEN29="$S29/screen"
+FL29="$S29/fail.log"
+cat > "$S29/cmux" <<'CMUX29'
+#!/usr/bin/env bash
+case "$1" in
+  ping) [ -n "${CC_FAKE_PINGDOWN:-}" ] && exit 1; exit 0 ;;
+  identify) echo '{ "caller": {} }' ;;
+  restore-session) printf 'RESTORE\n' >> "$CC_FAKE_LOG29"; echo "(fake) nothing to restore" ;;
+  list-workspaces) : ;;
+  list-pane-surfaces) cat "${CC_FAKE_LIVE29:-/dev/null}" 2>/dev/null ;;
+  new-surface)
+    n=$(cat "$CC_FAKE_LOG29.nscnt" 2>/dev/null || echo 900); n=$((n+1)); echo "$n" > "$CC_FAKE_LOG29.nscnt"
+    printf 'NEWSURF|surface:%s|%s\n' "$n" "$*" >> "$CC_FAKE_LOG29"
+    printf 'OK surface:%s (77777777-8888-8888-8888-%012d) pane:1 (P) workspace:1 (W)\n' "$n" "$n" ;;
+  send)     shift; printf 'SEND|%s\n' "$*" >> "$CC_FAKE_LOG29"
+            case "$*" in *"echo RDY"*) ;;    # the raw RDY echo must not trip the ON_SEND swap
+              *) [ -n "${CC_FAKE_ON_SEND:-}" ] && cp "$CC_FAKE_ON_SEND" "$CC_FAKE_SCREEN29" 2>/dev/null ;; esac ;;
+  send-key) shift; printf 'KEY|%s\n' "$*" >> "$CC_FAKE_LOG29"
+            case "$*" in *Enter*)
+              [ -n "${CC_FAKE_FLUSH_AT:-}" ] && {
+                n=$(grep -c 'KEY|.*Enter' "$CC_FAKE_LOG29"); n=${n:-0}
+                [ "$n" -ge "$CC_FAKE_FLUSH_AT" ] && cp "$CC_FAKE_TUI29" "$CC_FAKE_SCREEN29" 2>/dev/null; } ;; esac ;;
+  notify)   shift; printf 'NOTIFY|%s\n' "$*" >> "$CC_FAKE_LOG29" ;;
+  read-screen) cat "$CC_FAKE_SCREEN29" 2>/dev/null ;;
+esac
+exit 0
+CMUX29
+chmod +x "$S29/cmux"
+OP29="$PATH"; NB29="$(printf '\xc2\xa0')"
+# screens: RDY22 present + TUI markers (fast happy path) / RDY only / no RDY & no TUI (both
+# probe loops time out — the F3 "sent anyway" world) / a one-line trust dialog (regression) /
+# a trust dialog SHAPED like the real BOX — question at the top, 15 lines of body/options/
+# footer below it, so the question sits 16 lines up, outside any bottom-15 window / a 20-line
+# screen whose TOP carries a VERBATIM quote of the dialog wording above a healthy TUI (gate
+# follow-up: the phrase matches but the TUI markers must win the case-arm race), and one with
+# brief PROSE about trusting the folder (trust+folder but none of the exact phrases — the
+# phrase layer is all that separates it from a real dialog now that the window is gone).
+{ echo "RDY22"; printf '\xe2\x9d\xaf%s\n' "$NB29"; echo "? for shortcuts"; } > "$S29/scr-tui"
+{ echo "RDY22"; printf '\xe2\x9d\xaf%s\n' "$NB29"; } > "$S29/scr-shell"
+{ echo "shell banner"; printf '\xe2\x9d\xaf%s\n' "$NB29"; echo "plain output"; } > "$S29/scr-notui"
+printf 'Do you trust the files in this folder?\n' > "$S29/scr-dialog"
+{ echo '╭──────────────────────────────────────╮'
+  echo '│ Do you trust the files in this folder?'
+  echo '│'
+  echo '│ /private/tmp/repo29-fixture           │'
+  echo '│'
+  echo '│ Claude Code may read files in this folder.'
+  echo '│ Proceeding gives it access to every file'
+  echo '│ below this directory, and portions may be'
+  echo '│ sent back to the model provider as part'
+  echo '│ of your prompts.'
+  echo '│'
+  echo '│ Docs: https://claude.com/docs/trust'
+  echo '│'
+  echo '│ ❯ 1. Yes, proceed'
+  echo '│   2. No, exit'
+  echo '╰──────────────────────────────────────╯'
+  echo 'a trailing line below the box'
+  echo 'another trailing line' ; } > "$S29/scr-dialogbox"
+{ echo 'Do you trust the files in this directory?'
+  echo '/private/tmp/repo29-fixture'
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do echo "drift filler $i"; done; } > "$S29/scr-dialog-drift"
+{ echo "RDY22"; printf '\xe2\x9d\xaf brief quote: do you trust the files in this folder (echoed transcript)\n'
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14; do echo "transcript filler $i"; done
+  printf '\xe2\x9d\xaf%s\n' "$NB29"; echo "? for shortcuts"; } > "$S29/scr-echo-trust"
+{ echo "RDY22"; printf '\xe2\x9d\xaf brief quote: if you trust that folder of files, answer yes (echoed transcript)\n'
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14; do echo "transcript filler $i"; done
+  printf '\xe2\x9d\xaf%s\n' "$NB29"; echo "? for shortcuts"; } > "$S29/scr-prose-trust"
+# fixture repo: three REGISTERED worktrees in the canonical .claude/worktrees/ layout (the
+# PARENT batch map only ever feeds rows in that layout — §2c's wtW-style rows take the per-row
+# path and can never see the map), plus a foreign-repo row for the filter guard.
+cn29(){ CDPATH= cd -- "$1" >/dev/null 2>&1 && pwd -P; }
+REPO29=$(mktemp -d); ( cd "$REPO29"; git init -q; git config user.email t@t; git config user.name t
+  git commit -q --allow-empty -m i; git branch -M main
+  git worktree add -q ".claude/worktrees/wta" -b feat/wta >/dev/null 2>&1
+  git worktree add -q ".claude/worktrees/wtb" -b feat/wtb >/dev/null 2>&1
+  git worktree add -q ".claude/worktrees/wtp" -b feat/v1.2 >/dev/null 2>&1 )
+WTA="$(cn29 "$REPO29/.claude/worktrees/wta")"; WTB="$(cn29 "$REPO29/.claude/worktrees/wtb")"; WTP="$(cn29 "$REPO29/.claude/worktrees/wtp")"
+OTH29="$(cn29 "$(mktemp -d)")"
+svT="${CC_TASKS_FILE:-}"; svS="${CC_STATUS_FILE:-}"; svA="${CC_ARCHIVE_FILE:-}"
+TF29B=$(mktemp -u); SF29B=$(mktemp -u); AF29B=$(mktemp -u)
+printf '2026-01-01 00:00:01\tfeat/wtb\tsurface:41\t%s\tsurface:1\ttask sibling b\tmain\n' "$WTB"  > "$TF29B"
+printf '2026-01-01 00:00:02\tfeat/v1.2\tsurface:42\t%s\tsurface:1\ttask parent-map\tfeat/STALE7\n' "$WTP" >> "$TF29B"
+printf '2026-01-01 00:00:03\tfeat/foreign29\tsurface:43\t%s\tsurface:1\ttask foreign29\tmain\n' "$OTH29" >> "$TF29B"
+git -C "$REPO29" config branch.feat/v1.2.ccMergeInto feat/camp-29
+export CC_TASKS_FILE="$TF29B" CC_STATUS_FILE="$SF29B" CC_ARCHIVE_FILE="$AF29B"
+
+# ── F1a: the board's repo filter, run from a LINKED WORKTREE, must resolve the MAIN repo root
+# (pre-fix: `git rev-parse --show-toplevel` answered the worktree itself → only its own row)
+BO29="$( ( cd "$WTA" && bash "$CC/cc-board.sh" ) 2>/dev/null )"
+eq "F1 board: sibling row visible from a linked worktree" "$(echo "$BO29" | grep -c 'task sibling b')" "1"
+eq "F1 board: own-repo rows all present"                 "$(echo "$BO29" | grep -c 'task parent-map')" "1"
+eq "F1 board: foreign repo row still filtered"           "$(echo "$BO29" | grep -c 'task foreign29')" "0"
+
+# ── PARENT batch map (parent-session finding 2026-08-21): git NORMALIZES the name part of a
+# config key to lowercase in --get-regexp output (branch.feat/x.ccMergeInto prints as
+# …ccmergeinto), so the CamelCase suffix strip never matched and the map has been dead since
+# F13 — the PARENT column silently ran on the TSV 7th-field fallback. Red pre-fix by making the
+# config value and the TSV field deliberately DIFFERENT (§2c-style fixtures agree, which is
+# exactly why this never failed).
+eq "PARENT map: git-config target beats TSV 7th field" "$(echo "$BO29" | awk -v d="$WTP" '$5==d{print $3}')" "feat/camp-29"
+eq "PARENT map: strip survives dots in branch names"   "$(echo "$BO29" | awk -v d="$WTP" '$5==d{print $3}' | grep -c 'ccmergeinto')" "0"
+
+# ── H2: consecutive identical failure crumbs fold to ONE line +(×N) (16-in-a-row on 2026-08-21).
+# Round 2: the fold needs a WIDE window — tail-8-then-fold capped a 16-run at (×8) and kept
+# burying the older distinct crumb the fold existed to surface. Round 4: tail -60 was the
+# same trap one size up — a 61-run capped at (×60) and buried the distinct crumb AGAIN — so
+# the fold now sees the WHOLE time-filtered stream; only the display tail narrows. 1+61.
+LOGB29=$(mktemp -u); ts29="$(date '+%F %T')"
+printf '[%s] surface:2 — an older distinct crumb, drowned pre-fix\n' "$ts29" > "$LOGB29"
+for i in $(seq 61); do printf '[%s] surface:1 — cc-send parked after send: sixty-one in a row\n' "$ts29" >> "$LOGB29"; done
+BO29F="$( ( cd "$WTA" && CC_SEND_FAILLOG="$LOGB29" bash "$CC/cc-board.sh" ) 2>/dev/null )"
+eq "H2: a 61-run folds to one (×61), not (×60)" "$(echo "$BO29F" | grep -cF '(×61)')" "1"
+eq "H2: never prints the window-capped count"  "$(echo "$BO29F" | grep -cF '(×60)')"  "0"
+eq "H2: the older distinct crumb surfaces too" "$(echo "$BO29F" | grep -c 'an older distinct crumb')" "1"
+rm -f "$LOGB29"
+
+# ── F1b: `resume` run from a linked worktree must list SIBLING rows of the same repo
+TF29R=$(mktemp -u); echo '{}' > "$S29/store29.json"
+printf '2026-01-01 00:00:01\tfeat/rsm-sib\tsurface:51\t%s\tsurface:1\tresume sibling row\tmain\tuuid=66666666-6666-6666-6666-666666666666:provider=anthropic:pm=auto\n' "$WTB" > "$TF29R"
+OUT29R="$( cd "$WTA" && echo n | env HOME="$HOME" PATH="$S29:$OP29" CC_TASKS_FILE="$TF29R" \
+  CC_STATUS_FILE="$SF29B" CC_CMUX_SESSIONS="$S29/store29.json" CC_RESUME_SETTLE=0 \
+  CC_SEND_VERIFY_SEC=0.1 CC_SEND_FAILLOG="$FL29" bash "$CC/cc-dispatch.sh" resume 2>&1 )"
+eq "F1 resume: sibling branch listed from a linked worktree" "$(printf '%s' "$OUT29R" | grep -c 'feat/rsm-sib')" "1"
+
+# ── SUB (gate round 3): inside a SUBMODULE, --git-common-dir answers <super>/.git/modules/<name>
+# and its parent contains neither the submodule nor its rows — the gitroot discipline alone
+# filtered EVERYTHING ("no records", board and resume alike). The guard falls back to
+# --show-toplevel (the submodule root) and the rows show again. Round 4 widened the criterion
+# to an OR: superproject non-empty (this fixture) OR the computed root not containing the
+# target (the SUBWT fixture below). The two shapes after this block pin what must NOT drift:
+# --separate-git-dir keeps the plain common-dir resolution (bec2f41-identical), and the
+# out-of-repo worktree takes the containment fallback (bec2f41-board-identical — see the
+# comment at its own assert).
+SUP29=$(mktemp -d); ( cd "$SUP29" && git init -q && git config user.email t@t && git config user.name t
+  git -c protocol.file.allow=always submodule add -q "$REPO29" sub >/dev/null 2>&1
+  git commit -qm super ) >/dev/null 2>&1 || true
+SUB29="$(cn29 "$SUP29/sub")"                       # the submodule CHECKOUT (worktrees don't survive a clone)
+TF29SUB=$(mktemp -u)
+printf '2026-01-01 00:00:01\tfeat/wtb\tsurface:41\t%s\tsurface:1\tsub sibling row\tmain\n' "$SUB29" > "$TF29SUB"
+BO29S="$( ( cd "$SUB29" && CC_TASKS_FILE="$TF29SUB" CC_STATUS_FILE="$SF29B" bash "$CC/cc-board.sh" ) 2>/dev/null )"
+eq "SUB: board inside a submodule still shows rows" "$(echo "$BO29S" | grep -c 'sub sibling row')" "1"
+OUT29S="$( cd "$SUB29" && echo n | env HOME="$HOME" PATH="$S29:$OP29" CC_TASKS_FILE="$TF29SUB" \
+  CC_STATUS_FILE="$SF29B" CC_CMUX_SESSIONS="$S29/store29.json" CC_RESUME_SETTLE=0 \
+  CC_SEND_VERIFY_SEC=0.1 CC_SEND_FAILLOG="$FL29" bash "$CC/cc-dispatch.sh" resume 2>&1 )"
+eq "SUB: resume inside a submodule still lists siblings" "$(printf '%s' "$OUT29S" | grep -c 'feat/wtb')" "1"
+# ── SUBWT (gate round 4 — the regression the OR criterion exists for): from a submodule's
+# LINKED worktree (/super/sub/.claude/worktrees/x) the superproject check comes back EMPTY,
+# yet the common dir still resolves into <super>/.git/modules — the pure-superproject guard
+# never fired, the root WAS .git/modules, and both board and resume lost every row ("no
+# records" / "no resumable board rows"). bec2f41's --show-toplevel showed this shape its own
+# row. The containment half of the OR catches it: root doesn't contain the worktree →
+# --show-toplevel (the worktree itself) → its own row shows again.
+git -C "$SUB29" worktree add -q ".claude/worktrees/swtx" -b feat/swtx >/dev/null 2>&1 || true
+WTX29="$(cn29 "$SUB29/.claude/worktrees/swtx")"
+TF29X=$(mktemp -u)
+printf '2026-01-01 00:00:01\tfeat/swtx\tsurface:46\t%s\tsurface:1\tsubwt own row\tmain\n' "$WTX29" > "$TF29X"
+BO29X="$( ( cd "$WTX29" && CC_TASKS_FILE="$TF29X" CC_STATUS_FILE="$SF29B" bash "$CC/cc-board.sh" ) 2>/dev/null )"
+eq "SUBWT: a submodule's linked worktree still shows its own row" "$(echo "$BO29X" | grep -c 'subwt own row')" "1"
+rm -rf "$SUP29"; rm -f "$TF29SUB" "$TF29X"
+# --separate-git-dir (gate placement: worktree and gitdir SHARE a parent — the six-shape
+# probe's layout): the common dir is <parent>/sepgit, so the computed root is the shared
+# parent, which CONTAINS the worktree → neither guard criterion fires and the plain
+# common-dir resolution stands (bec2f41-identical). Two rows pin both properties: the
+# checkout's OWN row (this going red means the git dance above failed — round 4 replaced a
+# vacuous assert here: every setup step has `|| true`, so a broken fixture left an empty dir
+# field, the board dropped the row, and grep 0 read as "no fallback" green), and a SIBLING
+# row under the shared parent, which a --show-toplevel fallback (the worktree itself) hides.
+SEP29B=$(mktemp -d); mkdir -p "$SEP29B/sepwt" "$SEP29B/sib"   # cn29 cd's in — dirs must exist FIRST
+( cd "$SEP29B/sepwt" && git init -q --separate-git-dir="$SEP29B/sepgit" . && git config user.email t@t && git config user.name t \
+  && git commit -q --allow-empty -m i && git branch -M main ) >/dev/null 2>&1 || true
+WTSEP="$(cn29 "$SEP29B/sepwt")"; SIBSEP="$(cn29 "$SEP29B/sib")"
+TF29SEP=$(mktemp -u)
+printf '2026-01-01 00:00:01\tfeat/sepwt\tsurface:44\t%s\tsurface:1\tsep own row\tmain\n' "$WTSEP"  > "$TF29SEP"
+printf '2026-01-01 00:00:02\tfeat/sepsib\tsurface:45\t%s\tsurface:1\tsep sibling row\tmain\n' "$SIBSEP" >> "$TF29SEP"
+BO29SEP="$( ( cd "$WTSEP" && CC_TASKS_FILE="$TF29SEP" CC_STATUS_FILE="$SF29B" bash "$CC/cc-board.sh" ) 2>/dev/null )"
+eq "SEP: own row visible from the separate-git-dir checkout (fixture proof)" "$(echo "$BO29SEP" | grep -c 'sep own row')" "1"
+eq "SEP: --separate-git-dir does NOT fall back (sibling under the shared parent shows)" "$(echo "$BO29SEP" | grep -c 'sep sibling row')" "1"
+rm -rf "$SEP29B"; rm -f "$TF29SEP"
+# out-of-repo worktree: git worktree add <anywhere> (the hook dispatch path allows it). Under
+# the round-4 OR criterion this shape CHANGES resolution by design: the computed root (the
+# MAIN repo) does not CONTAIN the worktree, the containment half fires, and the root falls
+# back to --show-toplevel = the worktree itself (bec2f41-board-identical: its own row shows,
+# the main repo's sibling rows do not). Superproject stays empty here, so this is purely the
+# containment criterion's call — pinned so the trade doesn't drift silently.
+OWTB29=$(mktemp -d); OUTWT29="$(cn29 "$OWTB29")/outwt"
+git -C "$REPO29" worktree add -q "$OUTWT29" -b feat/outwt >/dev/null 2>&1 || true
+TF29O=$(mktemp -u)
+printf '2026-01-01 00:00:01\tfeat/outwt\tsurface:47\t%s\tsurface:1\toutwt own row\tmain\n' "$OUTWT29" > "$TF29O"
+cat "$TF29B" >> "$TF29O"
+BO29O="$( ( cd "$OUTWT29" && CC_TASKS_FILE="$TF29O" CC_STATUS_FILE="$SF29B" bash "$CC/cc-board.sh" ) 2>/dev/null )"
+eq "OUTWT: own row visible from the out-of-repo worktree"        "$(echo "$BO29O" | grep -c 'outwt own row')"   "1"
+eq "OUTWT: main-repo sibling rows hidden (containment fallback)" "$(echo "$BO29O" | grep -c 'task sibling b')" "0"
+git -C "$REPO29" worktree remove --force "$OUTWT29" >/dev/null 2>&1; rm -rf "$OWTB29"; rm -f "$TF29O"
+
+# ── F7: a row with an EMPTY surface field must not collapse (TAB is IFS whitespace: fields
+# shift left, largs land in task, and the recorded uuid is lost → bogus "no recorded session").
+# US (0x1f) is not IFS whitespace, so empty fields survive the awk→read handoff.
+TF297=$(mktemp -u)
+printf '2026-01-01 00:00:01\tfeat/f7-empty-surf\t\t%s\tsurface:1\tf7 task text\tmain\tuuid=77777777-7777-7777-7777-777777777777:provider=anthropic:pm=auto\n' "$WTB" > "$TF297"
+OUT297="$( cd "$WTA" && echo n | env HOME="$HOME" PATH="$S29:$OP29" CC_TASKS_FILE="$TF297" \
+  CC_STATUS_FILE="$SF29B" CC_CMUX_SESSIONS="$S29/store29.json" CC_RESUME_SETTLE=0 \
+  CC_SEND_VERIFY_SEC=0.1 CC_SEND_FAILLOG="$FL29" bash "$CC/cc-dispatch.sh" resume 2>&1 )"
+eq "F7: empty surface field keeps the uuid → --resume replay" "$(printf '%s' "$OUT297" | grep -c -- '--resume 77777777-7777-7777-7777-777777777777')" "1"
+eq "F7: not misread as a pre-recording idle row"              "$(printf '%s' "$OUT297" | grep -c 'no recorded session')" "0"
+rm -f "$TF29R" "$TF297"
+
+# ── F2: the parked-after-send breadcrumb must carry the MATCHED LINE (truncated 120, TAB/NL
+# stripped) — 16 identical alarms in 6 days were undiagnosable without it
+: > "$CC_FAKE_LOG29"; : > "$FL29"; cp "$S29/scr-tui" "$CC_FAKE_SCREEN29"
+M200="$(printf 'M%.0s' $(seq 1 200))"
+printf '\xe2\x9d\xaf%s%s\n' "$NB29" "$M200" > "$S29/scr-parked200"
+CC_FAKE_ON_SEND="$S29/scr-parked200" CC_SEND_FAILLOG="$FL29" CC_SEND_VERIFY_SEC=0.1 \
+  PATH="$S29:$OP29" bash "$CC/cc-dispatch.sh" send surface:1 "f2 msg" >/dev/null 2>&1; rcs=$?
+eq "F2: parked alarm still fails loudly (rc1)"  "$rcs" "1"
+C29="$(grep 'parked after send' "$FL29" 2>/dev/null)"
+eq "F2: crumb carries the matched line"         "$(printf '%s' "$C29" | grep -c 'matched line: "MMMM')" "1"
+eq "F2: matched line truncated at 120 chars"    "$(printf '%s' "$C29" | grep -oE 'M+' | awk '{print length($0)}' | sort -rn | head -1)" "120"
+
+# ── H3: CC_SEND_NOVERIFY=1 skips the post-send verify for callers that knowingly target a
+# SHELL — a ❯-prompt shell echoes the typed launch command, the scan reads the echo as a busy
+# composer, and verify false-alarms + Enter-retries a tab with no composer (2026-08-21 live hit)
+printf '\xe2\x9d\xaf ccteam --permission-mode auto\n' > "$S29/scr-launch-echo"
+: > "$CC_FAKE_LOG29"; : > "$FL29"; cp "$S29/scr-tui" "$CC_FAKE_SCREEN29"
+CC_SEND_NOVERIFY=1 CC_FAKE_ON_SEND="$S29/scr-launch-echo" CC_SEND_FAILLOG="$FL29" CC_SEND_VERIFY_SEC=0.1 \
+  PATH="$S29:$OP29" bash "$CC/cc-dispatch.sh" send surface:1 "launch line" >/dev/null 2>&1; rcs=$?
+eq "H3: NOVERIFY skips the shell-echo false alarm (rc0)" "$rcs" "0"
+eq "H3: NOVERIFY one Enter, no retry"                    "$(grep -c 'KEY|.*Enter' "$CC_FAKE_LOG29")" "1"
+eq "H3: NOVERIFY no crumb"                               "$([ -s "$FL29" ] && echo yes || echo no)" "no"
+: > "$CC_FAKE_LOG29"; : > "$FL29"; cp "$S29/scr-tui" "$CC_FAKE_SCREEN29"
+CC_FAKE_ON_SEND="$S29/scr-launch-echo" CC_SEND_FAILLOG="$FL29" CC_SEND_VERIFY_SEC=0.1 \
+  PATH="$S29:$OP29" bash "$CC/cc-dispatch.sh" send surface:1 "launch line" >/dev/null 2>&1; rcs=$?
+eq "H3: without the opt-in the same echo alarms (the bug)" "$rcs" "1"
+eq "H3: without the opt-in the crumb fires"                "$(grep -c 'parked after send' "$FL29")" "1"
+eq "H3: all three launch sends opt out (source pin)"       "$(grep -c 'CC_SEND_QUIET=1 CC_SEND_NOVERIFY=1' "$CC/cc-dispatch.sh")" "3"
+
+# ── surface runner: fake HOME (copy of THIS checkout), scratch ledgers, pinned ids, pre-trust
+# off, no shared corpus. mk29 sweeps the 120s dedup marker first — two runs on the same dir
+# within 120s would otherwise silently skip the second.
+FH29=$(mktemp -d); mkdir -p "$FH29/.config"; cp -R "$CC" "$FH29/.config/cc-stack"
+TSKV29=$(mktemp -u); TB29=$(mktemp -u); LF29=$(mktemp -u)
+mk29(){ : > "$CC_FAKE_LOG29"; rm -f "$CC_FAKE_LOG29.nscnt"; cp "$1" "$CC_FAKE_SCREEN29"
+        unset CC_FAKE_ON_SEND CC_FAKE_TUI29 CC_FAKE_FLUSH_AT CC_FAKE_PINGDOWN CC_LAUNCH_FILE
+        rm -f "$S29/cc-cmux-tabs/$(printf '%s' "$2" | shasum -a 1 | cut -d' ' -f1)" 2>/dev/null; }
+srf29(){ # $1 dir, $2 prompt (screens are set by mk29); extra knobs come from the environment
+  ( cd "$REPO29" && env HOME="$FH29" PATH="$S29:$OP29" TMPDIR="$S29" CC_TASKS_FILE="$TSKV29" CC_TABS_FILE="$TB29" \
+      CC_CALLER_CWD="$REPO29" CC_WT_PRETRUST=0 CC_WT_SHARE="" CC_SEND_VERIFY_SEC=0.1 \
+      CC_SEND_FAILLOG="$LF29" CC_CALLER_SURFACE_UUID="22222222-AAAA-AAAA-AAAA-222222222222" \
+      CC_WT_SESSION_ID="55555555-5555-5555-5555-555555555555" CC_RESUME_SETTLE=0 \
+      bash "$CC/cc-dispatch.sh" surface "$1" "$2" ) >/dev/null 2>&1; }
+# TMPDIR=$S29: dispatches write their pf temp files and cc-cmux-tabs dedup markers into the
+# section-private dir — the shared /tmp is subject to outside traffic (a concurrent sweep of
+# cc-wt-prompt litter flipped the F3 counts run-to-run), and every reader below matches.
+pf29(){ grep -l 'PROMPT29' "$S29"/cc-wt-prompt.* 2>/dev/null | wc -l | tr -d ' '; }
+# pfsweep29: `rm -f "$(grep -l …)"` is broken with >1 match — the multi-line output forms ONE
+# bogus filename and nothing gets deleted — and the unquoted `for _pf in $(grep -l …)` form is
+# just the same bug one layer out (word-split on IFS: a TMPDIR containing a space means not a
+# single file is removed). read -r line-by-line is the only form that holds for both.
+pfsweep29(){ grep -l 'PROMPT29' "$S29"/cc-wt-prompt.* 2>/dev/null | while IFS= read -r _pf; do rm -f "$_pf"; done; }
+
+# ── F4: provider validation unified with _ccres_parse's charset whitelist — the value is
+# interpolated into a typed terminal command, so `;` must fall back to ccteam, never `cld kim;i`
+printf 'kim;i' > "$S29/prov-bad"; printf 'a/b' > "$S29/prov-slash"; printf 'kimi' > "$S29/prov-ok"
+mk29 "$S29/scr-tui" "$WTA"; CC_LAUNCH_FILE="$S29/prov-bad" srf29 "$WTA" "PROMPT29 f4 bad" "$S29/scr-tui"
+eq "F4: ';'-provider falls back to ccteam"      "$(grep -c 'SEND|.*ccteam --session-id' "$CC_FAKE_LOG29")" "1"
+eq "F4: ';'-provider never typed into the tab"  "$(grep -c 'cld kim;i' "$CC_FAKE_LOG29")" "0"
+mk29 "$S29/scr-tui" "$WTA"; CC_LAUNCH_FILE="$S29/prov-slash" srf29 "$WTA" "PROMPT29 f4 slash" "$S29/scr-tui"
+eq "F4: path-ish provider still blocked"        "$(grep -c 'cld a/b' "$CC_FAKE_LOG29")" "0"
+mk29 "$S29/scr-tui" "$WTA"; CC_LAUNCH_FILE="$S29/prov-ok" srf29 "$WTA" "PROMPT29 f4 ok" "$S29/scr-tui"
+eq "F4: a clean custom provider still routes cld" "$(grep -c 'SEND|.*cld kimi --session-id' "$CC_FAKE_LOG29")" "1"
+# round 2: a LEADING DOT passes the charset but resume's _ccres_parse drops it (.kimi records
+# as `cld .kimi`, replays as ccteam) — the launch whitelist must reject it too, or the
+# recorded args can never be replayed as launched.
+printf '.kimi' > "$S29/prov-dot"
+mk29 "$S29/scr-tui" "$WTA"; CC_LAUNCH_FILE="$S29/prov-dot" srf29 "$WTA" "PROMPT29 f4 dot" "$S29/scr-tui"
+eq "F4: leading-dot provider falls back to ccteam"    "$(grep -c 'SEND|.*ccteam --session-id' "$CC_FAKE_LOG29")" "1"
+eq "F4: never records 'cld .kimi' (resume drops it)"  "$(grep -c 'cld \.kimi' "$CC_FAKE_LOG29")" "0"
+
+# ── F5: the trust scrape matches the REAL dialog phrases over the WHOLE 30-line capture — the
+# three exact wordings PLUS the *"do you trust"* catch-all (gate round 3: wording drift like
+# "…this directory?" must not silently defeat pre-auth again) —
+# (round 2 removed the bottom-15 window: the real dialog is a BOX whose question sits ~15-17
+# lines up and fell outside it — pre-auth missed → 24 idle spins → tab stuck on the dialog).
+# Two negatives, one per safety layer: (a) a VERBATIM quote of the dialog in the transcript
+# ABOVE a healthy TUI — the phrase matches, so only the case-arm ORDER protects (gate
+# follow-up: trust-first fired up to 24 stray Enters into the live session); (b) PROSE that
+# says trust+folder but none of the exact phrases — the phrase layer. Enter count must stay
+# at RDY+launch for both.
+mk29 "$S29/scr-echo-trust" "$WTA"; srf29 "$WTA" "PROMPT29 f5neg" "$S29/scr-echo-trust"
+eq "F5: verbatim quote above a live TUI never answers Enter" "$(grep -c 'KEY|.*Enter' "$CC_FAKE_LOG29")" "2"
+mk29 "$S29/scr-prose-trust" "$WTA"; srf29 "$WTA" "PROMPT29 f5negp" "$S29/scr-prose-trust"
+eq "F5: prose about trust never answers Enter" "$(grep -c 'KEY|.*Enter' "$CC_FAKE_LOG29")" "2"
+# a REAL dialog IS answered: ON_SEND swaps to the dialog after the launch send, FLUSH_AT=3
+# flips to the TUI on the dialog's Enter (RDY=1, launch=2, dialog=3). Two shapes: the one-line
+# fixture (regression) and the BOX (question 16 lines up — red against the round-1 tail-15 code).
+mk29 "$S29/scr-tui" "$WTA"
+CC_FAKE_ON_SEND="$S29/scr-dialog" CC_FAKE_TUI29="$S29/scr-tui" CC_FAKE_FLUSH_AT=3 srf29 "$WTA" "PROMPT29 f5pos" "$S29/scr-tui"
+eq "F5: a one-line dialog is answered (regression)" "$(grep -c 'KEY|.*Enter' "$CC_FAKE_LOG29")" "3"
+mk29 "$S29/scr-tui" "$WTA"
+CC_FAKE_ON_SEND="$S29/scr-dialogbox" CC_FAKE_TUI29="$S29/scr-tui" CC_FAKE_FLUSH_AT=3 srf29 "$WTA" "PROMPT29 f5posbox" "$S29/scr-tui"
+eq "F5: full dialog BOX (question 16 lines up) is answered" "$(grep -c 'KEY|.*Enter' "$CC_FAKE_LOG29")" "3"
+mk29 "$S29/scr-tui" "$WTA"
+CC_FAKE_ON_SEND="$S29/scr-dialog-drift" CC_FAKE_TUI29="$S29/scr-tui" CC_FAKE_FLUSH_AT=3 srf29 "$WTA" "PROMPT29 f5drift" "$S29/scr-tui"
+eq "F5: DRIFTED wording (still 'do you trust') is answered" "$(grep -c 'KEY|.*Enter' "$CC_FAKE_LOG29")" "3"
+
+# ── F3: the prompt temp file is deleted ONLY once the TUI was actually seen. TUI up → gone;
+# neither probe ever confirming (RDY timed out, no TUI markers) → the file SURVIVES so the
+# already-sent `$(cat pf)` cannot read empty (pre-fix: deleted unconditionally → red below).
+# Sweep first: an unconfirmed-TUI dispatch KEEPS its pf (e.g. the F5 box miss vs the round-1
+# code) — without the sweep that leftover inflates F3's counts and masks what F3 itself does.
+pfsweep29
+mk29 "$S29/scr-tui" "$WTA"; srf29 "$WTA" "PROMPT29 f3b tui" "$S29/scr-tui"
+eq "F3: TUI up → prompt file deleted"   "$(pf29)" "0"
+mk29 "$S29/scr-notui" "$WTA"; srf29 "$WTA" "PROMPT29 f3a notui" "$S29/scr-notui"
+eq "F3: TUI never seen → prompt file survives" "$(pf29)" "1"
+eq "F3: kept-pf warning reaches the board log (round 4)" "$(grep -c 'prompt kept in' "$LF29")" "1"
+eq "F3: kept-pf warning names the file (source pin, stderr + crumb)" "$(grep -cF 'prompt kept in $pf' "$CC/cc-dispatch.sh")" "2"
+# gate round 3 (pf sweep): a leftover older than ~a day is removed on the NEXT dispatch — the
+# common cause is a slow-painting TUI (the shell evals $(cat pf) ~6s before the probe gives
+# up), and each leftover is a world-readable copy of the full brief.
+STALE29="$S29/cc-wt-prompt.STALE.txt"; printf 'an old brief body
+' > "$STALE29"; touch -t 202001010000 "$STALE29"
+mk29 "$S29/scr-tui" "$WTA"; srf29 "$WTA" "PROMPT29 f3s" "$S29/scr-tui"
+eq "F3: stale pf (>1d) swept on next dispatch" "$([ -e "$STALE29" ] && echo kept || echo swept)" "swept"
+pfsweep29
+
+# ── F6: cmux PRESENT but unreachable fails the dispatch (rc1, same as new-surface failure —
+# wt-claude exec's in, so this rc IS gwt-claude's rc). No cmux BINARY stays the exit-0
+# remote-SSH no-op (source pin — rc equality with new-surface is the fix, not the no-op).
+mk29 "$S29/scr-tui" "$WTA"; CC_FAKE_PINGDOWN=1 srf29 "$WTA" "PROMPT29 f6" "$S29/scr-tui"; rcs=$?
+eq "F6: cmux unreachable fails the dispatch (rc1)" "$rcs" "1"
+eq "F6: no tab opened on unreachable cmux"          "$(grep -c 'NEWSURF' "$CC_FAKE_LOG29")" "0"
+eq "F6: breadcrumb honors CC_SEND_FAILLOG (unified)" "$(grep -c 'cmux ping unreachable' "$LF29" 2>/dev/null)" "1"
+eq "F6: no-cmux-binary no-op still pinned (source)" "$(grep -c '^command -v cmux >/dev/null 2>&1 || exit 0$' "$CC/cc-dispatch.sh")" "1"
+
+# ── working agreement clause (6): sub-task edits stay inside their own worktree
+grep -q '(6) Keep every edit inside THIS worktree' "$CC/cc-dispatch.sh" && ok "AG(6): worktree-scope clause assembled into prompts" || no "AG(6): worktree-scope clause assembled into prompts" missing present
+
+# ── restore section-external state and sweep every scratch artefact
+PATH="$OP29"
+export CC_TASKS_FILE="$svT" CC_STATUS_FILE="$svS" CC_ARCHIVE_FILE="$svA"
+for _d in "$WTA" "$WTB" "$WTP"; do rm -f "$S29/cc-cmux-tabs/$(printf '%s' "$_d" | shasum -a 1 | cut -d' ' -f1)" 2>/dev/null; done
+pfsweep29
+rm -rf "$S29" "$FH29" "$REPO29" "$OTH29" 2>/dev/null; rm -f "$TF29B" "$SF29B" "$AF29B" "$TSKV29" "$TB29" "$LF29" "$FL29"
+unset CC_FAKE_LOG29 CC_FAKE_SCREEN29 CC_FAKE_ON_SEND CC_FAKE_TUI29 CC_FAKE_FLUSH_AT CC_FAKE_PINGDOWN CC_LAUNCH_FILE
+
+echo ""
 echo "== 18. tab-close policy: the two ledgers + the sanctioned primitive =="
 # The 2026-08-16 PreToolUse text gate (hooks/block-unsafe-close.sh) is RETIRED — a parser that had
 # to decide whether prose quoting a close command IS a close command kept blocking real dispatch
