@@ -617,7 +617,9 @@ echo "✔ branch   : $branch"
 # 4th arg = the explicit base: when --base names a branch it IS the recorded merge target (the
 # skill's documented contract). The default "HEAD" names no branch, so the caller's cwd stays the
 # fallback — see cmd_capture for why cwd alone cannot be trusted after a fast-forward.
-"$HOME/.config/cc-stack/cc-merge.sh" capture "$root" "$branch" "$PWD" "$base" >/dev/null 2>&1
+# capture-dispatch echoes what got recorded (✔/⚠ + source) and warns when the base was unusable
+# (F4); a reused branch keeps its earlier --base target instead of being overwritten (F6).
+"$CC_SELF/cc-merge.sh" capture-dispatch "$root" "$branch" "$PWD" "$base"
 
 # ── Delegate: open tab + copy .env + start ccteam (plan) + pre-trust + send prompt + register ──
 exec "$HOME/.config/cc-stack/cc-dispatch.sh" surface "$wtpath" "$prompt"
@@ -701,8 +703,10 @@ fi
 if [ -n "${CC_CALLER_CWD:-}" ] && command -v git >/dev/null 2>&1; then
   _root="$(_cc_gitroot "$abspath")" || _root=""     # same caveat as above: resolve against $abspath
   _br="$(git -C "$abspath" symbolic-ref --short HEAD 2>/dev/null)"
+  # CC_CAPTURE_CRUMB=1: the hook swallows this stdout, so capture-dispatch leaves a breadcrumb in
+  # cc-failures.log (the board surfaces it) when the target did not come from an explicit base
   [ -n "$_root" ] && [ -n "$_br" ] && \
-    "$HOME/.config/cc-stack/cc-merge.sh" capture "$_root" "$_br" "$CC_CALLER_CWD" "${CC_WT_BASE:-}" >/dev/null 2>&1
+    CC_CAPTURE_CRUMB=1 "$CC_SELF/cc-merge.sh" capture-dispatch "$_root" "$_br" "$CC_CALLER_CWD" "${CC_WT_BASE:-}"
 fi
 
 # Pre-authorize trust for this worktree, skipping claude's "Do you trust this folder?" prompt (more robust than screen-scraping; CC_WT_PRETRUST=0 disables)
@@ -884,14 +888,18 @@ done
 [ -n "$pf" ] && rm -f "$pf" 2>/dev/null
 
 # ── Register into the task list (so gwt-status can show "which worktree is doing what") ──
-# 5th arg = parent branch (the caller's branch at dispatch — CC_CALLER_CWD on the hook path,
-# PWD on the gwt-claude path; empty when detached / not a repo): feeds the board's PARENT
-# column and outlives the branch.<b>.ccMergeInto git config.
-# 6th arg = launch-args (8th TSV field, what gwt-resume replays). SKIPPED in resume mode: the
-# row already exists with its recorded args; `cc-dispatch.sh resume` refreshes its surface ref.
+# F5: 5th arg = the merge target CAPTURE recorded (git config branch.<b>.ccMergeInto) — the same
+# single authority both dispatch paths went through above, not the caller cwd branch (config and
+# TSV used to disagree; once gwt-rm --branch deletes the config, the archive showed the wrong
+# parent forever). Empty (self-target / nothing recorded) → empty column; the board falls back
+# to its trunk heuristic. 6th arg = launch-args (8th TSV field, what gwt-resume replays).
+# SKIPPED in resume mode: the row already exists; `cc-dispatch.sh resume` refreshes its surface ref.
 if [ -z "$rsmode" ]; then
+  _mt=""
+  _mtb="$(git -C "$abspath" symbolic-ref --short HEAD 2>/dev/null)"
+  [ -n "$_mtb" ] && [ -n "${root:-}" ] && _mt="$(git -C "$root" config --get "branch.$_mtb.ccMergeInto" 2>/dev/null)"
   "$HOME/.config/cc-stack/cc-board.sh" log "$abspath" "$ref" "${caller_surface:-}" "$prompt" \
-    "$(git -C "${CC_CALLER_CWD:-$PWD}" symbolic-ref --short HEAD 2>/dev/null)" "${largs:-}"
+    "${_mt:-}" "${largs:-}"
 fi
 
 # ── Register into the opened-tabs ledger (who opened which tab) ──

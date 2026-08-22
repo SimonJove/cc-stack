@@ -34,7 +34,7 @@ case "${1:-}" in
 #     when it names a branch it becomes the recorded merge target, which is the only thing that
 #     still separates the campaign branch from a sibling once a fast-forward makes their tips equal.
 #   - Initial-prompt convention: prefix the command with CC_WT_PROMPT='task description', e.g.:
-#       CC_WT_PROMPT='refactor auth token refresh' git worktree add .claude/worktrees/oauth -b feat/oauth
+#       CC_WT_PROMPT='refactor auth token refresh' git worktree add .claude/worktrees/oauth -b feat/oauth feat/camp
 #   - Sub-tasks start in `auto` mode. To pin ONE dispatch to the plan-first gate, add the prefix
 #     CC_WT_PERMISSION_MODE=plan (parsed out of the command text, like CC_WT_PROMPT).
 #   - cmux availability via `cmux ping` (not CMUX_SOCKET, which is often empty in CC's Bash env).
@@ -49,9 +49,17 @@ shift
 input="$(cat 2>/dev/null || true)"
 [ -n "$input" ] || exit 0
 
-# Cheap prefilter: if the raw JSON has no "worktree" (any case), bail out
+# Cheap prefilter (F8): a real dispatch command is `git worktree add …` (or `git -C <repo>
+# worktree add …`), so the payload always carries the LITERAL substring "worktree add" — one
+# space, lowercase. A sub-task cwd lives under .claude/worktrees/ (matches "worktree", never
+# "worktree add"), and the highest-frequency sub-task commands (git add -A, --amend, address)
+# carry "add" without "worktree": the two-word test started python3 on every one of those.
+# Cost, spelled out: a multi-space spelling (`git worktree  add`) or an odd casing used to
+# parse in python (shlex folds whitespace, the scan lowercases) and is now filtered out here
+# — a real but practically unreachable narrowing, and the canonical one-space form is what
+# the rules doc spells.
 case "$input" in
-  *[Ww]orktree*) : ;;
+  *"worktree add"*) : ;;
   *) exit 0 ;;
 esac
 
@@ -146,19 +154,44 @@ opts_with_val = {"-b", "-B", "--reason"}
 path_arg = None
 base_arg = ""
 j = wi + 2
-while j < len(toks):
+stop = False
+while j < len(toks) and not stop:
     t = toks[j]
-    if t in (";", "&&", "||", "|", "&"):
-        break
-    if t in opts_with_val:
-        j += 2; continue
-    if t.startswith("-"):
-        j += 1; continue
-    if path_arg is None:
-        path_arg = t
-    else:
-        base_arg = t
-        break
+    # (F1) a separator may be glued ANYWHERE in a token — shlex splits none of "camp;",
+    # "camp;echo", "camp&&echo", ">/dev/null;". Cut at the FIRST separator char: the part
+    # before it still belongs to this add command and must pass the SAME filters below
+    # (a glued ">/dev/null;" is a redirection, never a base); everything after it is a new
+    # statement — stop there. An all-separator token ("&&") is a bare break.
+    sep = -1
+    for k in range(len(t)):
+        if t[k] in ";|&":
+            sep = k
+            break
+    head = t if sep < 0 else t[:sep]
+    stop = sep >= 0
+    if head:
+        # (F1) a redirection token is not a positional ("2>/dev/null", "2>&1", ">>log",
+        # "&>out"). In the spaced form ("2> file") the NEXT token is the redirect target
+        # too — but only when this token is a BARE operator, and never past a separator
+        # (a glued target swallows nothing: "2>/dev/null camp" keeps camp as the base).
+        if re.match(r"^([0-9]*[<>]|&>)", head):
+            if not stop and re.match(r"^([0-9]*>|[0-9]*<|&>|>&|>>|<<|>|<)$", head):
+                nxt = toks[j + 1] if j + 1 < len(toks) else ""
+                if nxt and not nxt.startswith("-") and not re.match(r"^([0-9]*[<>]|&>|[;|&])", nxt):
+                    j += 1
+        elif head in opts_with_val:
+            if not stop:
+                j += 1                    # the option value is not a positional either
+        # (F1) merged short opts ending in b/B ("-fb feat/x") take the next token as value
+        elif re.match(r"^-[a-zA-Z]*[bB]$", head):
+            if not stop:
+                j += 1
+        elif head.startswith("-"):
+            pass                          # any other option: not a positional
+        elif path_arg is None:
+            path_arg = head
+        else:
+            base_arg = head
     j += 1
 cand = None
 if path_arg:
@@ -291,6 +324,12 @@ shift
 input="$(cat 2>/dev/null || true)"
 [ -n "$input" ] || exit 0
 
+# F8: with no board file there is nothing this hook could ever write — and it fires on every
+# prompt of every session on the machine, so check BEFORE the python parse (python3 startup is
+# the one measurable cost; everything below stays exactly as it was).
+tasks="${CC_TASKS_FILE:-$HOME/.config/cc-stack/worktree-tasks.tsv}"
+[ -f "$tasks" ] || exit 0
+
 # Parse the three fields we need from the hook payload: event \t cwd \t notification-message
 # (TAB-separated, message last). python reads real stdin via -c (no heredoc here); any parse
 # failure prints nothing → the event match below exits 0.
@@ -321,8 +360,6 @@ esac
 [ -n "$cwd" ] || exit 0
 canon="$(CDPATH= cd -- "$cwd" 2>/dev/null && pwd -P)" || exit 0
 
-tasks="${CC_TASKS_FILE:-$HOME/.config/cc-stack/worktree-tasks.tsv}"
-[ -f "$tasks" ] || exit 0
 awk -F'\t' -v d="$canon" '$4==d{found=1} END{exit found?0:1}' "$tasks" 2>/dev/null || exit 0
 
 f="${CC_STATUS_FILE:-$HOME/.config/cc-stack/worktree-status.tsv}"

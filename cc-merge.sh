@@ -43,7 +43,13 @@ cmd_is_done() {       # <repo> <branch> → exit 0 if done
 cmd_tree() {          # <repo> → TSV: branch \t parent \t ahead \t dirty \t done
   # bash 3.2 safe: no associative array — emit each row inline as we read the
   # porcelain stream (a `branch` line always follows its `worktree` line).
-  local repo="$1" trunk dir="" line b parent ahead dirty done
+  # F7: nodes = branches checked out in a worktree ∪ branches with a ccMergeInto config
+  # (gwt-rm without --branch leaves unmerged branches with no worktree — they must stay visible:
+  # this tree is what the merge gate reads). No-worktree branches report dirty as clean:
+  # without a checkout there can BE no uncommitted changes, and every downstream ready
+  # test (gwt-merge / gwt-collect / gwt-tree) compares dirty=="clean" — a distinct value
+  # here would make such a branch permanently not-ready for a reason that cannot exist.
+  local repo="$1" trunk dir="" line b parent ahead dirty done seen=""
   trunk="$(_cm_main_branch "$repo")"
   while IFS= read -r line; do
     case "$line" in
@@ -51,6 +57,7 @@ cmd_tree() {          # <repo> → TSV: branch \t parent \t ahead \t dirty \t do
       "branch refs/heads/"*)
         b="${line#branch refs/heads/}"
         if [ "$b" = "$trunk" ]; then dir=""; continue; fi
+        seen="$seen $b"
         parent="$(cmd_get_parent "$repo" "$b")"
         ahead="$(git -C "$repo" rev-list --count "$parent..$b" 2>/dev/null || echo 0)"
         if [ -n "$(git -C "$dir" status --porcelain 2>/dev/null)" ]; then dirty=dirty; else dirty=clean; fi
@@ -59,6 +66,24 @@ cmd_tree() {          # <repo> → TSV: branch \t parent \t ahead \t dirty \t do
         dir="" ;;
     esac
   done < <(git -C "$repo" worktree list --porcelain)
+  # F7 second pass: branches known only through their config. get-regexp prints "<key> <value>"
+  # SPACE-separated (a branch name can never contain one).
+  git -C "$repo" config --get-regexp '^branch\..*\.ccMergeInto$' 2>/dev/null | while IFS=' ' read -r cfg_key cfg_val; do
+    # git config lowercases the variable part (branch.<b>.ccMergeInto → …ccmergeinto), so
+    # strip by the LAST dot — the key is always the final component, branch names may hold dots
+    b="${cfg_key#branch.}"; b="${b%.*}"
+    case " $seen " in *" $b "*) continue ;; esac
+    [ "$b" = "$trunk" ] && continue
+    # a config section can outlive its branch (hand-edited config, a prune race): never list
+    # a branch that does not exist — a ghost node would gate its parent ready-check forever
+    # on a line that can never be merged at all
+    git -C "$repo" show-ref --verify --quiet "refs/heads/$b" || continue
+    parent="$(cmd_get_parent "$repo" "$b")"
+    ahead="$(git -C "$repo" rev-list --count "$parent..$b" 2>/dev/null || echo 0)"
+    if cmd_is_done "$repo" "$b"; then done=done; else done=-; fi
+    # dirty=clean: no worktree = no working tree = no possible uncommitted changes
+    printf '%s\t%s\t%s\t%s\t%s\n' "$b" "$parent" "$ahead" "clean" "$done"
+  done
 }
 
 cmd_preflight() {     # <repo> <child> [<target>] → prints checks; exit 1 if any not ok
@@ -234,18 +259,84 @@ cmd_capture() {       # <repo> <newBranch> <callerCwd> [<base>]
   # sibling while the campaign branch stayed put). The graph cannot distinguish them either
   # (merge-base is the same commit for both), so intent is the only usable evidence — record it.
   # A base that does not name a branch (HEAD, a tag, a sha) is not intent: fall back to the cwd.
-  local repo="$1" branch="$2" cwd="$3" base="${4:-}" parent=""
-  if [ -n "$base" ] && git -C "$repo" show-ref --verify --quiet "refs/heads/$base"; then
-    parent="$base"
+  # NEW CONTRACT: prints "target=<branch>\tsource=<explicit|cwd|trunk|kept>" to stdout, so the
+  # dispatch paths can echo what was recorded (F4). kept = the branch already carries a target
+  # and THIS call brings no explicit branch base — a reused branch: wt-claude re-runs capture with
+  # its default base=HEAD, which is not intent, and must not overwrite an earlier --base (F6).
+  # An explicit branch base still overwrites: that IS intent.
+  local repo="$1" branch="$2" cwd="$3" base="${4:-}" parent="" source=""
+  local existing
+  existing="$(git -C "$repo" config --get "branch.$branch.ccMergeInto" 2>/dev/null)"
+  # H2: origin/<b> — the remote-tracking name itself is not a merge target; when a same-named
+  # LOCAL branch exists record that, else the base is unusable: warn, then the chain falls back.
+  case "$base" in
+    origin/*)
+      local lb="${base#origin/}"
+      if git -C "$repo" show-ref --verify --quiet "refs/heads/$lb" 2>/dev/null; then
+        base="$lb"
+      else
+        echo "warn: base origin/$lb has no local branch refs/heads/$lb; not treated as the merge target" >&2
+        base=""
+      fi ;;
+  esac
+  if [ -n "$base" ] && git -C "$repo" show-ref --verify --quiet "refs/heads/$base" 2>/dev/null; then
+    parent="$base"; source="explicit"
   else
+    # Whatever the base is by now (cleared above, HEAD, a sha, a tag, an unexpanded $VAR), it is
+    # not intent — when the caller actually passed one, say so (F2/F4: the fallback must be
+    # visible). HEAD stays quiet: it is wt-claude's documented default, not a mistake.
+    if [ -n "$base" ] && [ "$base" != HEAD ]; then
+      echo "warn: base $base is not a local branch; not treated as the merge target" >&2
+    fi
+    # kept must never hand back a SELF-target: a section that already says "merge into
+    # myself" is dirty data (hand-edited, or left behind by an older bug), not intent —
+    # skip kept and let the chain overwrite it; the self-guard below has the last word.
+    if [ -n "$existing" ] && [ "$existing" != "$branch" ]; then
+      printf 'target=%s\tsource=kept\n' "$existing"
+      return 0
+    fi
     parent="$(git -C "$cwd" symbolic-ref --short HEAD 2>/dev/null)"
+    if [ -n "$parent" ]; then
+      source="cwd"
+    else
+      parent="$(_cm_main_branch "$repo")"
+      source="trunk"
+    fi
   fi
-  [ -n "$parent" ] || parent="$(_cm_main_branch "$repo")"
   # Never record a branch as its own merge target: that is the shape a mis-resolved caller cwd
   # leaves behind (the branch's own worktree), and it merges into itself as a silent no-op. With
   # nothing recorded, get-parent answers the trunk — wrong perhaps, but never a fake success.
   [ "$parent" = "$branch" ] && return 0
   cmd_set_parent "$repo" "$branch" "$parent"
+  printf 'target=%s\tsource=%s\n' "$parent" "$source"
+}
+
+cmd_capture_dispatch() {   # <repo> <branch> <callerCwd> [<base>] — capture + the dispatcher echo
+  # The one place the two dispatch paths (wt-claude, surface/hook) learn what capture recorded:
+  # echoes "✔/⚠ merge target: X (…)" so the dispatcher sees it, passes capture warnings through,
+  # and leaves a cc-failures.log breadcrumb when CC_CAPTURE_CRUMB=1 and the target did not come
+  # from an explicit base (the hook path: Claude Code swallows hook stdout, so the board log is
+  # the only channel — the rules require a base on every dispatch, a missing one must be seen).
+  local repo="$1" branch="$2" cwd="$3" base="${4:-}"
+  local capout="" wtmp warn="" tgt="" src=""
+  wtmp="$(mktemp 2>/dev/null || echo /dev/null)"
+  capout="$(cmd_capture "$repo" "$branch" "$cwd" "$base" 2>"$wtmp")"
+  warn="$(cat "$wtmp" 2>/dev/null || true)"
+  [ "$wtmp" != /dev/null ] && rm -f "$wtmp" 2>/dev/null
+  [ -n "$warn" ] && printf '%s\n' "$warn" >&2
+  if [ -n "$capout" ]; then
+    tgt="${capout#target=}"; tgt="${tgt%%$'\t'*}"
+    src="${capout##*source=}"
+    if [ "$src" = explicit ]; then
+      echo "✔ merge target: $tgt (explicit --base)"
+    else
+      echo "⚠ merge target: $tgt (from $src — no explicit base; cc-merge.sh set-parent to change)"
+    fi
+  fi
+  if { [ "${CC_CAPTURE_CRUMB:-0}" = 1 ] && [ "$src" != explicit ]; } || [ -n "$warn" ]; then
+    { echo "[$(date '+%F %T')] $repo — merge target for $branch recorded as: ${tgt:-none} (source: ${src:-none}); base arg: ${base:-none}" \
+        >> "${CC_SEND_FAILLOG:-$HOME/.config/cc-stack/cc-failures.log}"; } 2>/dev/null || true
+  fi
 }
 
 cmd_trunk() {         # <repo> → trunk branch name
@@ -261,6 +352,7 @@ case "${1:-}" in
   preflight)  shift; cmd_preflight "$@" ;;
   do-merge)   shift; cmd_do_merge "$@" ;;
   capture)    shift; cmd_capture "$@" ;;
+  capture-dispatch) shift; cmd_capture_dispatch "$@" ;;
   trunk)      shift; cmd_trunk "$@" ;;
-  *) echo "usage: cc-merge.sh {set-parent|get-parent|done|is-done|tree|preflight|do-merge|capture|trunk} ..." >&2; exit 2 ;;
+  *) echo "usage: cc-merge.sh {set-parent|get-parent|done|is-done|tree|preflight|do-merge|capture|capture-dispatch|trunk} ..." >&2; exit 2 ;;
 esac

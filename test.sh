@@ -90,9 +90,11 @@ _cc_trust_keys       > "$CC_TEST_SANDBOX/trust-keys.before"
 
 echo "== 1. hook parser =="
 # extract the worktree python (the ONLY <<'PY' heredoc in cc-hooks.sh)
-awk "/<<'PY'/{f=1;next} /^PY\$/{f=0} f" "$CC/cc-hooks.sh" > /tmp/cctest-ep.py
-run(){ CC_HOOK_INPUT="$1" python3 /tmp/cctest-ep.py 2>/dev/null; }
-rer(){ CC_HOOK_INPUT="$1" python3 /tmp/cctest-ep.py 2>&1 >/dev/null; }   # the no-dispatch REASON (stderr only)
+# unique per run: a fixed path here let two suites running in parallel overwrite each other
+EP1="$(mktemp /tmp/cctest-ep.XXXXXX)"
+awk "/<<'PY'/{f=1;next} /^PY\$/{f=0} f" "$CC/cc-hooks.sh" > "$EP1"
+run(){ CC_HOOK_INPUT="$1" python3 "$EP1" 2>/dev/null; }
+rer(){ CC_HOOK_INPUT="$1" python3 "$EP1" 2>&1 >/dev/null; }   # the no-dispatch REASON (stderr only)
 pay(){ python3 -c "import json,sys;print(json.dumps({'tool_name':'Bash','cwd':sys.argv[1],'tool_input':{'command':sys.argv[2]}}))" "$1" "$2"; }
 R1=$(mktemp -d); ( cd "$R1"; git init -q; git config user.email t@t; git config user.name t; git commit -q --allow-empty -m i
   git worktree add -q wtC -b feat/C >/dev/null; git worktree add -q wtD -b feat/D >/dev/null )
@@ -137,7 +139,7 @@ eq "reason carries the add target"  "$(rer "$UN1" | cut -f3)" '$root/wtNope'
 # PostToolUse fires whether the command succeeded or not
 mkdir -p "$R1/plain"
 eq "non-worktree target: no dispatch" "$(run "$(pay "$R1" "${P}git worktree add plain -b feat/P")")" ""
-rm -rf "$R1" "$R2" /tmp/cctest-ep.py
+rm -rf "$R1" "$R2" "$EP1"
 
 echo "== 2. cc-board.sh log (task registration) =="
 export CC_TASKS_FILE=$(mktemp -u)
@@ -602,6 +604,192 @@ h27 "$(pay "$R27" "CC_WT_PROMPT='do 27' "'git -C $root worktree add $root/wtNope
 eq "CC_SEND_FAILLOG takes the crumb" "$(wc -l < "$H27/alt.log" | tr -d ' ')" "1"
 eq "default crumb path untouched"    "$([ -e "$FL27" ] && echo some || echo none)" "none"
 rm -rf "$H27" "$B27" "$R27"
+
+echo "== 28. merge target chain: capture contract + dispatch echo (F1-F9) =="
+# The 2026-08-21 audit line: "which branch does this line merge into" had three independent
+# answers (hook parse, cc-merge capture, board registration) that could disagree silently.
+# capture is now the single arbiter AND reports what it recorded.
+
+# ── F1: the hook tokenizer under the spellings the rules doc encourages (§1 pins happy paths) ──
+EP28="$(mktemp /tmp/cctest-28.XXXXXX)"   # same parallel-run collision hazard as §1's helper
+awk "/<<'PY'/{f=1;next} /^PY\$/{f=0} f" "$CC/cc-hooks.sh" > "$EP28"
+run28(){ CC_HOOK_INPUT="$1" python3 "$EP28" 2>/dev/null; }
+R28=$(mktemp -d); ( cd "$R28"; git init -q; git config user.email t@t; git config user.name t
+  git commit -q --allow-empty -m i; git branch -M main; git branch camp
+  git worktree add -q wtC -b feat/C camp >/dev/null )
+C28="$(cd "$R28/wtC" && pwd -P)"
+P28="CC_WT_PROMPT='doX' "
+eq "F1 base survives glued ;"       "$(run28 "$(pay "$R28" "${P28}git worktree add wtC -b feat/C camp; bash cc-board.sh")" | cut -f3)" "camp"
+eq "F1 base survives glued &&"      "$(run28 "$(pay "$R28" "${P28}git worktree add wtC -b feat/C camp&& echo ok")" | cut -f3)" "camp"
+eq "F1 base after glued redirect"   "$(run28 "$(pay "$R28" "${P28}git worktree add wtC -b feat/C 2>/dev/null camp")" | cut -f3)" "camp"
+eq "F1 base after spaced redirect"  "$(run28 "$(pay "$R28" "${P28}git worktree add wtC -b feat/C 2> /dev/null camp")" | cut -f3)" "camp"
+eq "F1 base before trailing redir"  "$(run28 "$(pay "$R28" "${P28}git worktree add wtC -b feat/C camp 2>&1")" | cut -f3)" "camp"
+eq "F1 merged -fb keeps the path"   "$(run28 "$(pay "$R28" "${P28}git worktree add -fb feat/C wtC camp")" | cut -f1)" "$C28"
+eq "F1 merged -fb keeps the base"   "$(run28 "$(pay "$R28" "${P28}git worktree add -fb feat/C wtC camp")" | cut -f3)" "camp"
+eq "F1 redir then glued ;: no base"     "$(run28 "$(pay "$R28" "${P28}git worktree add wtC -b feat/C >/dev/null;")" | cut -f3)" ""
+eq "F1 opt then glued ;: no base"        "$(run28 "$(pay "$R28" "${P28}git worktree add wtC -b feat/C --detach;")" | cut -f3)" ""
+eq "F1 base glued-; command keeps base"  "$(run28 "$(pay "$R28" "${P28}git worktree add wtC -b feat/C camp;echo ok")" | cut -f3)" "camp"
+eq "F1 base glued-&& command keeps base" "$(run28 "$(pay "$R28" "${P28}git worktree add wtC -b feat/C camp&&echo ok")" | cut -f3)" "camp"
+rm -f "$EP28"
+
+# ── capture NEW CONTRACT: one line "target=<branch>\tsource=<explicit|cwd|trunk|kept>" (F4) ──
+# explicit = the base names a local branch; cwd/trunk = fallback chain; kept = the branch
+# already carries a target and this call brings no explicit branch base (F6: reused branch).
+git -C "$R28" branch f/e1
+eq "contract: explicit base"        "$("$CC/cc-merge.sh" capture "$R28" f/e1 "$R28" camp 2>/dev/null)" "$(printf 'target=camp\tsource=explicit')"
+git -C "$R28" branch f/e2
+eq "F2 origin/x WITH local x"       "$("$CC/cc-merge.sh" capture "$R28" f/e2 "$R28" origin/camp 2>/dev/null)" "$(printf 'target=camp\tsource=explicit')"
+git -C "$R28" branch f/e3
+eq "F2 origin fallback: cwd source" "$("$CC/cc-merge.sh" capture "$R28" f/e3 "$R28" origin/nope 2>/dev/null)" "$(printf 'target=main\tsource=cwd')"
+eq "F2 origin/x w/o local: warns"   "$("$CC/cc-merge.sh" capture "$R28" f/e3 "$R28" origin/nope 2>&1 >/dev/null | grep -c 'no local branch')" "1"
+git -C "$R28" branch f/e4
+eq "F2 non-branch base: cwd source" "$("$CC/cc-merge.sh" capture "$R28" f/e4 "$R28" '$VAR' 2>/dev/null)" "$(printf 'target=main\tsource=cwd')"
+eq "F2 non-branch base: warns"      "$("$CC/cc-merge.sh" capture "$R28" f/e4 "$R28" '$VAR' 2>&1 >/dev/null | grep -c 'not a local branch')" "1"
+git -C "$R28" branch f/e5
+eq "contract: cwd fallback"         "$("$CC/cc-merge.sh" capture "$R28" f/e5 "$R28" "")" "$(printf 'target=main\tsource=cwd')"
+eq "HEAD (wt-claude default) stays quiet" "$("$CC/cc-merge.sh" capture "$R28" f/e5 "$R28" HEAD 2>&1 >/dev/null | wc -l | tr -d ' ')" "0"
+git -C "$R28" worktree add -q wtD28 --detach camp >/dev/null
+git -C "$R28" branch f/e7
+eq "F3 detached caller: trunk source" "$("$CC/cc-merge.sh" capture "$R28" f/e7 "$R28/wtD28" "")" "$(printf 'target=main\tsource=trunk')"
+git -C "$R28" branch f/e8
+eq "self-target still prints nothing"  "$("$CC/cc-merge.sh" capture "$R28" f/e8 "$R28" f/e8)" ""
+eq "self-target writes no config"      "$(git -C "$R28" config branch.f/e8.ccMergeInto 2>/dev/null)" ""
+
+# ── F6: a reused branch must not lose the target an earlier --base recorded ──
+git -C "$R28" branch f/e6
+"$CC/cc-merge.sh" set-parent "$R28" f/e6 feat/keep
+eq "F6 HEAD capture keeps the target" "$("$CC/cc-merge.sh" capture "$R28" f/e6 "$R28" HEAD)" "$(printf 'target=feat/keep\tsource=kept')"
+eq "F6 config survives untouched"     "$(git -C "$R28" config branch.f/e6.ccMergeInto)" "feat/keep"
+eq "F6 explicit base still overwrites" "$("$CC/cc-merge.sh" capture "$R28" f/e6 "$R28" camp 2>/dev/null)" "$(printf 'target=camp\tsource=explicit')"
+eq "F6 config now the explicit one"   "$(git -C "$R28" config branch.f/e6.ccMergeInto)" "camp"
+git -C "$R28" branch f/e9
+git -C "$R28" config branch.f/e9.ccMergeInto f/e9   # self-target: dirty data, not intent
+eq "F6 self-kept skips kept path" "$("$CC/cc-merge.sh" capture "$R28" f/e9 "$C28" "" 2>/dev/null)" "$(printf 'target=feat/C\tsource=cwd')"
+
+# ── capture-dispatch: the echo both dispatch paths show (F4) ──
+git -C "$R28" branch f/d1
+CR28=$(mktemp -u)
+eq "echo: explicit base"            "$("$CC/cc-merge.sh" capture-dispatch "$R28" f/d1 "$R28" camp)" "✔ merge target: camp (explicit --base)"
+eq "explicit: no crumb even asked"  "$(CC_CAPTURE_CRUMB=1 CC_SEND_FAILLOG="$CR28" "$CC/cc-merge.sh" capture-dispatch "$R28" f/d1 "$R28" camp >/dev/null 2>&1; [ -e "$CR28" ] && echo some || echo none)" "none"
+git -C "$R28" branch f/d2
+eq "echo: fallback warns"           "$(CC_SEND_FAILLOG="$CR28" "$CC/cc-merge.sh" capture-dispatch "$R28" f/d2 "$R28" "" 2>/dev/null)" "⚠ merge target: main (from cwd — no explicit base; cc-merge.sh set-parent to change)"
+eq "no crumb unless CC_CAPTURE_CRUMB=1" "$([ -e "$CR28" ] && echo some || echo none)" "none"
+CC_CAPTURE_CRUMB=1 CC_SEND_FAILLOG="$CR28" "$CC/cc-merge.sh" capture-dispatch "$R28" f/d2 "$R28" "" >/dev/null 2>&1
+eq "crumb written when asked"       "$(grep -c 'merge target for f/d2 recorded as: main' "$CR28")" "1"
+git -C "$R28" branch f/d3
+eq "warnings pass through"          "$(CC_SEND_FAILLOG="$CR28" "$CC/cc-merge.sh" capture-dispatch "$R28" f/d3 "$R28" origin/nope 2>&1 >/dev/null | grep -c 'no local branch')" "1"
+
+# ── F5 end-to-end: the board row PARENT is what capture recorded, not the caller branch ──
+# §17D pattern: fake HOME holding a copy of THIS checkout, fake cmux, scratch TSVs. The hook
+# path also leaves the no-base breadcrumb (its stdout is swallowed by Claude Code).
+F5H=$(mktemp -d); F5B=$(mktemp -d); F5L=$(mktemp -u)
+mkdir -p "$F5H/.config"; cp -R "$CC" "$F5H/.config/cc-stack"
+cat > "$F5B/cmux" <<'F5C'
+#!/usr/bin/env bash
+case "$1" in
+  ping) exit 0 ;;
+  identify) echo '{ "caller": {} }' ;;
+  list-pane-surfaces) cat "${CC_FAKE_LIVE:-/dev/null}" 2>/dev/null ;;
+  new-surface)
+    n=$(cat "${CC_FAKE_LOG}.nscnt" 2>/dev/null || echo 200); n=$((n+1)); echo "$n" > "${CC_FAKE_LOG}.nscnt"
+    printf 'NEWSURF|surface:%s|%s\n' "$n" "$*" >> "$CC_FAKE_LOG"; echo "opened surface:$n" ;;
+  send) shift; printf 'SEND|%s\n' "$*" >> "$CC_FAKE_LOG" ;;
+  send-key) shift; printf 'KEY|%s\n' "$*" >> "$CC_FAKE_LOG" ;;
+  notify) shift; printf 'NOTIFY|%s\n' "$*" >> "$CC_FAKE_LOG" ;;
+  read-screen) cat "$CC_FAKE_SCREEN" 2>/dev/null ;;
+esac
+exit 0
+F5C
+chmod +x "$F5B/cmux"
+export CC_FAKE_LOG="$F5B/log"; export CC_FAKE_SCREEN="$F5B/screen"
+NB28="$(printf '\xc2\xa0')"
+{ echo "RDY22"; printf '\xe2\x9d\xaf%s\n' "$NB28"; echo "? for shortcuts"; } > "$CC_FAKE_SCREEN"
+cn28(){ CDPATH= cd -- "$1" >/dev/null 2>&1 && pwd -P; }
+mkd28(){ _d=$(mktemp -d); _d="$(cn28 "$_d")"; ( cd "$_d"; git init -q; git config user.email t@t
+  git config user.name t; git commit -q --allow-empty -m i; git branch -M main
+  git branch camp; git checkout -q -b feat/x28 ); echo "$_d"; }
+D5A="$(mkd28)"
+env HOME="$F5H" PATH="$F5B:$PATH" CC_TASKS_FILE="$F5L" CC_SEND_FAILLOG="$F5B/fail" \
+  CC_SEND_VERIFY_SEC=0.1 CC_WT_SHARE="" CC_WT_PRETRUST=0 CC_CALLER_CWD="$R28" CC_WT_BASE=camp \
+  bash "$CC/cc-dispatch.sh" surface "$D5A" "F5 brief" >/dev/null 2>&1
+eq "F5 board parent = capture target" "$(awk -F'\t' -v d="$D5A" '$4==d{print $7}' "$F5L")" "camp"
+eq "F5 capture really recorded it"   "$(git -C "$D5A" config branch.feat/x28.ccMergeInto)" "camp"
+eq "F5 explicit base: no capture crumb" "$([ -f "$F5B/fail" ] && { grep -c 'merge target' "$F5B/fail" || true; } || echo 0)" "0"
+# …and the wt-claude path ECHOES the target to the human dispatching it (F4)
+WTOUT28="$( cd "$D5A" && env HOME="$F5H" PATH="$F5B:$PATH" CC_TASKS_FILE="$F5L" \
+  CC_SEND_FAILLOG="$F5B/fail" CC_SEND_VERIFY_SEC=0.1 CC_WT_SHARE="" CC_WT_PRETRUST=0 \
+  bash "$CC/cc-dispatch.sh" wt-claude t28 "wt-claude brief" --base camp 2>&1 )"
+eq "F4 wt-claude echoes the target"  "$(echo "$WTOUT28" | grep -c 'merge target: camp (explicit --base)')" "1"
+# same drive WITHOUT a base: target falls back to the caller branch + a breadcrumb is left
+D5B="$(mkd28)"
+: > "$F5B/fail"
+env HOME="$F5H" PATH="$F5B:$PATH" CC_TASKS_FILE="$F5L" CC_SEND_FAILLOG="$F5B/fail" \
+  CC_SEND_VERIFY_SEC=0.1 CC_WT_SHARE="" CC_WT_PRETRUST=0 CC_CALLER_CWD="$R28" \
+  bash "$CC/cc-dispatch.sh" surface "$D5B" "F5 brief 2" >/dev/null 2>&1
+eq "F5 no-base parent = caller branch" "$(awk -F'\t' -v d="$D5B" '$4==d{print $7}' "$F5L")" "main"
+eq "F5 no-base leaves a crumb"     "$(grep -c 'merge target for feat/x28 recorded as: main (source: cwd)' "$F5B/fail")" "1"
+rm -rf "$F5H" "$F5B" "$D5A" "$D5B"; rm -f "$F5L" "$CR28"
+rm -f "${TMPDIR:-/tmp}/cc-cmux-tabs/$(printf '%s' "$D5A" | shasum -a 1 | cut -d' ' -f1)" \
+      "${TMPDIR:-/tmp}/cc-cmux-tabs/$(printf '%s' "$D5B" | shasum -a 1 | cut -d' ' -f1)" 2>/dev/null
+unset CC_FAKE_LOG CC_FAKE_SCREEN
+
+# ── F7: gwt-rm without --branch leaves exactly this shape — the branch must stay visible ──
+"$CC/cc-merge.sh" set-parent "$R28" feat/C camp
+eq "F7 live branch listed exactly once" "$("$CC/cc-merge.sh" tree "$R28" | awk -F'\t' '$1=="feat/C"{c++} END{print c+0}')" "1"
+"$CC/cc-merge.sh" done "$R28" feat/C true
+git -C "$R28" worktree remove wtC >/dev/null 2>&1
+eq "F7 worktree-less branch still listed" "$("$CC/cc-merge.sh" tree "$R28" | awk -F'\t' '$1=="feat/C"{print $2"\t"$4"\t"$5}')" "$(printf 'camp\tclean\tdone')"
+# the mirror image: a config section whose branch is GONE is a ghost node, not a line — a
+# hand-edited section must not gain a tree row that gates its parent ready-check forever
+git -C "$R28" config branch.feat/ghost28.ccMergeInto camp
+eq "F7 ghost config row not listed" "$("$CC/cc-merge.sh" tree "$R28" | awk -F'\t' '$1=="feat/ghost28"' | wc -l | tr -d ' ')" "0"
+
+# ── F8: python3 is the per-tool-call cost — pay it only when the payload can matter ──
+F8H=$(mktemp -d); F8B=$(mktemp -d); PY28="$(command -v python3)"
+mkdir -p "$F8H/.config/cc-stack"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$F8H/.config/cc-stack/cc-dispatch.sh"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$F8B/cmux"
+cat > "$F8B/python3" <<F8P
+#!/usr/bin/env bash
+echo x >> "\${CC_PY_LOG:-/dev/null}"
+exec "$PY28" "\$@"
+F8P
+chmod +x "$F8H/.config/cc-stack/cc-dispatch.sh" "$F8B/cmux" "$F8B/python3"
+git -C "$R28" worktree add -q wtF8 -b feat/F8 camp >/dev/null   # fresh target for the add payload
+CNT28="$F8B/pycount"
+h28(){ : > "$CNT28"; printf '%s' "$1" | env HOME="$F8H" PATH="$F8B:$PATH" CC_PY_LOG="$CNT28" \
+      CC_STUB_LOG="$F8H/argv" bash "$CC/cc-hooks.sh" "$2" >/dev/null 2>&1; wc -l < "$CNT28" | tr -d ' '; }
+# a sub-task cwd sits under .claude/worktrees/ — the old prefilter started python3 on EVERY
+# plain Bash call of every sub-task (the "worktree" substring came from the cwd alone)
+eq "F8 sub-task cwd + ls: no python"   "$(h28 "$(pay "$R28/.claude/worktrees/x" "ls")" worktree)" "0"
+# (7) the killer case: sub-task cwd (worktree substring) + the MOST frequent sub-task command
+# — "git add -A". The two-word prefilter started python on every one of these.
+eq "F8 cwd + git add -A: no python"    "$(h28 "$(pay "$R28/.claude/worktrees/x" "git add -A")" worktree)" "0"
+# a real dispatch still parses: once for the heredoc, once for the caller-cwd extraction
+eq "F8 real add still parses"          "$(h28 "$(pay "$R28" "${P28}git worktree add wtF8 -b feat/F8 camp")" worktree)" "2"
+# the -C form carries the same literal, so the tightened prefilter must not drop it
+eq "F8 -C form add still parses"       "$(h28 "$(pay "$R28" "${P28}git -C $R28 worktree add wtF8 -b feat/F8 camp")" worktree)" "2"
+# status: registered on every prompt of every session — with no board file there is nothing to
+# write, so python must never start (the old order parsed the payload first)
+RR28="$(CDPATH= cd -- "$R28" && pwd -P)"   # the hook canonicalizes cwd before matching the board
+# NOTE: the payload is built in a variable FIRST — an inline JSON literal inside the nested
+# quotes of $(h28 "…" status) gets brace-expanded apart on bash 3.2, and $2 stops being "status"
+S28J="{\"hook_event_name\":\"UserPromptSubmit\",\"cwd\":\"$RR28\",\"message\":\"\"}"
+S28F=$(mktemp -u); S28=$(mktemp -u)
+eq "F8 status w/o board: no python"    "$(h28 "$S28J" status)" "0"
+printf '2026-01-01 00:00:00\tfeat/C\tsurface:1\t%s\tsurface:9\tt\tmain\n' "$RR28" > "$S28F"
+: > "$CNT28"; printf '%s' "$S28J" \
+  | env HOME="$F8H" PATH="$F8B:$PATH" CC_PY_LOG="$CNT28" CC_TASKS_FILE="$S28F" CC_STATUS_FILE="$S28" \
+    bash "$CC/cc-hooks.sh" status >/dev/null 2>&1
+eq "F8 status with board: one python"  "$(wc -l < "$CNT28" | tr -d ' ')" "1"
+eq "F8 status sidecar still written"   "$(awk -F'\t' -v d="$RR28" '$1==d{print $2}' "$S28")" "working"
+rm -rf "$F8H" "$F8B"; rm -f "$S28" "$S28F" "$CNT28"
+
+# ── F9: the header example must show the trailing base, 4 lines above "base is the target" ──
+eq "F9 header example names the base"  "$(grep -c 'git worktree add .claude/worktrees/oauth -b feat/oauth feat/camp' "$CC/cc-hooks.sh")" "1"
+
+rm -rf "$R28"
+
 
 echo "== 5. cc-merge done/is-done =="
 "$CC/cc-merge.sh" done "$MR" feat/A1
@@ -1226,8 +1414,12 @@ azsh(){ PATH="$AFK:$PATH" zsh -c "$1"; }
 azsh "source '$CC/worktree.zsh' >/dev/null 2>&1; cd '$AR'; gwt-adopt feature/orphan-x --no-worktree" >/dev/null 2>&1
 eq "adopt --no-worktree parent=trunk" "$(git -C "$AR" config branch.feature/orphan-x.ccMergeInto)" "main"
 eq "adopt --no-worktree makes no wt"  "$(git -C "$AR" worktree list | wc -l | tr -d ' ')" "1"
-# gwt-tree enumerates WORKTREES, so a register-only branch is intentionally not in it yet
-eq "no-worktree branch not in tree"   "$("$CC/cc-merge.sh" tree "$AR" | awk -F'\t' '$1=="feature/orphan-x"{print $2}')" ""
+# F7 (§28): a register-only branch IS in the tree now — gwt-rm without --branch leaves exactly
+# this shape, and an invisible unmergeable branch is worse than a config-only row. dirty=clean:
+# no worktree means no possible uncommitted changes, and ready tests compare =="clean". gwt-tree RENDERING
+# is the wtz line's call; this pins the TSV contract.
+eq "no-worktree branch in the tree"   "$("$CC/cc-merge.sh" tree "$AR" | awk -F'\t' '$1=="feature/orphan-x"{print $2}')" "main"
+eq "no-worktree branch dirty=clean"   "$("$CC/cc-merge.sh" tree "$AR" | awk -F'\t' '$1=="feature/orphan-x"{print $4}')" "clean"
 # full adopt with --into a non-trunk parent: sets parent + creates a sanitized worktree
 azsh "source '$CC/worktree.zsh' >/dev/null 2>&1; cd '$AR'; gwt-adopt feature/orphan-y --into feature/orphan-x" >/dev/null 2>&1
 eq "adopt --into sets the parent"     "$(git -C "$AR" config branch.feature/orphan-y.ccMergeInto)" "feature/orphan-x"
