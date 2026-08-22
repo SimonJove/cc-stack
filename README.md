@@ -239,7 +239,12 @@ gwt-resume [--all]             # after a cmux crash/restart: native restore firs
                                #   replaying the RECORDED session uuid + provider + permission-mode (+ model) in the recorded
                                #   dir verbatim; lists first + asks y/N (--all = every repo, no confirm); rows without a
                                #   recorded session degrade to an idle ccteam tab (visible)
-gwt-rm <name> [--branch]       # remove worktree (+ clear task record + clear pre-trust; optionally the branch)
+gwt-rm <name> [--branch] [--close] [--force]
+                               # remove worktree (+ clear task record + clear pre-trust; --close also closes its tab)
+                               # --branch deletes the branch ONLY when it merged into its recorded target
+                               #   (ancestry, or the Child-Tip trailer a squash leaves); otherwise it is kept
+                               # a dirty or locked worktree is REFUSED and nothing is cleaned; --force is the
+                               #   single destructive switch and covers the working tree and the branch alike
 gwt-prune                      # compact the task list (drop dead records + keep newest per dir)
 gwt-clean                      # git worktree prune + show current state
 gwt-provider <name>            # set AI provider for NEW sub-tasks: kimi|glm|anthropic (team mode either way; existing unchanged); no arg lists current + available
