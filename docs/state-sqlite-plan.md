@@ -191,13 +191,22 @@ worktree.zsh:373    while IFS=$'\t' read -r br rf; do _gt_ref[$br]="$rf"; done \
 照抄 `cc-board.sh:199` 已经确立的形态：
 
 ```zsh
-< <("$(_gwt_state)" task-list --all | awk -F'\t' '$2 != "" {print $2 "\t" $3}')
+< <("$(_gwt_state)" dump tasks | awk -F'\t' '$2 != "" {print $2 "\t" $3}')
 ```
 
-> **注意 `--all`**：今天这里读的是**整个文件**（无仓库过滤），`gwt-tree` 靠它认识
-> 其它仓库的分支 ref。换成不带 `--all` 的 `task-list` 会**缩小**结果集——这是行为变更，
-> 不是重构。请自己验证 `task-list --all` 的输出字段序与文件行一致（第 2 字段 branch、
-> 第 3 字段 surface ref），并写一条断言钉住。
+> **落地更正（2026-08-23，`feat/c1-callers` 实测）**：本文最初写的是 `task-list --all`，
+> **那是错的**，而且我自己引用的 `cc-board.sh:199` 写的就是 `dump`——指令和引用打架。
+> `cmd_task_list` 的非归档路径是 `for line in reversed(read_lines("tasks"))` +
+> `os.path.isdir` 跳过 + `seen` 去重，即它 (a) 跳过 dir 已消失的行、(b) newest-per-dir 去重、
+> (c) **倒序**输出。而 `gwt-tree` 是 `_gt_ref[$br]="$rf"` 的 last-write-wins 循环：
+> 倒序喂进去，一个分支记过两个 dir 时赢的变成**最旧**那条 ref；被跳过的死目录行恰恰是
+> 「worktree 被手删、tab 还开着」那种，`⌫closed` 会静默渲染成 `-`。
+> `dump tasks` 是原始行流，与今天 awk 直读文件逐字节等价。
+> `test.sh` §37 两条断言钉住，变异 M3 复跑确认会红（父会话已独立复现）。
+
+**站点数更正**：本节最初列了 8 处，实际是 **9 处**——漏掉了 `worktree.zsh` 里紧邻 `had` 的
+`[[ -s "$f" ]] || { rm -f "$f"; ... }`（`gwt-prune` 的后置判断）。它也已收进 `exists`，
+并因此产生了一条有意偏离，见 `docs/state-model.md` §3.5 第 9 条。
 
 ### 待你自己判断的两件事（我没有验证）
 
