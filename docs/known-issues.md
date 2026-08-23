@@ -537,6 +537,31 @@ checkout / 安装目录只读」(dispatch-fixes 线在加)。长期根治归 bac
 - 无论哪种,**恢复手段已经有了且实测可用**:`cc-dispatch.sh send <ref> "继续"` 就能把它推回去
   (本次即如此);真卡死到键盘不响应时走 `close` + `resume`(见下一条)。
 
+## cc-send parked 假阳性的根因找到了:"Press up to edit queued messages"(2026-08-22 晚,面包屑抓到)
+
+audit-0821 的 dispatch-fixes 线让报警带上**匹配行原文**,这次直接把根因交出来了:
+
+```
+[2026-08-22 23:16:21] surface:34 — cc-send parked after send: input line still non-empty
+  after one Enter retry (matched line: "Press up to edit queued messages") — see docs/known-issues.md
+```
+
+骗到"输入行还有字"判定的**不是** `❯` 提示符回显(那是先前的假设,现在可以降级),
+是 Claude Code 在**目标忙碌、消息被排队**时渲染的那行提示。这解释了整个模式:
+假阳性总出现在接收方正在干活的时候,因为那正是这行提示出现的时候。
+
+**为什么本该不走到这一步**:cc-dispatch.sh 的 busy fast-path 就是为这种情况设计的
+(:212-214 — 忙碌时直接发、不做 post-send verify,因为"排队的文字留在框里是合法终态")。
+这次是 **busy 判定没命中**,于是落到 verify 那条路,再被这行提示咬中。
+
+**修法(未做,超出当轮作用面)**:把 `Press up to edit queued messages` 当成**排队信号**
+而不是"残留输入"——它出现时应当走 busy fast-path 的终态,报 `delivered (queued)`,不报 parked。
+
+**在修好之前**:收到 parked 报警**先看屏再决定**,不要直接重发。
+判据是**底部那个框里的 `❯` 后面有没有字**,不是屏幕上有没有 `❯`——
+transcript 里的历史消息也以 `❯ <text>` 渲染。重发假阳性会造成重复消息。
+真阳性长什么样见下一条(长多行消息打死 TUI,进程 0.7% CPU 且 Enter/Escape/Ctrl-C 全被吞)。
+
 ## cc-send 的 parked 报警有真阳性:长多行消息把 TUI 打到键盘无响应(2026-08-22 实测)
 
 **现象**:父会话用 `cc-dispatch.sh send` 往一个 **接近 auto-compact**(76% 会话)的子任务 tab
