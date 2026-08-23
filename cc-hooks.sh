@@ -302,31 +302,39 @@ exit 0
 # ─────────────────────────────────────────────────────────────────────────────
 # status — UserPromptSubmit / Stop / Notification agent-state writer
 #   Keeps a per-sub-task agent-state sidecar (worktree-status.tsv, read by gwt-status's STATUS column)
-#   with ZERO model cooperation and ZERO token cost: Claude Code fires these hooks on its own lifecycle,
-#   the hook just records them.
-#   - Board membership is the filter: only dirs already registered in worktree-tasks.tsv (written when
-#     the tab was opened) get a row — the MAIN session and unrelated projects never write here,
-#     even though the hook is registered globally.
+#   with ZERO model cooperation and ZERO token cost: Claude Code fires these hooks on their own
+#   lifecycle, the hook just records them.
 #   - States: UserPromptSubmit → working; Stop → idle; Notification → blocked ONLY when the message
 #     text mentions "permission" (other notifications are noise). There is deliberately NO ready
-#     state: readiness stays owned by gwt-done + a clean tree (see README).
-#   - The board's dir column is `cd <dir> && pwd -P` output (cc-dispatch.sh surface), so the
-#     hook's cwd is canonicalized the exact same way before matching.
-#   - Read-modify-write (one row per dir, newest wins) under cc-board.sh log's mkdir-lock pattern
-#     (macOS has no flock); the same lock discipline in worktree.zsh keeps gwt-rm/gwt-prune rewrites
-#     from losing a concurrent hook update.
+#     state: readiness stays owned by gwt-done + a clean tree (see README), and cc-state task-set-state
+#     refuses the value outright — the invariant now lives in the one writer, not in this hook.
+#   - All state bookkeeping is cc-state's (the single reader/writer): board membership (a dir with
+#     no task row is a silent no-op that writes not one byte), the sidecar rewrite, the locking.
+#   - The one cheap gate kept IN FRONT of the facade: the no-board fast path. A missing tasks
+#     file would cost two python3 startups through the facade for a guaranteed no-op, on every
+#     event of every session on the machine — so the [ -f ] check runs first (F8; §33 pins the
+#     zero-python-starts contract, because a comment did not survive the last refactor).
+#   - The hook still canonicalizes its cwd with cd + pwd -P before handing it over. Not for
+#     matching — cc-state's dir rule takes the raw string OR the canonical form, so a legacy
+#     logical-path row (/var vs /private/var, spec §3.5 defect 3) joins either way — but as the
+#     enterability gate: cd must SUCCEED, which cc-state's best-effort realpath never demands.
+#     Drop the cd and a vanished cwd writes a sidecar row the board can never join (verified
+#     2026-08-22: raw-string match fires on a dead dir's row).
 #   - HARD RULES: never write to stdout/stderr (UserPromptSubmit stdout gets injected into the
 #     model's context — zero token cost means zero output); ALWAYS exit 0 (exit 2 would block the
-#     user's prompt); any failure (no python3, malformed JSON, unreadable board) degrades to a
-#     silent no-op. cmux-independent by design — pure file bookkeeping, no surfaces touched.
+#     user's prompt); any failure (no python3, malformed JSON, cc-state missing or erroring)
+#     degrades to a silent no-op. cmux-independent by design — pure file bookkeeping, no surfaces
+#     touched.
 status)
 shift
 input="$(cat 2>/dev/null || true)"
 [ -n "$input" ] || exit 0
 
 # F8: with no board file there is nothing this hook could ever write — and it fires on every
-# prompt of every session on the machine, so check BEFORE the python parse (python3 startup is
-# the one measurable cost; everything below stays exactly as it was).
+# prompt of every session on the machine, so check BEFORE the python parse. cc-state would make
+# the same call a silent no-op; this gate is what saves its TWO python3 startups on a no-board
+# machine (the common case — measured 4.3ms vs 45.1ms per event without the gate, round-2 gate
+# 2026-08-22). Payload-independent on purpose: it decides on the store, never on the event.
 tasks="${CC_TASKS_FILE:-$HOME/.config/cc-stack/worktree-tasks.tsv}"
 [ -f "$tasks" ] || exit 0
 
@@ -356,24 +364,18 @@ case "$ev" in
 esac
 
 # Canonical dir, same form the board stores. CDPATH= so a stray CDPATH can neither redirect the cd
-# nor echo into $canon; an un-enterable cwd can never match the board anyway.
+# nor echo into $canon — and the cd itself is the gate: an un-enterable cwd (dir gone, no access)
+# must not earn a state row, while cc-state's canonicalization is best-effort and never fails.
 [ -n "$cwd" ] || exit 0
 canon="$(CDPATH= cd -- "$cwd" 2>/dev/null && pwd -P)" || exit 0
 
-awk -F'\t' -v d="$canon" '$4==d{found=1} END{exit found?0:1}' "$tasks" 2>/dev/null || exit 0
-
-f="${CC_STATUS_FILE:-$HOME/.config/cc-stack/worktree-status.tsv}"
-# Locked read-modify-write: drop any previous row for this dir, append the fresh one (cc-board.sh log
-# pattern — mkdir is atomic; if the lock never frees we still write, matching its append behavior).
-lock="$f.lock"
-for _ in $(seq 1 60); do
-  if mkdir "$lock" 2>/dev/null; then trap 'rmdir "$lock" 2>/dev/null' EXIT; break; fi
-  sleep 0.05
-done
-tmp="$f.tmp.$$"
-awk -F'\t' -v OFS='\t' -v d="$canon" '$1!=d' "$f" 2>/dev/null > "$tmp" || : > "$tmp"
-printf '%s\t%s\t%s\n' "$canon" "$state" "$(date +%s)" >> "$tmp"
-mv "$tmp" "$f" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+# ONE facade call: membership + rewrite + lock are all cc-state's. The redirects and `|| true`
+# are the hook contract, not decoration: task-set-state exits 2 with stderr for a refused state
+# (e.g. `ready`), and cc-state's own startup can fail loudly (no python3) — every byte of that
+# must stay invisible and the hook must still exit 0.
+CC_SELF="$( (CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd -P) 2>/dev/null )"
+[ -n "$CC_SELF" ] || CC_SELF="$HOME/.config/cc-stack"
+"$CC_SELF/cc-state" task-set-state "$canon" "$state" >/dev/null 2>&1 || true
 
 exit 0
 ;;
