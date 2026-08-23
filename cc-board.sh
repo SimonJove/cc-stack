@@ -58,10 +58,6 @@ MERGE="$SELF/cc-merge.sh"
 STATE="$SELF/cc-state"
 [ -f "$STATE" ] || STATE="$HOME/.config/cc-stack/cc-state"
 
-tasks="${CC_TASKS_FILE:-$HOME/.config/cc-stack/worktree-tasks.tsv}"
-status="${CC_STATUS_FILE:-$HOME/.config/cc-stack/worktree-status.tsv}"
-arch="${CC_ARCHIVE_FILE:-$HOME/.config/cc-stack/worktree-tasks-archive.tsv}"
-
 ccb_canon1(){ CDPATH= cd -- "$1" >/dev/null 2>&1 && pwd -P; }   # one-shot (forks); the repo-root block below
 
 # ── TSV access discipline (2026-08-16 audit, F1) ───────────────────────────────────────
@@ -148,13 +144,19 @@ else
   rows_src="$("$STATE" task-list ${archive:+--archive} $wstate --repo "$root")"
 fi
 
+# Nothing to render. The two messages below are a SPLIT, not a fallback: "there is no store"
+# and "the store is there and none of it matched" are different answers to the human, and the
+# render used to tell them apart by stat'ing the file it no longer knows the name of. `exists`
+# asks the facade the same question in the only form that survives the engine swap (rows, not
+# files) — and it is asked HERE, on a path that has already come up empty, so the live board's
+# three facade calls stay three. Never hoist it above the task-list call.
 if [ -z "$rows_src" ]; then
   if [ -n "$archive" ]; then
-    [ -f "$arch" ] || { echo "no archived tasks"; exit 0; }
+    "$STATE" exists archive || { echo "no archived tasks"; exit 0; }
     echo "no records"; exit 0    # the store exists but nothing renders (e.g. all rows foreign)
   fi
-  [ -f "$tasks" ] || { echo "no registered worktree tasks"; exit 0; }
-  echo "no records"; exit 0      # same split the old render kept: file gone ≠ nothing matched
+  "$STATE" exists tasks || { echo "no registered worktree tasks"; exit 0; }
+  echo "no records"; exit 0      # same split the old render kept: store gone ≠ nothing matched
 fi
 
 # ── tab liveness: one cmux probe per WORKSPACE (live board only) ──────────────────────

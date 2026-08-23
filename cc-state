@@ -11,9 +11,9 @@ path (<file>.lock, atomic mkdir; macOS has no flock), same append discipline.
 Verb contract (spec §4): each subcommand answers ONE caller question; output is TSV
 with no header, stdout only; errors go to stderr. rc: 0 = success (including the
 deliberate silent no-ops that mirror today's callers), 1 = a query that found
-nothing (task-get / tab-owner / tab-resolve / task-opened-recently), 2 = usage
-error. Safe to call from sh: nothing reads stdin, no output on failure paths that
-today are silent.
+nothing (task-get / tab-owner / tab-resolve / task-opened-recently / exists), 2 =
+usage error. Safe to call from sh: nothing reads stdin, no output on failure paths
+that today are silent.
 
 Stores and their overrides (same env names the sandbox uses):
   tasks   CC_TASKS_FILE    worktree-tasks.tsv           time\\tbranch\\tsurface\\tdir\\tcaller\\ttask\\tparent\\tlargs
@@ -862,8 +862,26 @@ def cmd_dump(args):
         return 1
     return 0
 
+def cmd_exists(args):
+    """rc 0 = this store holds at least one row, rc 1 = it does not. Zero output on
+    both — the callers are `||` guards in shell, and a guard that prints is a guard
+    that leaks into a board's output.
+
+    The callers this replaces all asked `[ -f <store> ]`, and they asked it for one
+    reason: to tell "there is no store" apart from "the store is there and nothing
+    in it matched", which are two different sentences to a human. Those two
+    questions are the same question only because _write_unlocked DELETES a store it
+    empties, so a file that exists always has a row in it. Defining the verb on ROWS
+    rather than on the file keeps the sentence the caller prints correct after the
+    four TSVs become one library, where there is no per-store file left to stat.
+    That is the whole point of the verb, and it is why this contract does not move
+    in Task 2 — only its implementation does."""
+    if len(args) != 1 or args[0] not in PATHS:
+        return _usage("exists tasks|status|archive|tabs")
+    return 0 if read_lines(args[0]) else 1
+
 VERBS = {
-    "dump": cmd_dump,
+    "dump": cmd_dump, "exists": cmd_exists,
     "task-add": cmd_task_add, "task-set-launch": cmd_task_set_launch,
     "task-get": cmd_task_get, "task-list": cmd_task_list,
     "task-set-state": cmd_task_set_state, "task-clear-state": cmd_task_clear_state,
