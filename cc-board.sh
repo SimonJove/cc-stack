@@ -4,9 +4,10 @@
 #   Bash tool invokes it directly (`bash ~/.config/cc-stack/cc-board.sh [--all]`) because the
 #   old zsh-only render silently printed nothing there (the cmux tree + capture-pane
 #   workaround is retired).
-# Usage: cc-board.sh log <worktree-dir> <surface_ref> <caller_surface> <initial-prompt> [parent-branch] [launch-args]
-#          append one worktree sub-task record (the single write point; absorbs cc-tasks-log.sh)
 # Usage: cc-board.sh [--all] [--archive]
+#   (the `log` subcommand — the pre-facade single write point for task rows — was retired
+#    with Task 9: cc-state task-add / task-set-launch own the row now, and its recorded
+#    bytes live on as test.sh §32's frozen oracle)
 #   (default)  live board: the task list (via cc-state) joined with the status sidecar
 #   --all      disable the repo filter (rows from every repo)
 #   --archive  render the task archive (merged tasks; what gwt-log shows)
@@ -40,55 +41,6 @@
 #   its STATUS still joins, because the sidecar join lives in the facade's --with-state and
 #   keys on the dir rule that knows both the /var and the /private/var form.
 set -u
-
-# ── log subcommand: append one worktree sub-task record (absorbs cc-tasks-log.sh) ─────────
-# The single write point, keeping the TSV format consistent with the render below.
-# Called by cc-dispatch.sh surface (hook path and gwt-claude path both land there).
-# Fields (TAB-separated): time \t branch \t surface \t dir \t caller-tab \t task-summary \t parent-branch \t launch-args
-#   (parent = the caller's branch at dispatch; the board's PARENT column falls back to it
-#    once the branch's branch.<b>.ccMergeInto git config is gone, e.g. deleted after merge)
-#   launch-args (8th field, roadmap 2 gwt-resume) = compact k=v:... record of the dispatch-time
-#   launch, colon-separated, empty parts omitted, written in this order:
-#     uuid=<claude session id>:provider=<cld name|anthropic>:pm=<permission-mode>
-#     :csuuid=<CALLER surface uuid>:suuid=<CHILD tab surface uuid>:model=<id>
-#   model stays LAST (a model id may itself contain colons — every parser stops there).
-#   csuuid/suuid (2026-08-16, tab-close permission model) are cmux SURFACE UUIDs, the only stable
-#   tab identities there are: short refs (surface:283) drift as panes open and close, so the 3rd
-#   field is an address, never an identity. csuuid = the session that dispatched this sub-task
-#   (the one allowed to close its tab while it is still running), suuid = the sub-task tab itself.
-#   Read by `cc-dispatch.sh close`; kept fresh across a cmux restart by gwt-resume. Rows without
-#   them (pre-feature) have no recorded owner here — the close primitive then falls back to the
-#   opened-tabs ledger (opened-tabs.tsv), and refuses when neither ledger names an owner.
-#   POSITION: appended AFTER parent-branch, i.e. the LAST live-board field — every positional
-#   reader keys on fields 1-7 (cc-hooks.sh status matches $4 = dir; the PARENT fallback reads the
-#   7th), and the archive appends merged-at after it (live 8 fields → archive 9). Old 7-field rows
-#   stay valid: bash/zsh `read` gives the LAST variable the remainder WITH its TABs, so the rewriters
-#   below and in worktree.zsh round-trip the extra field untouched. Rows before this feature carry
-#   no uuid → gwt-resume degrades them to an idle ccteam tab (visible, never silent).
-if [ "${1:-}" = "log" ]; then
-  shift
-  dir="${1:-}"; ref="${2:-?}"; caller="${3:-}"; prompt="${4:-}"; parent="${5:-}"; largs="${6:-}"
-  [ -n "$dir" ] || exit 0
-  f="${CC_TASKS_FILE:-$HOME/.config/cc-stack/worktree-tasks.tsv}"
-
-  branch="$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
-  # Task summary: collapse to one line, strip TAB/pipe, truncate — keeps TSV and `column` display intact
-  summary="$(printf '%s' "$prompt" | tr '\t\n' '  ' | tr '|' '/' | cut -c1-140)"
-  [ -n "$summary" ] || summary='(idle ccteam, no initial prompt)'
-  # launch-args: composed by cc-dispatch.sh surface; sanitize the same way (one line, no TAB)
-  largs="$(printf '%s' "$largs" | tr '\t\n' '  ' | cut -c1-200)"
-
-  # Locked append (avoid losing lines racing with the prune rewrite below). mkdir is atomic; macOS lacks flock.
-  lock="$f.lock"
-  for _ in $(seq 1 60); do
-    if mkdir "$lock" 2>/dev/null; then trap 'rmdir "$lock" 2>/dev/null' EXIT; break; fi
-    sleep 0.05
-  done
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-    "$(date '+%Y-%m-%d %H:%M:%S')" "$branch" "$ref" "$dir" "$caller" "$summary" "$parent" "$largs" \
-    >> "$f" 2>/dev/null || true
-  exit 0
-fi
 
 all=""; archive=""
 while [ $# -gt 0 ]; do
