@@ -4530,12 +4530,19 @@ zw36 gwt-prune >"$S36/p1" 2>&1; eq "36 prune: live rows compacted" "$(cat "$S36/
 # above); a filtered view hides dead rows at read time and would pass with no sweep at all
 eq "36 prune keeps the live sidecar row"  "$("$CC/cc-state" dump status | grep -cF "$D36A")" "1"
 eq "36 prune swept the dead sidecar row"  "$("$CC/cc-state" dump status | grep -cF "$D36D")" "0"
-# a list whose dirs are ALL gone (or a pre-existing empty file) empties AND removes the file —
-# the facade deletes an emptied store; the had-check keeps the three messages distinguishable
+# a list whose dirs are ALL gone empties AND removes the file — the facade deletes an emptied
+# store; the had-check keeps the three messages distinguishable
 rm -rf "$D36A"
 zw36 gwt-prune >"$S36/p2" 2>&1; eq "36 prune: all dead says emptied" "$(cat "$S36/p2")"$'\n'"$([ -f "$T36" ] && echo kept || echo gone)" "✔ emptied (no live records)"$'\n'"gone"
+# CHANGED, C phase Task 1 — recorded, not silent. A store the facade never wrote: zero bytes on
+# disk, truncated by hand. gwt-prune used to stat the FILE, so it read this as "there is a list
+# and pruning emptied it" (✔ emptied) and unlinked it; it now asks cc-state exists, which is
+# defined on ROWS, so the same store reads as "no rows" — the empty-list message, and the
+# zero-byte file left alone. The stack cannot produce this state (every store cc-state empties
+# is unlinked), and once the four TSVs are one library there is no per-store file to truncate.
 : > "$T36"
-zw36 gwt-prune >"$S36/p3" 2>&1; eq "36 prune: empty file says emptied" "$(cat "$S36/p3")"$'\n'"$([ -f "$T36" ] && echo kept || echo gone)" "✔ emptied (no live records)"$'\n'"gone"
+zw36 gwt-prune >"$S36/p3" 2>&1; eq "36 prune: a hand-truncated store reads as empty" "$(cat "$S36/p3")"$'\n'"$([ -f "$T36" ] && echo kept || echo gone)" "list is empty"$'\n'"kept"
+rm -f "$T36"
 mkdir -p "$D36A"
 # _gwt_archive_branch through the facade: the archived row is the tasks row VERBATIM with
 # merged-at appended (8→9 fields), launch-args and the empty caller field intact
@@ -4625,6 +4632,199 @@ env CC_TASKS_FILE="$CC_TEST_SANDBOX/19b-tasks.tsv" CC_STATUS_FILE="$CC_TEST_SAND
 eq "gwt-rm healthy path still works" "$(git -C "$GT2" worktree list --porcelain | grep -c wtguard)" "0"
 rm -rf "$GT2"
 
+
+echo ""
+echo "== 37. storage awareness lives in the facade (C phase, Task 1) =="
+# The nine places outside cc-state that knew WHICH FILE the state lives in were all
+# `[ -f <store> ]` prechecks, and every one of them is fail-silent-empty: after the engine
+# swap the file is simply not there any more, the check goes false, and the caller takes its
+# "nothing here" branch without a word. The whole class is invisible to an "empty store →
+# empty output" assertion, because empty output is what BOTH branches produce. So every
+# assertion below pits the two branches against each other — store ABSENT (message names the
+# store) vs store PRESENT but nothing matched (message says "no records"/"none of mine") —
+# which is exactly the distinction the `[ -f ]` used to draw and the new verb must keep.
+#
+# `cc-state exists <store>` is defined on ROWS, not on files: rc 0 = at least one row.
+# The two are the same question today only because _write_unlocked DELETES an emptied store,
+# and only the row question still means something once the four TSVs become one library.
+cn37(){ CDPATH= cd -- "$1" >/dev/null 2>&1 && pwd -P; }
+S37=$(mktemp -d); S37="$(cn37 "$S37")"
+T37="$S37/tasks.tsv"; ST37="$S37/status.tsv"; A37="$S37/archive.tsv"; TB37="$S37/tabs.tsv"
+st37(){ env CC_TASKS_FILE="$T37" CC_STATUS_FILE="$ST37" CC_ARCHIVE_FILE="$A37" \
+            CC_TABS_FILE="$TB37" "$CC/cc-state" "$@"; }
+ex37(){ st37 exists "$1" >"$S37/o" 2>"$S37/e"; echo $?; }
+
+# ── the verb's contract (Task 2 replaces its implementation, not one word of this) ──────────
+rm -f "$T37"
+eq "37 exists: absent store is rc 1"          "$(ex37 tasks)" "1"
+eq "37 exists: rc 1 is silent"                "$(cat "$S37/o")$(cat "$S37/e")" ""
+printf 'one row\n' > "$T37"
+eq "37 exists: a store with a row is rc 0"    "$(ex37 tasks)" "0"
+eq "37 exists: rc 0 is silent"                "$(cat "$S37/o")$(cat "$S37/e")" ""
+# the contract is "at least one ROW", not "the file is there" — a hand-truncated store is empty
+: > "$T37"
+eq "37 exists: a zero-row file is rc 1"       "$(ex37 tasks)" "1"
+rm -f "$T37"
+eq "37 exists: unknown store is rc 2"         "$(ex37 nosuchstore)" "2"
+eq "37 exists: rc 2 prints usage on stderr"   "$(grep -c '^usage: cc-state exists ' "$S37/e")" "1"
+eq "37 exists: rc 2 prints nothing on stdout" "$(cat "$S37/o")" ""
+eq "37 exists: no argument is rc 2"           "$(ex37 "")" "2"
+eq "37 exists: two arguments is rc 2"         "$(st37 exists tasks tabs >/dev/null 2>&1; echo $?)" "2"
+n37=0; for s37 in tasks status archive tabs; do st37 exists "$s37" || n37=$((n37+1)); done
+eq "37 exists: all four stores answer, empty" "$n37" "4"
+printf 'r\n' > "$T37"; printf 'r\n' > "$ST37"; printf 'r\n' > "$A37"; printf 'r\n' > "$TB37"
+n37=0; for s37 in tasks status archive tabs; do st37 exists "$s37" && n37=$((n37+1)); done
+eq "37 exists: all four stores answer, filled" "$n37" "4"
+eq "37 exists is a registered verb"           "$("$CC/cc-state" --help 2>&1 | grep -c '^verbs:.* exists ')" "1"
+rm -f "$T37" "$ST37" "$A37" "$TB37"
+
+# ── fixtures: a repo with one registered worktree, plus a dir belonging to nobody ───────────
+B37="$(cn37 "$(mktemp -d)")"
+( cd "$B37"; git init -q; git config user.email t@t; git config user.name t
+  git commit -q --allow-empty -m i; git branch -M main
+  mkdir -p .claude; git worktree add -q .claude/worktrees/w37 -b feat/37W >/dev/null )
+W37="$B37/.claude/worktrees/w37"; OTH37="$(cn37 "$(mktemp -d)")"
+row37(){ printf '2026-01-01 00:00:0%s\t%s\tsurface:%s\t%s\tsurface:9\t%s\tmain\tuuid=z\n' \
+           "$1" "$2" "$3" "$4" "$5"; }
+
+# ── cc-board.sh: the two messages the precheck exists to tell apart ─────────────────────────
+brd37(){ ( cd "$B37" && env PATH=/usr/bin:/bin CC_TASKS_FILE="$T37" CC_STATUS_FILE="$ST37" \
+    CC_ARCHIVE_FILE="$A37" CC_SEND_FAILLOG=/dev/null bash "$CC/cc-board.sh" ${1:-} ) 2>/dev/null; }
+rm -f "$T37" "$A37"
+eq "37 board: no task store names the store"  "$(brd37)" "no registered worktree tasks"
+# a store that IS there but holds only another repo's row: the repo filter empties the render,
+# and the message must flip. (This is the half an "empty store" fixture can never reach.)
+row37 1 feat/37F 61 "$OTH37" '37 foreign row' > "$T37"
+eq "37 board: store present, nothing matched" "$(brd37)" "no records"
+eq "37 board: the foreign row survived the read" \
+   "$(env CC_TASKS_FILE="$T37" "$CC/cc-state" dump tasks | grep -c '37 foreign row')" "1"
+rm -f "$A37"
+eq "37 board: no archive names the archive"   "$(brd37 --archive)" "no archived tasks"
+row37 2 feat/37FA 62 "$OTH37" '37 foreign archive' > "$A37"
+eq "37 board: archive present, nothing matched" "$(brd37 --archive)" "no records"
+
+# ── the cost rule: `exists` may only be asked on a path that is ALREADY empty ───────────────
+# The live board is the most-run command in the stack; it forks python three times today
+# (task-prune, task-list, dump tasks) and this round may not add a fourth. A PATH-fronted
+# python3 shim logs each start with its argv, so both halves are countable: how many, and
+# which verb. (§33's F8 trick; here the argv matters, not just the count.)
+PY37="$S37/shim"; mkdir -p "$PY37"; RP37="$(command -v python3)"
+cat > "$PY37/python3" <<PY37SHIM
+#!/usr/bin/env bash
+echo "\$*" >> "\${CC_PY_LOG:-/dev/null}"
+exec "$RP37" "\$@"
+PY37SHIM
+chmod +x "$PY37/python3"
+cat > "$PY37/cmux" <<'CMUX37'
+#!/usr/bin/env bash
+case "$1" in
+  ping) exit 0 ;;
+  identify) echo '{ "caller": {} }' ;;
+  restore-session) echo "(fake) nothing to restore" ;;
+  list-workspaces) printf '* workspace:1  fake  [selected]\n' ;;
+  list-pane-surfaces) cat "${CC_37_LIVE:-/dev/null}" 2>/dev/null ;;
+esac
+exit 0
+CMUX37
+chmod +x "$PY37/cmux"
+export CC_37_LIVE="$S37/live"
+printf 'surface:13  AAAAAAAA-1111-1111-1111-111111111111\n' > "$CC_37_LIVE"
+brdpy37(){ : > "$S37/pylog"
+  ( cd "$B37" && env PATH="$PY37:/usr/bin:/bin" CC_PY_LOG="$S37/pylog" CC_TASKS_FILE="$T37" \
+      CC_STATUS_FILE="$ST37" CC_ARCHIVE_FILE="$A37" CC_SEND_FAILLOG=/dev/null \
+      bash "$CC/cc-board.sh" ) >/dev/null 2>&1; }
+row37 3 feat/37W 13 "$W37" '37 live row' > "$T37"
+brdpy37
+eq "37 cost: a rendering board still forks python 3x" "$(wc -l < "$S37/pylog" | tr -d ' ')" "3"
+eq "37 cost: a rendering board never asks exists"     "$(grep -cw exists "$S37/pylog")" "0"
+# and on the cold path it is asked exactly once — not once per store, not in a loop
+rm -f "$T37"; brdpy37
+eq "37 cost: the empty board asks exists once"        "$(grep -cw exists "$S37/pylog")" "1"
+
+# ── cc-dispatch.sh tabs: ledger absent vs ledger present but none of mine ───────────────────
+SELF37="CCCCCCCC-3333-3333-3333-333333333333"
+tabs37(){ ( cd "$S37" && env PATH=/usr/bin:/bin CC_TABS_FILE="$TB37" \
+    CC_CALLER_SURFACE_UUID="$SELF37" bash "$CC/cc-dispatch.sh" tabs ) 2>&1; }
+rm -f "$TB37"
+O37="$(tabs37)"
+eq "37 tabs: no ledger says (no tabs recorded)" "$(printf '%s\n' "$O37" | tail -1)" "  (no tabs recorded)"
+# ...and says NOTHING else: no cmux warning, no column header. That is the whole point of the
+# precheck sitting where it sits, and it is what a post-hoc check would quietly change.
+eq "37 tabs: no ledger prints two lines only"   "$(printf '%s\n' "$O37" | wc -l | tr -d ' ')" "2"
+printf 'AAAAAAAA-1111-1111-1111-111111111111\tBBBBBBBB-2222-2222-2222-222222222222\t%s\tsess\t2026-01-01 00:00:00\n' \
+  "$S37" > "$TB37"
+O37B="$(tabs37)"
+eq "37 tabs: ledger present, none of mine"      "$(printf '%s\n' "$O37B" | tail -1)" \
+  "  (no tabs opened by this session — cc-dispatch.sh tabs --all shows every row)"
+eq "37 tabs: ledger present still warns + heads" \
+  "$(printf '%s\n' "$O37B" | grep -cE 'cmux unreachable|^REF +UUID')" "2"
+# the ledger row is another session's, so an unpruned read must leave it alone (cmux was
+# unreachable → no evidence → no prune); read RAW, a filtered view hides it either way
+eq "37 tabs: an unreachable probe pruned nothing" \
+  "$(env CC_TABS_FILE="$TB37" "$CC/cc-state" dump tabs | grep -c .)" "1"
+
+# ── cc-dispatch.sh resume: same split, over the task store ─────────────────────────────────
+res37(){ ( cd "$B37" && env PATH="$PY37:/usr/bin:/bin" CC_TASKS_FILE="$T37" CC_STATUS_FILE="$ST37" \
+    CC_TABS_FILE="$TB37" CC_CMUX_SESSIONS="$S37/nosuch.json" CC_RESUME_SETTLE=0 \
+    bash "$CC/cc-dispatch.sh" resume ) 2>&1; }
+rm -f "$T37"
+eq "37 resume: no task store names the store" "$(res37 | tail -1)" \
+  "no registered worktree tasks (nothing to resume)"
+row37 4 feat/37F 64 "$OTH37" '37 foreign row' > "$T37"
+eq "37 resume: store present, nothing matched" "$(res37 | tail -1)" \
+  "no resumable board rows (current repo; try --all)"
+
+# ── worktree.zsh gwt-prune: three messages, one facade ──────────────────────────────────────
+# PATH carries the fake cmux: gwt-tree's TAB cell is a liveness verdict, so on the real cmux
+# the tree assertions below would render whatever surfaces this machine happens to have open.
+zw37(){ ( cd "${2:-$S37}" && env PATH="$PY37:/usr/bin:/bin" CC_TASKS_FILE="$T37" CC_STATUS_FILE="$ST37" \
+    CC_ARCHIVE_FILE="$A37" CC_TABS_FILE="$TB37" zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; $1" ) 2>&1; }
+rm -f "$T37"
+eq "37 gwt-prune: no store says list is empty" "$(zw37 gwt-prune)" "list is empty"
+row37 5 feat/37W 13 "$W37" '37 live row' > "$T37"
+eq "37 gwt-prune: live rows compact"           "$(zw37 gwt-prune)" "✔ task list compacted"
+row37 6 feat/37G 65 "$S37/never-existed" '37 dead row' > "$T37"
+eq "37 gwt-prune: all-dead empties"            "$(zw37 gwt-prune)" "✔ emptied (no live records)"
+eq "37 gwt-prune: the emptied store is gone"   "$([ -f "$T37" ] && echo kept || echo gone)" "gone"
+
+# ── worktree.zsh gwt-tree: the ref map (the 47th field-level parse, and the trap in it) ─────
+# This one is NOT `task-list --all`. task-list answers a different question than the file:
+# it skips rows whose dir is gone, dedups newest-per-dir, and emits NEWEST FIRST. Feeding it
+# to a `_gt_ref[branch]=ref` loop inverts the winner (the loop's last write wins, so reversed
+# input hands the OLDEST ref to a branch recorded twice) and drops the ref of any branch whose
+# worktree dir has been removed by hand — a ⌫closed tab silently rendering as "-".
+# `dump <store>` is the raw row stream, which is the question this scan actually asks, and it
+# is the same shape cc-board.sh's stale-ref probe already uses.
+R37="$(cn37 "$(mktemp -d)")"
+( cd "$R37"; git init -q; git config user.email t@t; git config user.name t
+  git commit -q --allow-empty -m i; git branch -M main
+  git branch feat/37X; git branch feat/37D )
+"$CC/cc-merge.sh" set-parent "$R37" feat/37X main >/dev/null
+"$CC/cc-merge.sh" set-parent "$R37" feat/37D main >/dev/null
+D37GONE="$S37/removed-by-hand"                       # recorded once, never created
+# feat/37X twice: the older row points at a dead ref, the newer at the LIVE surface:13.
+row37 7 feat/37X 90 "$B37" '37 older X'  >  "$T37"
+row37 8 feat/37X 13 "$W37" '37 newer X'  >> "$T37"
+row37 9 feat/37D 91 "$D37GONE" '37 gone dir' >> "$T37"
+TREE37="$(zw37 gwt-tree "$R37")"
+eq "37 gwt-tree: the NEWEST row wins the ref"  "$(printf '%s\n' "$TREE37" | grep 'feat/37X' | grep -c '✔live')" "1"
+eq "37 gwt-tree: a gone dir keeps its ref"     "$(printf '%s\n' "$TREE37" | grep 'feat/37D' | grep -c '⌫closed')" "1"
+eq "37 gwt-tree: no store means no refs at all" \
+   "$(rm -f "$T37"; printf '%s\n' "$(zw37 gwt-tree "$R37")" | grep 'feat/37[XD]' | grep -c '\[-\]')" "2"
+
+# ── structure: who is still allowed to name a state FILE ───────────────────────────────────
+# Two survivors, both deliberate, both Task 2's business: cc-hooks.sh's hot-path precheck
+# (a facade call there would put a 15 ms python start on every prompt of every session) and
+# cc-dispatch.sh's `tabs` header, which PRINTS the ledger path to the human on purpose.
+eq "37 cc-board.sh names no store file"   "$(grep -cE '\$\{CC_(TASKS|STATUS|ARCHIVE|TABS)_FILE:-' "$CC/cc-board.sh")" "0"
+eq "37 worktree.zsh names no store file"  "$(grep -cE '\$\{CC_(TASKS|STATUS|ARCHIVE|TABS)_FILE:-' "$CC/worktree.zsh")" "0"
+eq "37 cc-dispatch.sh keeps one, for the header" \
+   "$(grep -cE '\$\{CC_(TASKS|STATUS|ARCHIVE|TABS)_FILE:-' "$CC/cc-dispatch.sh")" "1"
+eq "37 cc-hooks.sh keeps its fast path"   "$(grep -cE '\$\{CC_(TASKS|STATUS|ARCHIVE|TABS)_FILE:-' "$CC/cc-hooks.sh")" "1"
+eq "37 no caller tests a store with [ -f ]" \
+   "$(grep -cE '\[ *-f *"\$(tasks|arch|status|tabs_f|_tl_f)"' "$CC/cc-board.sh" "$CC/cc-dispatch.sh" | awk -F: '{s+=$2} END{print s+0}')" "0"
+unset CC_37_LIVE
+rm -rf "$S37" "$B37" "$OTH37" "$R37"; cc_sandbox_ledgers
 echo "== syntax =="
 for s in "$CC"/*.sh "$CC"/hooks/*.sh; do bash -n "$s" && : || { echo "  ✗ syntax $s"; fail=$((fail+1)); }; done
 zsh -n "$CC/worktree.zsh" && ok "worktree.zsh syntax" || { no "worktree.zsh syntax" x x; }

@@ -441,7 +441,10 @@ _cctabs_where(){ # $1 = live map, $2 = surface uuid → the workspace ref it was
   printf '%s\n' "${1:-}" | awk -F'\t' -v u="${2:-}" '$2==u{print $3; exit}'
 }
 _cctabs_prune(){ # $1 = live map (optional; probed when omitted) — drop rows whose surface is gone
-  _tl_f="$(_cctabs_file)"; [ -f "$_tl_f" ] || return 0
+  # No "is there a ledger?" precheck: an empty store makes cc-state tab-prune a no-op that
+  # creates nothing, so asking the facade first would only spend a python start to save one.
+  # (The precheck that used to sit here stat'ed the ledger FILE — the thing this file is no
+  # longer allowed to know the name of.)
   _tlm="${1:-$(_cctabs_livemap)}"
   [ -n "$_tlm" ] || return 0                              # no map = no evidence = no pruning
   # INVARIANT (2026-08-16): absence of evidence is NEVER evidence of death, and it only ever gets
@@ -1339,13 +1342,19 @@ tabs_all=""
 if [ "${1:-}" = "--all" ]; then tabs_all=1; shift; fi
 [ $# -eq 0 ] || { echo "usage: cc-dispatch.sh tabs [--all]" >&2; exit 2; }
 
-tabs_f="$(_cctabs_file)"
+tabs_f="$(_cctabs_file)"     # printed in the header below, on purpose — the human troubleshoots
+                             # this ledger by hand. The only remaining store PATH in this file.
+echo "── opened tabs ($tabs_f) ──"
+# "no ledger at all" is a different sentence from "a ledger, but no row of yours", and it is the
+# one that must be said BEFORE the cmux warnings and the column header — a reader who has never
+# opened a tab should not be told their workspace enumeration was incomplete. So this stays a
+# PRECHECK (one python start on a command that already forks cmux once per workspace), and it
+# buys back the whole liveness probe on the empty path, which today ran before saying this.
+"$CC_SELF/cc-state" exists tabs || { echo "  (no tabs recorded)"; exit 0; }
 tabs_live="$(_cctabs_livemap)"
 tabs_part=""; _cctabs_partial "$tabs_live" && tabs_part=1
 _cctabs_prune "$tabs_live"
 tabs_self="$(_cctabs_uc "${CC_CALLER_SURFACE_UUID:-${CMUX_SURFACE_ID:-}}")"
-echo "── opened tabs ($tabs_f) ──"
-[ -f "$tabs_f" ] || { echo "  (no tabs recorded)"; exit 0; }
 [ -n "$tabs_live" ] || echo "  ⚠ cmux unreachable — liveness unknown, nothing pruned"
 [ -n "$tabs_part" ] && echo "  ⚠ cmux workspace enumeration incomplete — liveness partial, nothing pruned (rows below print dead? rather than dead)"
 printf '%-12s  %-36s  %-6s  %-36s  %s\n' REF UUID STATE OWNER DIR
@@ -1409,7 +1418,6 @@ if [ "${1:-}" = "--all" ]; then res_all=1; shift; fi
 command -v cmux >/dev/null 2>&1 && cmux ping >/dev/null 2>&1 || {
   echo "✗ can't reach cmux, aborting (gwt-resume reopens tabs — it needs cmux)" >&2; exit 1; }
 
-tasks="${CC_TASKS_FILE:-$HOME/.config/cc-stack/worktree-tasks.tsv}"
 ccb_canon(){ CDPATH= cd -- "$1" >/dev/null 2>&1 && pwd -P; }   # same canonicalization as the board
 
 # ── ① native restore (fail-soft) ──
@@ -1486,7 +1494,6 @@ fi
 # newest-first output). The row stream is still TSV, so the awk→shell handoff below keeps the
 # same US (0x1f) delimiter discipline as cc-board.sh: TAB is IFS whitespace and collapses runs
 # of it, breaking empty fields (F7).
-[ -f "$tasks" ] || { echo "no registered worktree tasks (nothing to resume)"; exit 0; }
 repo_root=""
 if [ -z "$res_all" ]; then
   # F1 fix: resolve to the main repo root, not the worktree itself (linked worktrees must see
@@ -1598,7 +1605,15 @@ while IFS="$US" read -r c r_dir r_br r_ref r_task r_largs; do
   n_re=$((n_re+1))
 done <<< "$(printf '%s\n' "$rows")"
 
-[ -n "$plan" ] || { echo "no resumable board rows (current repo; try --all)"; exit 0; }
+# Nothing to resume — but WHY not? "no board at all" and "a board with nothing of this repo's on
+# it" send the human to different places (register a sub-task vs. rerun with --all), and telling
+# them apart used to mean stat'ing the task file before the rows were even read. Asked here
+# instead, the question costs a python start only on the path that already came up empty, and
+# nothing is printed between the old call site and this one, so the transcript is unchanged.
+if [ -z "$plan" ]; then
+  "$CC_SELF/cc-state" exists tasks || { echo "no registered worktree tasks (nothing to resume)"; exit 0; }
+  echo "no resumable board rows (current repo; try --all)"; exit 0
+fi
 
 # ── ⑤ list, then ONE confirm for the re-opens (--all skips both repo filter and confirm) ──
 echo "── ② board rows ──"

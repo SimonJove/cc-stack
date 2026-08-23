@@ -93,8 +93,9 @@ _gwt_bootstrap_wt() {
 # opened-tabs) goes through the cc-state facade — one lock, one access path
 # (docs/state-model.md). worktree.zsh keeps only the zsh interaction layer: the
 # gwt-* commands call the verbs, and the two shims below keep the function names
-# older callers (and test.sh) invoke directly. The ONE raw read left in this file
-# is gwt-tree's branch/ref scan — still awk -F'\t', never `IFS=$'\t' read`: TAB is
+# older callers (and test.sh) invoke directly. No file in this layer is opened by
+# name any more; the ONE row stream still parsed here is gwt-tree's branch/ref scan,
+# and it comes off `cc-state dump` — still awk -F'\t', never `IFS=$'\t' read`: TAB is
 # IFS *whitespace*, one empty field shifts every later field (2026-08-16 audit, F1).
 # cc-state sits next to this file when a worktree tests itself, else in the install dir.
 _gwt_state() {
@@ -103,8 +104,10 @@ _gwt_state() {
   echo "$HOME/.config/cc-stack/cc-state"
 }
 
-# ── Task list (worktree-tasks.tsv) maintenance ───────────────────────────────
-_gwt_tasks_file() { echo "${CC_TASKS_FILE:-$HOME/.config/cc-stack/worktree-tasks.tsv}" }
+# ── Task list maintenance ────────────────────────────────────────────────────
+# (there is deliberately no _gwt_tasks_file here any more: which FILE the task list
+# lives in is the facade's business, and after the engine swap there is no per-store
+# file to name. Everything below asks cc-state a question instead.)
 
 # Drop all records for a given dir (used by gwt-rm): task-drop's dir rule (raw or
 # canonical match). Kept as a named shim — gwt-rm and the regression suite call it.
@@ -271,16 +274,22 @@ gwt-tabs() {
 
 # gwt-prune — compact the task list: drop dead-dir records + keep only the newest per dir.
 #   One facade call sweeps the pair (tasks dir field + sidecar col 0) and compacts newest-per-dir;
-#   the messages below stay byte-identical to the hand-rolled era.
+#   the three messages below are the hand-rolled era's, with one recorded exception: a store the
+#   facade never wrote — a task file truncated to zero bytes by hand — now reads as "list is
+#   empty" (it holds no row) where the file-stat era said "✔ emptied" and unlinked it. The
+#   facade deletes every store IT empties, so this state is unreachable from the stack itself.
 gwt-prune() {
   emulate -L zsh
-  local f; f="$(_gwt_tasks_file)"
-  local had=0; [[ -f "$f" ]] && had=1
+  local st; st="$(_gwt_state)"
+  # The three messages are "had rows / had rows, none survived / had none", so the question
+  # asked before and after the sweep is the same one: does this store hold a row? `exists`
+  # answers it without naming a file, and the sweep itself already deletes a store it empties.
+  local had=0; "$st" exists tasks && had=1
   local rc=0
-  "$(_gwt_state)" task-prune --compact || rc=$?
+  "$st" task-prune --compact || rc=$?
   if (( rc )); then return $rc; fi   # the facade already said "compaction failed — task list left untouched"
   (( had )) || { echo "list is empty"; return 0 }
-  [[ -s "$f" ]] || { rm -f "$f"; echo "✔ emptied (no live records)"; return 0 }
+  "$st" exists tasks || { echo "✔ emptied (no live records)"; return 0 }
   echo "✔ task list compacted"
 }
 
@@ -365,13 +374,18 @@ gwt-tree() {
       [[ -n "$_gt_live" ]] && _gt_live_partial=1
     fi
   fi
-  local f; f="$(_gwt_tasks_file)"
-  if [[ -f "$f" ]]; then
-    local br="" rf=""
-    # branch + surface ref via awk -F'\t' (see the TSV access discipline): a read loop over the
-    # whole row shifts the ref onto whatever follows an empty caller field.
-    while IFS=$'\t' read -r br rf; do _gt_ref[$br]="$rf"; done < <(awk -F'\t' '$2 != "" {print $2 "\t" $3}' "$f")
-  fi
+  local br="" rf=""
+  # branch → surface ref, off the RAW row stream (`dump`, the same shape cc-board.sh's stale-ref
+  # probe reads), still awk -F'\t' (see the TSV access discipline): a read loop over the whole
+  # row shifts the ref onto whatever follows an empty caller field. An absent store dumps
+  # nothing, which is what the `[[ -f ]]` this replaced was for.
+  # NOT task-list: it answers the BOARD's question, not the file's — dead-dir rows dropped,
+  # newest-per-dir deduped, newest FIRST. Each of those breaks this scan. The dropped rows are
+  # exactly the hand-removed worktrees whose tab is still open (⌫closed would render as "-"),
+  # and the reversal inverts this loop's last-write-wins, handing a branch recorded in two dirs
+  # its OLDEST ref. Measured, not reasoned about: test.sh §37 pins both.
+  while IFS=$'\t' read -r br rf; do _gt_ref[$br]="$rf"; done \
+    < <("$(_gwt_state)" dump tasks | awk -F'\t' '$2 != "" {print $2 "\t" $3}')
   local branch parent ahead dirty dn
   while IFS=$'\t' read -r branch parent ahead dirty dn; do
     [[ -n "$branch" ]] || continue
