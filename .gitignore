@@ -4,6 +4,11 @@ worktree-tasks-archive.tsv
 opened-tabs.tsv
 cc-failures.log
 launch
+# python bytecode (cc-state is the repo's first python executable; importing it
+# for a test writes a __pycache__/ into whatever checkout it is imported from)
+__pycache__/
+*.pyc
+
 # backups
 *.bak.*
 .DS_Store

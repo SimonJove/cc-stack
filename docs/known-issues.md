@@ -555,3 +555,48 @@ cc-dispatch.sh resume                    # 按板行记录的 --resume <uuid> �
 
 **教训**:给运行中的 tab 发长指令一律走文件指针。技能文档对"简报"已经这么要求,
 但**打回清单、追加说明这类中途消息**同样适用,而且正是最容易图省事直接内联的地方。
+
+## python 管道写者的 BrokenPipe 噪音有**尺寸窗口**:采样一档就下结论会得到相反答案(2026-08-22,cc-state 门面)
+
+`cc-state dump archive | head -2` 这类"大输出接一个提前退出的消费方",漏不漏 85 字节的
+`Exception ignored while flushing sys.stdout: BrokenPipeError` 到 stderr,**取决于库的字节数**:
+
+```
+库大小        dump stderr(5 次)   task-list stderr(5 次)
+ 90893B            425                425      ← 窗口内,每次必漏
+113890B            425                425
+136890B              0                  0
+182893B              0                  0
+228893B              0                  0
+552894B              0                  0
+```
+
+窗口约 **90 KB – 136 KB**,窗口内 100% 复现。机理:`head` 读完两行就退出、写者填满 64 KB 管道缓冲,
+两者的先后是竞态。EPIPE 在 `main()` 内部冒出来时,`except BrokenPipeError` 接得住;
+在解释器退出时的最后一次 flush 里冒出来时,try/except 早已退出,handler 命中次数为 **0**——
+代码看着有 handler,实际没执行。
+
+**这条记在这里不是因为那 85 字节,是因为它让两个独立审查者得出了相反的结论。**
+gate 只在 ~114 KB 上量、只探了 `dump` 一条路径,判定"handler 是死代码、没修";
+父会话只在 228 KB 上量、探了两条路径,判定"两条都干净、结案"。两边的观测都是真的,
+两边的推广都不成立。定案靠的是**二分**,不是重申。
+
+**修法**(唯一确定性的):把 EPIPE 逼进 try 内部,别指望它自己冒到那里——
+
+```python
+try:
+    _rc = main(sys.argv[1:])
+    sys.stdout.flush()          # ← 没有这一行,窗口内 handler 永远不可达
+    sys.exit(_rc)
+except BrokenPipeError:
+    os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+    sys.exit(0)
+```
+
+**注意**:`except OSError: pass` 会顺手吃掉 `BrokenPipeError`(它是 OSError 子类)。
+`cc-state` 的 `cmd_dump` 曾因此在一条路径上"看起来修好了",实际是被局部吞掉的——
+同时也吞掉了真正的读错误(部分输出 + rc 0)。要吃就只吃 `BrokenPipeError`。
+
+**给后来者**:测这一类问题时,断言要钉在**已知会漏的尺寸**上(`cc-state` 的 §32 钉在 90–110 KB)。
+钉在干净档位的断言恒绿,而且看不出来它恒绿。可达性也别当合成场景:
+`worktree-tasks-archive.tsv` 只增不剪,会单调穿过这个窗口(约 470–720 条归档行)。

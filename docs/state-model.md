@@ -201,9 +201,16 @@ tab-add      <suuid> <owner> <dir> <session-id>
 tab-list     [--all]
 tab-resolve  <dir>                                   候选行按优先级全出（board 行 → tabs 台账），一行一个候选
 tab-owner    <suuid>                                 最终选定的 uuid 的 owner
-tab-prune    <live-uuid-list>                        证据完整才剪（今天的 !partial 不变量）
+tab-prune    <live-map-file>                         收原始 live map（不是抽好的 uuid 表），自己认哨兵
 dump         tasks|archive|tabs|status               打出今天格式的 TSV，供人 cat/grep 排查
 ```
+
+**为什么 `tab-prune` 收的是原始 live map 而不是一份 uuid 清单**（2026-08-22 gate 实测后改）：
+`!partial` 哨兵是 live map 里的**一行 1 字段**，而调用方抽 key 的那句
+`awk 'NF>=2{print toupper($2)}'` 恰好会把它丢掉——今天 `_cctabs_prune` 之所以安全，
+是因为它**先**查哨兵**再**抽 key。门面若只收抽好的清单，就永远看不见哨兵，
+§8 不变量 4 会从结构性保证降级成调用方约定，而那正是本次 campaign 五个提交在守的东西。
+收原始 map、自己认哨兵，这条不变量才重新变成门面自己担保的。
 
 **为什么 `task-mark-opened` 和 `task-add` 是两个动词**（2026-08-22 gate 实测后拆开）：
 `cc-dispatch.sh:711` 的注释是硬约束——*Only CHECK here; write the marker after success
