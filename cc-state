@@ -428,6 +428,24 @@ def cmd_task_set_state(args):
     rewrite("status", fn)
     return 0
 
+def cmd_task_clear_state(args):
+    """Drop a dir's sidecar rows. The counterpart of task-set-state, and the verb
+    resume and gwt-rm need: BOTH clear the agent-state row of a dir that is still
+    ALIVE, which no other verb does — task-prune only sweeps dirs that are gone and
+    task-drop only touches the task list. Deliberately NOT gated on board
+    membership the way task-set-state is: every caller clears precisely when the
+    task row is about to go away or has already gone, so requiring one would make
+    the verb a no-op exactly when it is needed. No matching row is a silent rc 0."""
+    if len(args) != 1:
+        return _usage("task-clear-state <dir>")
+    d = args[0]
+    c = canon(d)
+    def fn(rows):
+        return [l for l in rows
+                if not (len(fields(l)) >= 1 and dir_match(fields(l)[0], d, c))]
+    rewrite("status", fn)
+    return 0
+
 def _swap_suuid(la, u):
     """_ccres_setref's setsuuid: replace the suuid= segment of a launch-args field,
     keeping model= LAST (a model id may itself contain colons — every parser stops
@@ -763,7 +781,8 @@ VERBS = {
     "dump": cmd_dump,
     "task-add": cmd_task_add, "task-set-launch": cmd_task_set_launch,
     "task-get": cmd_task_get, "task-list": cmd_task_list,
-    "task-set-state": cmd_task_set_state, "task-set-ref": cmd_task_set_ref,
+    "task-set-state": cmd_task_set_state, "task-clear-state": cmd_task_clear_state,
+    "task-set-ref": cmd_task_set_ref,
     "task-drop": cmd_task_drop, "task-prune": cmd_task_prune,
     "task-archive": cmd_task_archive, "task-mark-opened": cmd_task_mark_opened,
     "task-opened-recently": cmd_task_opened_recently,

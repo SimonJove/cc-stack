@@ -2336,6 +2336,40 @@ done
 eq "32 C5 list path through the window leaks nothing (5 runs)" "$L32" "0"
 CC_ARCHIVE_FILE="$S32B/c5arch.tsv" "$CC/cc-state" dump archive 2>/dev/null | head -2 >/dev/null; r32c5=${PIPESTATUS[0]}
 eq "32 C5 rc stays 0 through the window" "$r32c5" "0"
+
+# ── task-clear-state: the sidecar counterpart of task-set-state ───────────────────
+# The verb resume (_ccres_dropstatus) and gwt-rm (_gwt_status_drop_dir) need and no
+# other verb provides: clearing the agent-state row of a dir that is still ALIVE.
+# task-prune only sweeps dirs that are GONE; task-drop only touches the task list.
+S32CL=$(mktemp -d); D32CL="$S32CL/live dir"; mkdir -p "$D32CL"   # NB: a SPACE in the path
+export CC_STATUS_FILE="$S32CL/s.tsv" CC_TASKS_FILE="$S32CL/t.tsv"
+P32CL="$(cd "$D32CL" && pwd -P)"
+printf '%s\tworking\t111\n%s\tblocked\t222\n' "$D32CL" "$S32CL/other" > "$CC_STATUS_FILE"
+: > "$CC_TASKS_FILE"          # deliberately EMPTY: clearing must not be gated on board membership
+"$CC/cc-state" task-clear-state "$D32CL"
+# spec 3.5 defect 1: _ccres_dropstatus' awk had no -F'\t', so it split on whitespace and a
+# dir with a space in it could never be dropped. Byte-matching on the field kills that class.
+eq "32 clear-state drops a dir whose path has a space" "$(grep -cF "$D32CL	" "$CC_STATUS_FILE")" "0"
+eq "32 clear-state leaves unrelated rows"              "$(grep -cF "$S32CL/other" "$CC_STATUS_FILE")" "1"
+eq "32 clear-state is not gated on board membership"   "$(wc -l < "$CC_STATUS_FILE" | tr -d ' ')" "1"
+# the file-header dir rule, both directions (macOS /var vs /private/var)
+printf '%s\tworking\t111\n%s\tidle\t222\n' "$D32CL" "$S32CL/other" > "$CC_STATUS_FILE"
+"$CC/cc-state" task-clear-state "$P32CL"
+eq "32 clear-state matches a logical row by its physical form" "$(grep -cF "$D32CL	" "$CC_STATUS_FILE")" "0"
+printf '%s\tworking\t111\n%s\tidle\t222\n' "$P32CL" "$S32CL/other" > "$CC_STATUS_FILE"
+"$CC/cc-state" task-clear-state "$D32CL"
+eq "32 clear-state matches a physical row by its logical form" "$(grep -cF "$P32CL	" "$CC_STATUS_FILE")" "0"
+# no match is a silent rc 0 (resume clears dirs that may have no row at all)
+c32cl="$("$CC/cc-state" task-clear-state /d/never-recorded 2>&1)"; rc32cl=$?
+eq "32 clear-state on an unknown dir is rc 0" "$rc32cl" "0"
+eq "32 clear-state on an unknown dir is silent" "$c32cl" ""
+# emptying the store removes the file, exactly as today's `[ -s ] || rm -f` does
+printf '%s\tworking\t111\n' "$P32CL" > "$CC_STATUS_FILE"
+"$CC/cc-state" task-clear-state "$P32CL"
+eq "32 clear-state emptying the store removes the file" \
+  "$([ -e "$CC_STATUS_FILE" ] && echo yes || echo no)" "no"
+rm -rf "$S32CL"
+
 rm -rf "$S32" "$S32B" "$S32R" "$S32RO" "$D32A" "$D32B" "$LIVE32" "$R32A" "$R32B" "$V32"
 rm -f "$S32/live.empty" "$S32/live.missing" "$S32/live.part" "$S32/live.one" "$S32/live.none" 2>/dev/null
 cc_sandbox_ledgers   # back to the sandbox before the next section
