@@ -128,7 +128,7 @@ done
 
 # ── 1. Executable bits ──
 say "▸ 1. executable bits"
-[ -n "$DRY" ] || chmod +x "$CC"/*.sh "$CC/cc-claude" "$CC/gwt-done" "$CC"/hooks/*.sh 2>/dev/null || true
+[ -n "$DRY" ] || chmod +x "$CC"/*.sh "$CC/cc-claude" "$CC/cc-state" "$CC/gwt-done" "$CC"/hooks/*.sh 2>/dev/null || true
 say "  ✓"
 
 # ── 2. Dependency check ──

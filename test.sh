@@ -1920,6 +1920,427 @@ rm -f "${TMPDIR:-/tmp}/cc-cmux-tabs/$(printf '%s' "$D0"  | shasum -a 1 | cut -d'
 unset CC_FAKE_LOG CC_FAKE_SCREEN
 
 echo ""
+echo "== 32. cc-state facade (Phase A: one lock, one access path, TSV backend) =="
+# The facade's contract under test (docs/state-model-plan.md Task 1–3): every verb's bytes on disk
+# are EXACTLY what today's hand-rolled awk/mkdir-lock code produces — same sanitization, same
+# fallbacks, same empty-set-deletes-file behaviour — so the round-2 lines can swap callers without
+# any observable change. mktemp everywhere (a worktree tests itself, siblings run in parallel).
+S32=$(mktemp -d); export CC_TASKS_FILE="$S32/t.tsv" CC_STATUS_FILE="$S32/s.tsv" \
+  CC_ARCHIVE_FILE="$S32/a.tsv" CC_TABS_FILE="$S32/b.tsv"
+printf '2026-01-01 00:00:00\tfeat/x\tsurface:1\t/d/x\tsurface:9\tdo x\tcamp\tuuid=u1\n' > "$CC_TASKS_FILE"
+eq "32 dump tasks is byte-identical" "$("$CC/cc-state" dump tasks)" "$(cat "$CC_TASKS_FILE")"
+eq "32 dump of a missing file is empty" "$("$CC/cc-state" dump tabs)" ""
+# no trailing newline may be invented or dropped: dump is a raw byte passthrough
+printf 'a\tb' > "$CC_TABS_FILE"
+eq "32 dump keeps a missing trailing newline" "$("$CC/cc-state" dump tabs | od -An -c | tr -d ' \n')" "$(od -An -c "$CC_TABS_FILE" | tr -d ' \n')"
+rm -f "$CC_TABS_FILE"
+# ... and a last line without its newline is still a ROW to the verbs, not chaff —
+# a reader that dropped it would turn the next rewrite into data loss
+S32X=$(mktemp -d); printf '2026-01-01 00:00:00\tfeat/nt\tsurface:1\t/d/nt\tc\trow sans newline\tcamp\t' > "$S32X/t.tsv"
+eq "32 no-trailing-newline row is still a row" \
+  "$(CC_TASKS_FILE="$S32X/t.tsv" "$CC/cc-state" task-get /d/nt | cut -f2)" "feat/nt"
+rm -rf "$S32X"
+# readers take no lock at all (today's readers don't): a held FRESH lock must
+# neither slow a read down nor be touched by it (a reading holder would make every
+# concurrent writer burn its 3s deadline and then write unlocked — round-2 B12)
+mkdir "$CC_TASKS_FILE.lock"
+t0=$(date +%s); "$CC/cc-state" dump tasks >/dev/null 2>&1; t1=$(date +%s)
+eq "32 reader ignores a held lock" "$(( t1 - t0 < 3 ? 1 : 0 ))" "1"
+eq "32 reader leaves a fresh lock alone" "$([ -d "$CC_TASKS_FILE.lock" ] && echo yes || echo no)" "yes"
+rmdir "$CC_TASKS_FILE.lock"
+# stale lock is reclaimed by the next WRITER rather than waited out (today every
+# writer burns its full ~3s loop against a dead holder's lock dir, forever;
+# CC_STATE_LOCK_STALE defaults to 60s) — and the reclaim must not eat the write
+mkdir "$CC_TASKS_FILE.lock"; touch -t 202601010000 "$CC_TASKS_FILE.lock"
+t0=$(date +%s); "$CC/cc-state" task-add /d/sl feat/sl s:1 'stale lock' p >/dev/null 2>&1; t1=$(date +%s)
+eq "32 stale lock reclaimed fast by a writer" "$(( t1 - t0 < 3 ? 1 : 0 ))" "1"
+eq "32 stale lock dir removed" "$([ -d "$CC_TASKS_FILE.lock" ] && echo yes || echo no)" "no"
+eq "32 write survived the reclaim" "$("$CC/cc-state" dump tasks | grep -c 'stale lock')" "1"
+
+# ── Task 2: the tasks-store verbs (byte contract of cc-board.sh log / cc-hooks.sh
+# status / the worktree.zsh rewriters / cc-dispatch.sh's $TMPDIR marker) ──────────
+S32B=$(mktemp -d); export CC_TASKS_FILE="$S32B/t.tsv" CC_STATUS_FILE="$S32B/s.tsv" \
+  CC_ARCHIVE_FILE="$S32B/a.tsv" CC_TABS_FILE="$S32B/b.tsv"
+# task-add / task-get: the placeholder row is exactly cc-board.sh log's row with
+# caller+largs left empty for task-set-launch to fill at the end of the dispatch
+"$CC/cc-state" task-add /d/y feat/y surface:2 'do y' camp
+eq "32 task-add appends"        "$("$CC/cc-state" task-get /d/y | cut -f2)" "feat/y"
+eq "32 task-add 8 fields"       "$("$CC/cc-state" task-get /d/y | awk -F'\t' '{print NF}')" "8"
+eq "32 placeholder caller+largs empty" "$("$CC/cc-state" task-get /d/y | awk -F'\t' '{print $5"|"$8}')" "|"
+"$CC/cc-state" task-get /d/nope >/dev/null 2>&1; eq "32 task-get miss rc1" "$?" "1"
+"$CC/cc-state" task-set-launch /d/y surface:9 'uuid=u2:pm=auto'
+eq "32 set-launch fills field 8" "$("$CC/cc-state" task-get /d/y | cut -f8)" "uuid=u2:pm=auto"
+eq "32 set-launch fills field 5" "$("$CC/cc-state" task-get /d/y | cut -f5)" "surface:9"
+# H1 byte oracle: same inputs through TODAY's writer (cc-board.sh log) and the facade
+# must produce the identical row — sanitization (tab/nl→space, |→/, 140/200 cut) and
+# both fallbacks (branch '?', the idle-prompt summary) included; only field 1 (time)
+# may differ. log gets the branch from git itself; task-add derives it (empty arg).
+# The task/largs texts are deliberately LONGER than the 140/200 cut lines so the
+# truncation itself is inside the oracle's compared bytes (round-2 B6: an oracle
+# fixture that never crosses the boundary proved nothing when the cap was mutated).
+LONGOR="$(printf 'or	task|test ')$(python3 -c 'print("x"*250)')"
+LONGOR2="$(printf 'uuid=o1:pm=auto	model ')$(python3 -c 'print("y"*250)')"
+"$CC/cc-board.sh" log /d/oracle s:5 c:9 "$LONGOR" feat/or "$LONGOR2"
+"$CC/cc-state" task-add /d/oracle '' s:5 "$LONGOR" feat/or
+"$CC/cc-state" task-set-launch /d/oracle c:9 "$LONGOR2"
+# last two rows of the file = today's writer (tail -2 head -1), then the facade's.
+# No NR guard (round-2 B6: `NR>1` on one-line input made both sides empty and the
+# assertion vacuous — it must actually compare bytes to be an oracle).
+flds32='{print $2"|"$3"|"$4"|"$5"|"$6"|"$7"|"$8}'
+eq "32 facade matches today's log writer field-for-field" \
+  "$(tail -1 "$CC_TASKS_FILE" | awk -F'\t' "$flds32")" \
+  "$(tail -2 "$CC_TASKS_FILE" | head -1 | awk -F'\t' "$flds32")"
+# B7: log's `ref="${2:-?}"` — an empty surface ref becomes '?' on BOTH sides
+"$CC/cc-board.sh" log /d/oref "" c:9 "ref fallback" feat/or2 "uuid=o2"
+"$CC/cc-state" task-add /d/oref '' '' "ref fallback" feat/or2
+"$CC/cc-state" task-set-launch /d/oref c:9 "uuid=o2"
+eq "32 empty ref falls back to ? on both sides" \
+  "$(tail -1 "$CC_TASKS_FILE" | awk -F'\t' "$flds32")" \
+  "$(tail -2 "$CC_TASKS_FILE" | head -1 | awk -F'\t' "$flds32")"
+# H1 fallbacks and truncation
+"$CC/cc-state" task-add /d/h3 feat/h3 s:1 "" p3
+eq "32 empty task falls back" "$("$CC/cc-state" task-get /d/h3 | cut -f6)" "(idle ccteam, no initial prompt)"
+LONG32=$(python3 -c 'print("x"*300)')
+"$CC/cc-state" task-set-launch /d/h3 c:1 "$LONG32"
+eq "32 largs truncated at 200" "$("$CC/cc-state" task-get /d/h3 | awk -F'\t' '{print length($8)}')" "200"
+eq "32 largs keeps pipes (no |→/)" "$("$CC/cc-state" task-set-launch /d/h3 c:1 'a|b' >/dev/null; "$CC/cc-state" task-get /d/h3 | cut -f8)" "a|b"
+# task-set-state: the hook's membership rule (no row → silent no-op, rc 0, no byte)
+"$CC/cc-state" task-set-state /d/nope working; rc=$?
+eq "32 set-state unknown dir rc0" "$rc" "0"
+eq "32 set-state unknown dir writes nothing" "$([ -s "$CC_STATUS_FILE" ] && echo yes || echo no)" "no"
+"$CC/cc-state" task-set-state /d/y working
+eq "32 set-state registered dir" "$(cut -f2 "$CC_STATUS_FILE")" "working"
+eq "32 sidecar row is dir\\tstate\\tepoch" "$(awk -F'\t' '$1=="/d/y"{print ($3 ~ /^[0-9]+$/)?"ok":"bad"}' "$CC_STATUS_FILE")" "ok"
+"$CC/cc-state" task-set-state /d/y ready; rc=$?
+eq "32 set-state refuses ready rc2" "$rc" "2"
+eq "32 sidecar never holds ready" "$(grep -c ready "$CC_STATUS_FILE")" "0"
+"$CC/cc-state" task-set-state /d/y idle
+eq "32 set-state newest wins" "$(awk -F'\t' '$1=="/d/y"{print $2}' "$CC_STATUS_FILE")" "idle"
+eq "32 sidecar one row per dir" "$(wc -l < "$CC_STATUS_FILE" | tr -d ' ')" "1"
+# the facade is a public entry: a TAB inside the state value must not split the row
+# (today's hook only ever passes a closed set, but nothing enforces that here)
+"$CC/cc-state" task-set-state /d/y "$(printf 'wor\tking')"
+eq "32 set-state collapses a tab in the value" \
+  "$(awk -F'\t' '$1=="/d/y"{print $2"|"(NF==3?"3f":NF"")}' "$CC_STATUS_FILE")" "wor king|3f"
+# task-set-ref: raw lines must round-trip byte-identically — empty middle fields stay
+# empty (the TAB-collapse class), and a 7-field legacy row must NOT gain a field
+# (spec §3.5 defect 6: _ccres_setref's $3=r OFS-rebuild was the one exception)
+printf '2026-01-01 00:00:00\tfeat/z\tsurface:3\t/d/z\t\tdo z\t\tuuid=u3\n' >> "$CC_TASKS_FILE"
+"$CC/cc-state" task-set-ref /d/z surface:33
+eq "32 set-ref rewrites field 3" "$("$CC/cc-state" task-get /d/z | cut -f3)" "surface:33"
+eq "32 empty fields survive rewrite" "$("$CC/cc-state" task-get /d/z | cut -f8)" "uuid=u3"
+eq "32 rewrite keeps field count" "$("$CC/cc-state" task-get /d/z | awk -F'\t' '{print NF}')" "8"
+printf '2026-01-01 00:00:00\tfeat/z7\tsurface:4\t/d/z7\tsurface:1\tseven field row\tmain\n' >> "$CC_TASKS_FILE"
+"$CC/cc-state" task-set-ref /d/z7 surface:44
+eq "32 7-field row keeps 7 fields" "$("$CC/cc-state" task-get /d/z7 | awk -F'\t' '{print NF}')" "7"
+# the launch-args suuid swap: existing suuid= replaced in place, model= stays LAST
+# (it may itself contain colons — every parser stops there)
+"$CC/cc-state" task-add /d/r feat/r s:6 'refresh me' camp
+"$CC/cc-state" task-set-launch /d/r c:1 'uuid=u9:pm=auto:csuuid=OLD:suuid=OLDS:model=m.1'
+"$CC/cc-state" task-set-ref /d/r surface:66 NEWSUUID-1234
+eq "32 set-ref swaps suuid, model last" "$("$CC/cc-state" task-get /d/r | cut -f8)" \
+  "uuid=u9:pm=auto:csuuid=OLD:suuid=NEWSUUID-1234:model=m.1"
+# task-list: newest-per-dir (canonical key, like the render's SEEN[c]), dead dirs
+# skipped at read time (like resume's -d test), newest-first output
+D32A="$(cd "$(mktemp -d)" && pwd -P)"; D32B="$(cd "$(mktemp -d)" && pwd -P)"
+printf '2026-01-01 00:00:00\tfeat/old\tsurface:2\t%s\tc:1\tfirst gen\tcamp\tuuid=o\n' "$D32A" >> "$CC_TASKS_FILE"
+printf '2026-01-02 00:00:00\tfeat/new\tsurface:3\t%s\tc:1\tsecond gen\tcamp\tuuid=n\n' "$D32A" >> "$CC_TASKS_FILE"
+printf '2026-01-01 00:00:00\tfeat/other\tsurface:4\t%s\tc:1\tother repo\tcamp\t\n' "$D32B" >> "$CC_TASKS_FILE"
+eq "32 task-list newest per dir" "$("$CC/cc-state" task-list | grep -c "$D32A")" "1"
+eq "32 task-list keeps the newest row" "$("$CC/cc-state" task-list | grep "$D32A" | cut -f2)" "feat/new"
+eq "32 task-list hides dead dirs" "$("$CC/cc-state" task-list | grep -c '/d/')" "0"
+eq "32 task-list renders newest-first" "$("$CC/cc-state" task-list | head -1 | cut -f4)" "$D32B"
+D32N="$D32A/nested"; mkdir -p "$D32N"
+printf '2026-01-01 00:00:00\tfeat/nest\tsurface:5\t%s\tc:1\tnested\tcamp\t\n' "$D32N" >> "$CC_TASKS_FILE"
+eq "32 task-list --repo keeps rows under root" "$("$CC/cc-state" task-list --repo "$D32A" | grep -c "$D32N")" "1"
+eq "32 task-list --repo drops foreign rows" "$("$CC/cc-state" task-list --repo "$D32A" | grep -c "$D32B")" "0"
+# --archive: the archive is a history — every row, file order, no dead-dir skip
+printf '2026-01-01 00:00:00\tfeat/done\tsurface:9\t%s\tc:1\tdone task\tcamp\tuuid=d\t1700000000\n' "$D32A" >> "$CC_ARCHIVE_FILE"
+printf '2026-01-02 00:00:00\tfeat/done\tsurface:9\t%s\tc:1\tdone task 2\tcamp\tuuid=d2\t1700000001\n' "$D32A" >> "$CC_ARCHIVE_FILE"
+eq "32 task-list --archive keeps every row" "$("$CC/cc-state" task-list --archive | grep -c 'done task')" "2"
+# task-drop: raw-dir match (what gwt-rm feeds), and H2 — an emptied store deletes the file
+"$CC/cc-state" task-drop "$D32B"
+eq "32 task-drop removes the dir's rows" "$(grep -c "$D32B" "$CC_TASKS_FILE")" "0"
+S32C=$(mktemp -d)
+CC_TASKS_FILE="$S32C/one.tsv" "$CC/cc-state" task-add /d/solo feat/s s:1 solo p
+CC_TASKS_FILE="$S32C/one.tsv" "$CC/cc-state" task-drop /d/solo
+eq "32 empty row set deletes the file" "$([ -f "$S32C/one.tsv" ] && echo yes || echo no)" "no"
+rm -rf "$S32C"
+# task-prune: sweeps dead-dir rows from the task list AND the sidecar (both real
+# callers — board prune-on-read and gwt-prune — always sweep the pair)
+LIVE32="$(cd "$(mktemp -d)" && pwd -P)"
+printf '2026-01-01 00:00:00\tfeat/live\tsurface:6\t%s\tc:1\tlive row\tcamp\t\n' "$LIVE32" >> "$CC_TASKS_FILE"
+printf '%s\tidle\t200\n/d/dead\tworking\t100\n' "$LIVE32" > "$CC_STATUS_FILE"
+"$CC/cc-state" task-prune
+eq "32 task-prune sweeps dead task rows" "$(grep -c '/d/' "$CC_TASKS_FILE")" "0"
+eq "32 task-prune keeps live task rows" "$(grep -c "$LIVE32" "$CC_TASKS_FILE")" "1"
+eq "32 task-prune sweeps the sidecar too" "$(grep -c '/d/dead' "$CC_STATUS_FILE")" "0"
+eq "32 task-prune keeps live sidecar rows" "$(grep -c "$LIVE32" "$CC_STATUS_FILE")" "1"
+# task-archive: row verbatim + merged-at (8→9 fields), moved dirs on stdout, sidecar
+# rows of the moved dirs swept (the _gwt_archive_branch contract)
+"$CC/cc-state" task-set-state "$D32A" blocked          # the moved dir gets a sidecar row
+moved="$("$CC/cc-state" task-archive feat/new trunk)"
+eq "32 archive returns moved dirs" "$moved" "$D32A"
+eq "32 archive row keeps fields verbatim" "$(grep 'feat/new' "$CC_ARCHIVE_FILE" | tail -1 | cut -f6)" "second gen"
+eq "32 archive appends merged-at (9 fields)" "$(awk -F'\t' '$2=="feat/new"{print NF}' "$CC_ARCHIVE_FILE" | tail -1)" "9"
+eq "32 archive moves rows out of tasks" "$(grep -c 'feat/new' "$CC_TASKS_FILE")" "0"
+eq "32 archive sweeps the sidecar for moved dirs" "$(grep -c "$D32A" "$CC_STATUS_FILE")" "0"
+eq "32 archive keeps other sidecar rows" "$(grep -c "$LIVE32" "$CC_STATUS_FILE")" "1"
+# the dedup marker (Phase A's tab_opened_ts) says "a tab actually opened", so
+# task-add must NOT stamp it (a failed dispatch must leave no blocking marker —
+# B5); task-mark-opened does, and the hash is today's: sha1 of the dir bytes, no
+# trailing newline. TMPDIR scoped per call.
+env TMPDIR="$S32B" "$CC/cc-state" task-add /d/m1 feat/m s:1 marker p
+M32="cc-cmux-tabs/$(printf '%s' /d/m1 | shasum -a 1 | cut -d' ' -f1)"
+eq "32 task-add does not stamp the marker" "$([ -e "$S32B/$M32" ] && echo yes || echo no)" "no"
+env TMPDIR="$S32B" "$CC/cc-state" task-opened-recently /d/m1 120; eq "32 opened-recently false before mark" "$?" "1"
+env TMPDIR="$S32B" "$CC/cc-state" task-mark-opened /d/m1; eq "32 mark-opened rc0" "$?" "0"
+eq "32 mark-opened writes the marker" "$([ -e "$S32B/$M32" ] && echo yes || echo no)" "yes"
+env TMPDIR="$S32B" "$CC/cc-state" task-opened-recently /d/m1 120; eq "32 opened-recently rc0 in window" "$?" "0"
+touch -t 202601010000 "$S32B/$M32"
+env TMPDIR="$S32B" "$CC/cc-state" task-opened-recently /d/m1 120; eq "32 opened-recently rc1 outside window" "$?" "1"
+env TMPDIR="$S32B" "$CC/cc-state" task-opened-recently /d/never 120; eq "32 opened-recently rc1 without marker" "$?" "1"
+
+# ── Task 3: the tabs-store verbs (byte contract of _cctabs_log / _cctabs_by_dir /
+# _cctabs_owner / _cctabs_prune) ─────────────────────────────────────────────────
+"$CC/cc-state" tab-add aaaa-1 bbbb-2 /d/y sid-1
+eq "32 tab-add uppercases uuids" "$(cut -f1,2 "$CC_TABS_FILE")" "$(printf 'AAAA-1\tBBBB-2')"
+"$CC/cc-state" tab-add CCCC-3 '' /d/z ''
+eq "32 tab-add writes - for empty owner/session" "$(tail -1 "$CC_TABS_FILE" | cut -f2,4)" "$(printf -- '-\t-')"
+N32=$(wc -l < "$CC_TABS_FILE" | tr -d ' ')
+"$CC/cc-state" tab-add 'surface:9' OW /d/w s9; rc=$?
+eq "32 tab-add non-uuid suuid rc0" "$rc" "0"
+eq "32 tab-add non-uuid suuid writes no row" "$(wc -l < "$CC_TABS_FILE" | tr -d ' ')" "$N32"
+"$CC/cc-state" tab-add DDDD-4 'surface:7' /d/w2 s4
+eq "32 tab-add non-uuid owner becomes -" "$(tail -1 "$CC_TABS_FILE" | cut -f2)" "-"
+# tab-list: default = only this session's rows (session = CC_CALLER_SURFACE_UUID /
+# CMUX_SURFACE_ID, uppercased); --all = every row; no session identity at all = no filter
+eq "32 tab-list default = this session's rows" \
+  "$(CC_CALLER_SURFACE_UUID=BBBB-2 "$CC/cc-state" tab-list | wc -l | tr -d ' ')" "1"
+eq "32 tab-list --all = every row" "$("$CC/cc-state" tab-list --all | wc -l | tr -d ' ')" "3"
+eq "32 tab-list with no session shows all" \
+  "$(env -u CC_CALLER_SURFACE_UUID -u CMUX_SURFACE_ID "$CC/cc-state" tab-list | wc -l | tr -d ' ')" "3"
+# tab-owner: the NEWEST ledger row for the uuid that actually names an owner
+printf 'AAAA-1\tEEEE-9\t/d/y\ts2\t2026-01-02 00:00:00\n' >> "$CC_TABS_FILE"
+eq "32 tab-owner newest non-dash owner" "$("$CC/cc-state" tab-owner aaaa-1)" "EEEE-9"
+"$CC/cc-state" tab-owner NOPE-0 >/dev/null 2>&1; eq "32 tab-owner miss rc1" "$?" "1"
+# tab-resolve (spec §4, round-2 shape): ALL ledger candidates in priority order,
+# one `source \t suuid \t owner \t branch` line each — the facade gives evidence,
+# close keeps the liveness cascade. Board candidate first: its largs suuid/owner;
+# the tabs candidate follows and is NOT crowded out by a bad board value.
+"$CC/cc-state" task-add /d/tb feat/tb s:7 'resolve me' camp
+"$CC/cc-state" task-set-launch /d/tb c:8 'uuid=u77:pm=auto:csuuid=CS-1:suuid=AAAA-1:model=m'
+"$CC/cc-state" tab-add FFFF-5 OTHER-9 /d/tb sX
+eq "32 tab-resolve emits board then tabs" "$("$CC/cc-state" tab-resolve /d/tb)" \
+  "$(printf 'board\tAAAA-1\tCS-1\tfeat/tb\ntabs\tFFFF-5\t-\t-')"
+# B3 fixture 1: a recorded SHORT REF is an address, never an identity — the board
+# candidate is dropped (not emitted as "surface") and the real tabs candidate shows
+"$CC/cc-state" task-add /d/sr feat/sr s:7 'short ref' camp
+"$CC/cc-state" task-set-launch /d/sr c:8 'uuid=u:suuid=surface:283:model=m'
+"$CC/cc-state" tab-add EEEE-1 FFFF-2 /d/sr sR
+eq "32 tab-resolve drops a non-uuid identity" "$("$CC/cc-state" tab-resolve /d/sr)" \
+  "$(printf 'tabs\tEEEE-1\tFFFF-2\t-')"
+# B3 fixture 2: identities come back UPPERCASED, like every close comparison
+"$CC/cc-state" task-add /d/sr2 feat/sr2 s:7 'lowercase' camp
+"$CC/cc-state" task-set-launch /d/sr2 c:8 'uuid=u:csuuid=abcd-1:suuid=beef-2'
+eq "32 tab-resolve uppercases identities" "$("$CC/cc-state" tab-resolve /d/sr2)" \
+  "$(printf 'board\tBEEF-2\tABCD-1\tfeat/sr2')"
+# board row without a suuid → only the opened-tabs candidate answers
+"$CC/cc-state" task-add /d/tb2 feat/tb2 s:7 'fallback' camp
+"$CC/cc-state" task-set-launch /d/tb2 c:8 'uuid=u78:pm=auto'
+"$CC/cc-state" tab-add 1111-6 2222-7 /d/tb2 sY
+eq "32 tab-resolve falls back to opened-tabs" "$("$CC/cc-state" tab-resolve /d/tb2)" \
+  "$(printf 'tabs\t1111-6\t2222-7\t-')"
+# board row with a suuid but no csuuid → owner from the ledger's newest row for
+# THAT suuid (close's by-uuid fallback; the by-dir owner is dead code there)
+"$CC/cc-state" task-add /d/tb3 feat/tb3 s:7 'owner fallback' camp
+"$CC/cc-state" task-set-launch /d/tb3 c:8 'uuid=u79:pm=auto:suuid=3333-8'
+"$CC/cc-state" tab-add 3333-8 '' /d/tb3 sZ
+"$CC/cc-state" tab-add 3333-8 4444-9 /d/tb3 sZ2
+eq "32 tab-resolve owner falls back to the ledger" "$("$CC/cc-state" tab-resolve /d/tb3)" \
+  "$(printf 'board\t3333-8\t4444-9\tfeat/tb3\ntabs\t3333-8\t4444-9\t-')"
+"$CC/cc-state" tab-resolve /d/void >/dev/null 2>&1; eq "32 tab-resolve nothing rc1" "$?" "1"
+eq "32 tab-resolve nothing prints nothing" "$("$CC/cc-state" tab-resolve /d/void)" ""
+# tab-prune takes the RAW live map (`ref \t uuid [\t ws]` lines) and recognizes the
+# !partial sentinel ITSELF (B8): completeness is structural here, not caller
+# discipline — a pre-extracted uuid list has already thrown the completeness bit
+# away. No evidence — empty map, missing map, PARTIAL map — prunes not one row.
+B32=$("$CC/cc-state" tab-list --all | wc -l | tr -d ' ')
+: > "$S32/live.empty"
+"$CC/cc-state" tab-prune "$S32/live.empty"; rc=$?
+eq "32 tab-prune empty evidence rc0" "$rc" "0"
+eq "32 tab-prune empty evidence prunes nothing" "$("$CC/cc-state" tab-list --all | wc -l | tr -d ' ')" "$B32"
+"$CC/cc-state" tab-prune "$S32/live.missing"; eq "32 tab-prune missing evidence file rc0" "$?" "0"
+printf 'surface:1\tAAAA-1\tworkspace:1\n!partial\n' > "$S32/live.part"
+"$CC/cc-state" tab-prune "$S32/live.part"; rc=$?
+eq "32 tab-prune partial map rc0" "$rc" "0"
+eq "32 tab-prune partial map prunes nothing" "$("$CC/cc-state" tab-list --all | wc -l | tr -d ' ')" "$B32"
+printf 'surface:1\taaaa-1\tworkspace:1\n' > "$S32/live.one"   # lowercase uuid: keys fold like toupper($2)
+"$CC/cc-state" tab-prune "$S32/live.one"
+eq "32 tab-prune keeps live uuids (case-folded)" "$("$CC/cc-state" tab-list --all | wc -l | tr -d ' ')" "2"
+eq "32 tab-prune dropped the dead" "$("$CC/cc-state" tab-list --all | cut -f1 | sort -u)" "AAAA-1"
+printf 'surface:1\tZZZZ-0\tworkspace:1\n' > "$S32/live.none"
+"$CC/cc-state" tab-prune "$S32/live.none"
+eq "32 tab-prune all-dead removes the file" "$([ -f "$CC_TABS_FILE" ] && echo yes || echo no)" "no"
+# the CLI surface itself
+eq "32 help lists every verb" "$("$CC/cc-state" --help 2>&1 | grep -oE 'task-add|tab-prune|dump' | wc -l | tr -d ' ')" "3"
+"$CC/cc-state" bogus-verb >/dev/null 2>&1; eq "32 unknown verb rc2" "$?" "2"
+printf '/d/x\tworking\t123\n' > "$CC_STATUS_FILE"
+eq "32 dump status works" "$("$CC/cc-state" dump status)" "$(printf '/d/x\tworking\t123')"
+
+# ── round-2 gate fixes ──────────────────────────────────────────────────────────
+# B1: read→transform→write must sit inside ONE lock hold (the shell shape). A
+# plain-campaign race: 40 concurrent appends against 40 concurrent rewrites of the
+# same pre-existing row — every one of the 41 records must survive.
+S32R=$(mktemp -d); R32="$S32R/race"; mkdir -p "$R32"
+CC_TASKS_FILE="$S32R/t.tsv" "$CC/cc-state" task-add "$R32" feat/race s:1 'race seed' p
+for i in $(seq 1 40); do mkdir -p "$S32R/w$i"; done
+for i in $(seq 1 40); do
+  ( CC_TASKS_FILE="$S32R/t.tsv" "$CC/cc-state" task-add "$S32R/w$i" "feat/w$i" s:1 "race $i" p ) &
+  ( CC_TASKS_FILE="$S32R/t.tsv" "$CC/cc-state" task-set-ref "$R32" "surface:$i" "UUID-$i" ) &
+done
+wait
+eq "32 no row lost to a concurrent rewrite (B1)" "$(wc -l < "$S32R/t.tsv" | tr -d ' ')" "41"
+eq "32 every raced append survived" "$(grep -c "race [0-9]" "$S32R/t.tsv")" "40"
+# B2: one stray non-UTF-8 byte must not take the list verbs down (awk doesn't);
+# must hold in a UTF-8 locale AND under LC_ALL=C
+printf 'AAAA-1\tBBBB-2\t/d/nf\t-\tts\nCCCC-3\t-\t/d/nf2\t-\tts\nDDDD-4\tBBBB-2\t/d/nf\xff3\t-\tts\n' > "$CC_TABS_FILE"
+o32a="$(LANG=en_US.UTF-8 "$CC/cc-state" tab-list --all 2>/dev/null)"; r32a=$?
+eq "32 non-UTF-8 byte survives a UTF-8 locale" "$r32a$(printf '%s\n' "$o32a" | wc -l | tr -d ' ')" "03"
+o32b="$(LC_ALL=C "$CC/cc-state" tab-list --all 2>/dev/null)"; r32b=$?
+eq "32 non-UTF-8 byte survives LC_ALL=C" "$r32b$(printf '%s\n' "$o32b" | wc -l | tr -d ' ')" "03"
+# B4: a truncated 1-field row is skipped/shown, never a traceback
+printf 'AAAA-1\n' > "$CC_TABS_FILE"
+CC_CALLER_SURFACE_UUID=BBBB-2 "$CC/cc-state" tab-list >/dev/null 2>&1; eq "32 short row: default filter rc0" "$?" "0"
+eq "32 short row still listed with --all" "$("$CC/cc-state" tab-list --all | wc -l | tr -d ' ')" "1"
+# B9: --all disables the repo filter, in either flag order (cc-board.sh's contract)
+R32A="$(cd "$(mktemp -d)" && pwd -P)"; R32B="$(cd "$(mktemp -d)" && pwd -P)"
+printf '2026-01-01 00:00:00\tfeat/ra\ts:1\t%s\tc:1\ta row\tcamp\t\n' "$R32A" >> "$CC_TASKS_FILE"
+printf '2026-01-01 00:00:00\tfeat/rb\ts:1\t%s\tc:1\tb row\tcamp\t\n' "$R32B" >> "$CC_TASKS_FILE"
+eq "32 --repo alone filters"       "$("$CC/cc-state" task-list --repo "$R32A" | grep -c "$R32B")" "0"
+eq "32 --all after --repo disables" "$("$CC/cc-state" task-list --repo "$R32A" --all | grep -c "$R32B")" "1"
+eq "32 --all before --repo disables" "$("$CC/cc-state" task-list --all --repo "$R32A" | grep -c "$R32B")" "1"
+# B10: ONE dir rule for every verb — a LOGICAL-path row (/var → /private/var on
+# macOS) must be found by a canonical caller, and the reverse; new writes are
+# canonicalized (write-side normalization, spec §3.5 defect 3)
+V32="$(mktemp -d)"; V32C="$(cd "$V32" && pwd -P)"
+[ "$V32" != "$V32C" ] || { echo "  ✗ 32 fixture needs a logical path (mktemp under /var)"; fail=$((fail+1)); }
+printf '2026-01-01 00:00:00\tfeat/v\ts:1\t%s\tc:1\tlogical row\tcamp\tuuid=u1:pm=auto:csuuid=CCCC-1:suuid=DDDD-1\n' "$V32" > "$CC_TASKS_FILE"
+eq "32 logical row found by canonical caller (get)" "$("$CC/cc-state" task-get "$V32C" | cut -f2)" "feat/v"
+"$CC/cc-state" task-set-launch "$V32C" c2 'uuid=u1:pm=auto:csuuid=CCCC-1:suuid=DDDD-1'
+eq "32 logical row found by canonical caller (set-launch)" "$("$CC/cc-state" task-get "$V32" | cut -f5)" "c2"
+"$CC/cc-state" task-set-state "$V32C" working
+eq "32 logical row found by canonical caller (set-state)" "$(awk -F'\t' -v d="$V32C" '$1==d{print $2}' "$CC_STATUS_FILE")" "working"
+"$CC/cc-state" task-set-ref "$V32C" s:9
+eq "32 logical row found by canonical caller (set-ref)" "$("$CC/cc-state" task-get "$V32" | cut -f3)" "s:9"
+"$CC/cc-state" tab-add EEEE-2 FFFF-3 "$V32" sV
+eq "32 logical dir found by canonical caller (tab-resolve)" "$("$CC/cc-state" tab-resolve "$V32C" | head -1)" \
+  "$(printf 'board\tDDDD-1\tCCCC-1\tfeat/v')"
+"$CC/cc-state" task-drop "$V32C"
+eq "32 logical row found by canonical caller (drop)" \
+  "$([ -f "$CC_TASKS_FILE" ] && grep -c "feat/v" "$CC_TASKS_FILE" || echo 0)" "0"
+"$CC/cc-state" task-add "$V32" feat/v2 s:1 'written logical' p
+eq "32 task-add canonicalizes what it writes" "$("$CC/cc-state" dump tasks | grep -c "$V32C")" "1"
+eq "32 ...and drops the logical form" "$(awk -F'\t' -v d="$V32" '$4==d' "$CC_TASKS_FILE" | wc -l | tr -d ' ')" "0"
+# B11: a failed archive rewrite is LOUD (rc 1 + stderr), tasks untouched — a
+# read-only store dir makes the tmp-write fail while the archive stays writable
+S32RO=$(mktemp -d)
+printf '2026-01-01 00:00:00\tfeat/ro\ts:1\t/d/ro\tc:1\tread only\tcamp\t\n' > "$S32RO/t.tsv"
+chmod 555 "$S32RO"
+CC_TASKS_FILE="$S32RO/t.tsv" CC_ARCHIVE_FILE="$S32B/ro-arch.tsv" \
+  "$CC/cc-state" task-archive feat/ro trunk >/dev/null 2>"$S32B/ro-err"; r32ro=$?
+chmod 755 "$S32RO"
+eq "32 archive rewrite failure is loud rc1" "$r32ro" "1"
+eq "32 archive rewrite failure says so" "$(grep -c 'archive rewrite failed' "$S32B/ro-err")" "1"
+eq "32 tasks left untouched on failure" "$(wc -l < "$S32RO/t.tsv" | tr -d ' ')" "1"
+# B13: a downstream `| head` must not leak a traceback onto stderr
+python3 -c 'import sys
+open(sys.argv[1],"w").write("".join(
+  "2026-01-01 00:00:00\tfeat/b%d\ts:1\t/d/b%d\tc\trow %d\tcamp\t\n" % (i, i, i)
+  for i in range(5000)))' "$S32B/big.tsv"
+CC_TASKS_FILE="$S32B/big.tsv" "$CC/cc-state" dump tasks 2>"$S32B/bp-err" | head -2 >/dev/null
+eq "32 broken pipe is silent" "$([ -s "$S32B/bp-err" ] && echo noise || echo quiet)" "quiet"
+python3 -c 'import sys
+open(sys.argv[1],"w").write("".join(
+  "AAAA-%04d\tBBBB-2\t/d/t%d\t-\t2026-01-01 00:00:00\n" % (i, i)
+  for i in range(5000)))' "$S32B/bigtabs.tsv"
+CC_TABS_FILE="$S32B/bigtabs.tsv" "$CC/cc-state" tab-list --all 2>>"$S32B/bp-err" | head -2 >/dev/null
+eq "32 broken pipe is silent (list path)" "$([ -s "$S32B/bp-err" ] && echo noise || echo quiet)" "quiet"
+# B14: a dir with a raw non-UTF-8 byte (from argv) must not crash the verbs that
+# hash it — fsencode, not str.encode
+BD32=$(printf '/d/bad\xff')
+env TMPDIR="$S32B" "$CC/cc-state" task-mark-opened "$BD32"; eq "32 non-UTF-8 dir: mark-opened rc0" "$?" "0"
+env TMPDIR="$S32B" "$CC/cc-state" task-opened-recently "$BD32" 120; eq "32 non-UTF-8 dir: marker round-trips" "$?" "0"
+"$CC/cc-state" task-add "$BD32" feat/bd s:1 'bad bytes dir' p; eq "32 non-UTF-8 dir: task-add rc0" "$?" "0"
+eq "32 non-UTF-8 dir: row round-trips" "$("$CC/cc-state" task-get "$BD32" | wc -l | tr -d ' ')" "1"
+
+# ── round-3 gate hardening ──────────────────────────────────────────────────────
+# C1: rewrite()'s change detection must hold even against a fn that mutates its
+# argument IN PLACE and returns it (the mutation has to land, not be silently
+# skipped because out and rows are the same object) — driven at module level,
+# the way the gate reproduced it
+C1OUT=$(python3 - "$CC/cc-state" "$S32B/c1.tsv" <<'PY'
+import importlib.util, os, sys
+from importlib.machinery import SourceFileLoader
+sys.dont_write_bytecode = True   # no __pycache__/ next to the repo's cc-state
+loader = SourceFileLoader("ccstate", sys.argv[1])   # no .py extension → explicit loader
+spec = importlib.util.spec_from_loader("ccstate", loader)
+m = importlib.util.module_from_spec(spec); loader.exec_module(m)
+os.environ["CC_TASKS_FILE"] = sys.argv[2]
+m.append_line("tasks", "a\tb")
+def inplace(rows):
+    rows.append("c\td")           # mutates and returns the SAME list object
+    return rows
+m.rewrite("tasks", inplace)
+sys.stdout.write(str(len(open(sys.argv[2]).read().splitlines())))
+PY
+)
+eq "32 rewrite fires even for an in-place fn (C1)" "$C1OUT" "2"
+# C2: the !partial sentinel must survive sloppy whitespace — '!partial ' or
+# '!partial\r' still means "evidence incomplete", and pruning stays off
+printf 'AAAA-1\tBBBB-2\t/d/c2\t-\tts\nCCCC-3\t-\t/d/c2b\t-\tts\n' > "$CC_TABS_FILE"
+printf 'surface:1\tAAAA-1\tworkspace:1\n!partial \n' > "$S32/live.ps"
+"$CC/cc-state" tab-prune "$S32/live.ps"; r32ps=$?
+eq "32 sentinel with trailing space: rc0" "$r32ps" "0"
+eq "32 sentinel with trailing space: nothing pruned" "$("$CC/cc-state" tab-list --all | wc -l | tr -d ' ')" "2"
+printf 'surface:1\tAAAA-1\tworkspace:1\n!partial\r\n' > "$S32/live.cr"
+"$CC/cc-state" tab-prune "$S32/live.cr"
+eq "32 sentinel with CR: nothing pruned" "$("$CC/cc-state" tab-list --all | wc -l | tr -d ' ')" "2"
+# C3: dump must not swallow genuine read errors (a blanket except OSError would
+# report partial output as success); a MISSING store stays silent rc 0
+CC_TASKS_FILE="$S32B" "$CC/cc-state" dump tasks >/dev/null 2>&1; r32dir=$?
+eq "32 dump read error is loud" "$r32dir" "1"
+CC_TASKS_FILE="$S32B/none.tsv" "$CC/cc-state" dump tasks; r32none=$?
+eq "32 dump missing file stays silent rc0" "$r32none" "0"
+# C5: the BrokenPipe leak had a SIZE window (~90–136KB): the write returns cleanly,
+# head exits, and EPIPE only surfaces at the interpreter's exit-time flush — outside
+# every handler. Pin the fixture INSIDE the window and run both paths 5×: the
+# in-main flush must make the handler reachable at every size
+python3 -c 'import sys
+open(sys.argv[1], "w").write("".join(
+  "2026-01-01 00:00:00\tfeat/c5-%04d\tsurface:1\t/d/c5-%04d\tc:1\tc5 archive row %04d sized into the pipe leak window\tcamp\tuuid=u:pm=auto\t1700000000\n"
+  % (i, i, i) for i in range(800)))' "$S32B/c5arch.tsv"
+SZ32=$(wc -c < "$S32B/c5arch.tsv" | tr -d ' ')
+eq "32 C5 fixture sits inside the 90-136KB leak window" "$(( SZ32 >= 90000 && SZ32 <= 136000 ? 1 : 0 ))" "1"
+L32=0
+for i in 1 2 3 4 5; do
+  CC_ARCHIVE_FILE="$S32B/c5arch.tsv" "$CC/cc-state" dump archive 2>"$S32B/c5e1" | head -2 >/dev/null
+  [ -s "$S32B/c5e1" ] && L32=$((L32+1))
+done
+eq "32 C5 dump through the window leaks nothing (5 runs)" "$L32" "0"
+L32=0
+for i in 1 2 3 4 5; do
+  CC_ARCHIVE_FILE="$S32B/c5arch.tsv" "$CC/cc-state" task-list --archive 2>"$S32B/c5e2" | head -2 >/dev/null
+  [ -s "$S32B/c5e2" ] && L32=$((L32+1))
+done
+eq "32 C5 list path through the window leaks nothing (5 runs)" "$L32" "0"
+CC_ARCHIVE_FILE="$S32B/c5arch.tsv" "$CC/cc-state" dump archive 2>/dev/null | head -2 >/dev/null; r32c5=${PIPESTATUS[0]}
+eq "32 C5 rc stays 0 through the window" "$r32c5" "0"
+rm -rf "$S32" "$S32B" "$S32R" "$S32RO" "$D32A" "$D32B" "$LIVE32" "$R32A" "$R32B" "$V32"
+rm -f "$S32/live.empty" "$S32/live.missing" "$S32/live.part" "$S32/live.one" "$S32/live.none" 2>/dev/null
+cc_sandbox_ledgers   # back to the sandbox before the next section
+
+echo ""
 echo "== 21. dispatch path resolution: target repo root + the opened-tabs prune =="
 # F10 — `git rev-parse --git-common-dir` answers with an ABSOLUTE path when the target is a LINKED
 # WORKTREE but with the bare RELATIVE `.git` when it is a MAIN CHECKOUT (live-probed 2026-08-16,
@@ -3399,6 +3820,8 @@ rm -rf "$GT2"
 echo "== syntax =="
 for s in "$CC"/*.sh "$CC"/hooks/*.sh; do bash -n "$s" && : || { echo "  ✗ syntax $s"; fail=$((fail+1)); }; done
 zsh -n "$CC/worktree.zsh" && ok "worktree.zsh syntax" || { no "worktree.zsh syntax" x x; }
+python3 -c 'import sys; compile(open(sys.argv[1]).read(), sys.argv[1], "exec")' "$CC/cc-state" \
+  && ok "cc-state compiles" || { no "cc-state compiles" x x; }
 
 echo ""
 echo "== 10. zsh commands present =="
