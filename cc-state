@@ -1,0 +1,801 @@
+#!/usr/bin/env python3
+"""cc-stack · cc-state — the single reader/writer of the stack's state stores.
+
+Phase A (docs/state-model.md §7): the backend is still today's four TSV files, byte
+for byte. What changes is that there is now ONE implementation of the locking and of
+every field access, instead of nine mkdir-lock copies and 46 awk parse points spread
+over cc-hooks.sh / cc-board.sh / cc-dispatch.sh / worktree.zsh. Producers switch to
+this facade in later tasks; until then the old writers interoperate — same lock file
+path (<file>.lock, atomic mkdir; macOS has no flock), same append discipline.
+
+Verb contract (spec §4): each subcommand answers ONE caller question; output is TSV
+with no header, stdout only; errors go to stderr. rc: 0 = success (including the
+deliberate silent no-ops that mirror today's callers), 1 = a query that found
+nothing (task-get / tab-owner / tab-resolve / task-opened-recently), 2 = usage
+error. Safe to call from sh: nothing reads stdin, no output on failure paths that
+today are silent.
+
+Stores and their overrides (same env names the sandbox uses):
+  tasks   CC_TASKS_FILE    worktree-tasks.tsv           time\\tbranch\\tsurface\\tdir\\tcaller\\ttask\\tparent\\tlargs
+  status  CC_STATUS_FILE   worktree-status.tsv          dir\\tstate\\tunix-ts
+  archive CC_ARCHIVE_FILE  worktree-tasks-archive.tsv   a tasks row verbatim + \\tmerged-at
+  tabs    CC_TABS_FILE     opened-tabs.tsv              suuid\\towner\\tdir\\tsession\\ttime
+
+Phase A mapping note (spec §3.1 / plan Task 2): the API is already the target shape
+but the backend is transitional — state/state_ts live in the status sidecar, the
+tab-opened dedup timestamp lives in the $TMPDIR marker (task-mark-opened stamps it,
+task-opened-recently reads it), and task-archive takes <merged-into> but cannot
+persist it yet (the archive format is frozen at "row + merged-at"; the column
+arrives with the engine swap). task-mark-opened is deliberately NOT part of
+task-add: the marker may only be stamped once the tab actually OPENED — a failed
+dispatch must leave no marker, or it silently eats the retry for 120s
+(cc-dispatch.sh's "Only CHECK here; write the marker after success").
+
+Row discipline (the TAB-collapse class, cc-board.sh's access note): rewrites select
+whole lines, modify only the fields they mean to touch, and re-emit the rest by
+lossless split/join — `"\t".join(line.split("\t"))` with untouched fields is
+byte-identical by construction (a split can never lose a field or a TAB, unlike
+re-printfing parsed VARIABLES, which is what fossilized the shift class). A 7-field
+legacy row round-trips as 7 fields; an empty middle field stays empty; a rewrite
+whose row set comes up empty DELETES the file — the behaviour of every one of
+today's rewriters.
+
+Dir matching — ONE rule for every verb (the round-2 gate's B10): a stored row
+matches a caller's <dir> when the stored string IS the given string, or when it
+canonicalizes (while it still exists) to the canonical form of the given string.
+task-add additionally canonicalizes what it WRITES (spec §3.5 defect 3's fix
+direction: normalization moves to the write side), so new rows are always physical
+while legacy logical rows (/var vs /private/var) still resolve on read.
+
+Intentional deviations from today's byte stream, both gate-ruled (spec §3.5 #7/#8):
+  · task summaries truncate by CHARACTER, not by BYTE — today's `cut -c1-140`
+    under LC_ALL=C slices multibyte summaries mid-character and writes invalid
+    UTF-8 to disk; the facade does not replicate that bug.
+  · an unborn branch's `git rev-parse --abbrev-ref HEAD` exits 128 after printing
+    "HEAD", which today's `$(… || echo '?')` captures as a two-line "HEAD\\n?"
+    branch field, corrupting the row; _git_branch returns a clean '?'.
+"""
+import contextlib
+import errno
+import hashlib
+import os
+import subprocess
+import sys
+import time
+
+# Non-UTF-8 bytes ride through argv and the files as lone surrogates
+# (errors="surrogateescape" below); stdout/stderr must pass them back out the same
+# way — a bare print() would raise UnicodeEncodeError and take the whole board down
+# over one stray byte that awk never even notices (round-2 gate B2).
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(errors="surrogateescape")
+    except (AttributeError, OSError):
+        pass
+
+# ── store paths ─────────────────────────────────────────────────────────────────
+def _p(env, name):
+    # `or`, not a plain default: an EMPTY override must fall through to the default
+    # path, same as ${VAR:-...} in the shell callers.
+    return os.environ.get(env) or os.path.join(
+        os.path.expanduser("~"), ".config", "cc-stack", name)
+
+PATHS = {
+    "tasks":   lambda: _p("CC_TASKS_FILE",   "worktree-tasks.tsv"),
+    "status":  lambda: _p("CC_STATUS_FILE",  "worktree-status.tsv"),
+    "archive": lambda: _p("CC_ARCHIVE_FILE", "worktree-tasks-archive.tsv"),
+    "tabs":    lambda: _p("CC_TABS_FILE",    "opened-tabs.tsv"),
+}
+
+def _stale_seconds():
+    # CC_STATE_LOCK_STALE, seconds before a lock dir is considered abandoned.
+    # Unparseable values fall back to the default rather than crashing every verb.
+    try:
+        return float(os.environ.get("CC_STATE_LOCK_STALE") or 60)
+    except ValueError:
+        return 60.0
+
+# ── the one lock ────────────────────────────────────────────────────────────────
+# Atomic mkdir lock, same <file>.lock path today's shell writers already use, so
+# old-code writers and this facade serialize against each other during the
+# transition. Two deliberate properties, both lifted from today's callers:
+#   · a writer never blocks forever: it waits up to 3s — the same 60×0.05s ceiling
+#     every shell lock loop has — and then proceeds UNLOCKED, exactly what
+#     cc-board.sh log / cc-hooks.sh status / _cctabs_log do when the loop runs out;
+#   · a lock dir older than CC_STATE_LOCK_STALE (default 60s) is reclaimed — the
+#     holder died (today a stale lock dir taxes every later writer the full 3s
+#     wait, forever). No legitimate holder keeps the lock for 60s; the longest
+#     critical section in the stack is a few-file awk rewrite.
+# Readers take NO lock at all, like today's readers: a reading loop that held the
+# lock would make every concurrent writer burn its 3s deadline and then write
+# unlocked, and a reader that reclaimed could drop a slow-but-live holder's lock
+# and admit two writers into the critical section (round-2 gate B12).
+@contextlib.contextmanager
+def lock(path):
+    d, held = path + ".lock", False
+    deadline = time.time() + 3.0
+    while True:
+        try:
+            os.mkdir(d)
+            held = True
+            break
+        except OSError as e:
+            if e.errno != errno.EEXIST:
+                break                      # unusable path: proceed unlocked (today: same)
+            reclaimed = False
+            try:
+                if time.time() - os.stat(d).st_mtime > _stale_seconds():
+                    os.rmdir(d)            # reclaim: the holder died
+                    reclaimed = True
+            except OSError:
+                pass                        # raced or junk-carrying lock dir — not fatal
+            if reclaimed:
+                continue                    # retry mkdir immediately (may lose the race: fine)
+            if time.time() > deadline:
+                break                       # give up waiting, write anyway (today's behaviour)
+            time.sleep(0.05)
+    try:
+        yield held
+    finally:
+        if held:
+            try:
+                os.rmdir(d)
+            except OSError:
+                pass
+
+# ── raw line IO (the discipline: whole lines, lossless reassembly) ─────────────
+# newline="" disables universal-newline translation (a stray \r\n row must not be
+# silently rewritten to \n); surrogateescape makes non-UTF-8 bytes round-trip the
+# way awk passes them through instead of crashing the verb.
+def _open_rd(p):
+    return open(p, encoding="utf-8", errors="surrogateescape", newline="")
+
+def read_lines(store):
+    """Raw lines without the trailing newline. Missing/unreadable file → [] (today:
+    awk on a missing file prints nothing). A final line WITHOUT its newline is
+    still a line — dropping it would make a rewrite eat the row."""
+    try:
+        with _open_rd(PATHS[store]()) as f:
+            lines = f.read().split("\n")
+    except OSError:
+        return []
+    if lines and lines[-1] == "":
+        lines.pop()
+    return lines
+
+def _write_unlocked(p, lines):
+    """Returns success. An empty row set removes the file — the behaviour of every
+    one of today's rewriters (`[ -s ] || rm -f`)."""
+    if not lines:
+        try:
+            os.unlink(p)
+        except OSError:
+            pass
+        # an emptied store whose file could not be removed is a FAILED rewrite:
+        # the caller may already have archived these rows (task-archive's shape),
+        # so pretending success would leave the rows in both places, silently
+        return not os.path.exists(p)
+    tmp = "%s.tmp.%d" % (p, os.getpid())
+    try:
+        with open(tmp, "w", encoding="utf-8", errors="surrogateescape", newline="") as f:
+            f.write("\n".join(lines) + "\n")
+        os.replace(tmp, p)
+        return True
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return False
+
+def write_lines(store, lines):
+    with lock(PATHS[store]()):
+        _write_unlocked(PATHS[store](), lines)
+
+def rewrite(store, fn):
+    """Read → transform → write inside ONE lock hold — the shape every shell
+    rewriter already uses (ccb_lock BEFORE ccb_dead_lines; _gwt_tasks_rewrite's
+    comment: "avoid losing a concurrent append during read→mv"). Reading the rows
+    into write_lines' argument instead would re-introduce the race that lost 18 of
+    41 dispatch records under plain campaign concurrency (round-2 gate B1). Skips
+    the write when fn returns the rows unchanged. fn receives a COPY: an in-place
+    fn then shows up as out != rows and the write still fires — without the copy,
+    a mutating fn would return the very object it mutated and the skip check
+    would compare an object against itself (round-3 gate C1)."""
+    p = PATHS[store]()
+    with lock(p):
+        rows = read_lines(store)
+        out = fn(list(rows))
+        if out != rows:
+            return _write_unlocked(p, out)
+        return True
+
+def append_line(store, line):
+    """Locked append. Failure is silent (rc stays 0): today's appends all end in
+    `>> "$f" 2>/dev/null || true`, and a hook crashing on a full disk would violate
+    its always-exit-0 contract."""
+    with lock(PATHS[store]()):
+        try:
+            with open(PATHS[store](), "a", encoding="utf-8",
+                      errors="surrogateescape", newline="") as f:
+                f.write(line + "\n")
+        except OSError:
+            pass
+
+def now_stamp():
+    return time.strftime("%Y-%m-%d %H:%M:%S")   # `date '+%Y-%m-%d %H:%M:%S'`
+
+def canon(path):
+    """Best-effort `cd <path> && pwd -P`. For a path that exists this is exactly the
+    board's canonical form (physical, symlinks resolved); for one that does not we
+    still return a resolved string so raw-string callers can compare it (close keeps
+    the string as given when cd fails)."""
+    return os.path.realpath(path)
+
+def canon_or_raw(path):
+    """_ccres_keys' rule: canonicalize when the dir can be entered, otherwise keep
+    the string VERBATIM (not prefix-resolved) — a dead row only ever matches a
+    caller that named its exact string."""
+    return os.path.realpath(path) if os.path.isdir(path) else path
+
+def dir_match(row_dir, given, given_canon):
+    """The ONE row-matching rule (file header, "Dir matching"): raw-string equality
+    or canonical equality. Every verb takes both forms of the caller's dir, so a
+    legacy logical-path row and a canonical caller (or the reverse) still find each
+    other — the /var-vs-/private/var row that used to be unmatched forever."""
+    return row_dir == given or canon_or_raw(row_dir) == given_canon
+
+def fields(line):
+    return line.split("\t")
+
+def _sanitize(text, maxlen, pipes_to_slash):
+    """cc-board.sh log's cleaning, byte for byte: TAB and newline collapse to one
+    space each, task summaries additionally trade | for / (keeps TSV and the
+    `column` board intact), then the cut. largs gets no pipe translation. Truncates
+    by CHARACTER (see the deviations note in the header)."""
+    s = text.replace("\t", " ").replace("\n", " ")
+    if pipes_to_slash:
+        s = s.replace("|", "/")
+    return s[:maxlen]
+
+def _sanitize_field(text):
+    """The corruption guard for fields with no length contract (e.g. the sidecar's
+    state): collapse TAB/newline so a stray one cannot split the row, and nothing
+    else — no truncation, no pipe translation."""
+    return text.replace("\t", " ").replace("\n", " ")
+
+def _git_branch(dir_):
+    """`git -C <dir> rev-parse --abbrev-ref HEAD`, '?' when it fails (log's rule) —
+    but a CLEAN '?' (see the deviations note: the shell capture can splice a
+    printed "HEAD" onto the fallback). rc 0 with empty output writes an EMPTY
+    field — replicated, not second-guessed."""
+    try:
+        r = subprocess.run(["git", "-C", dir_, "rev-parse", "--abbrev-ref", "HEAD"],
+                           capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return "?"
+    if r.returncode != 0:
+        return "?"
+    return r.stdout.strip()
+
+# Phase A's tab_opened_ts still lives in the $TMPDIR marker (plan Task 2 note); the
+# D-phase engine swap retires it. The hash is today's: sha1 of the dir bytes with
+# NO trailing newline (`printf '%s' | shasum -a 1`). fsencode, not str.encode: a
+# dir straight out of argv may carry lone surrogates, and .encode() would raise
+# where the shell pipeline never fails (round-2 gate B14).
+def _marker(dir_):
+    md = os.path.join(os.environ.get("TMPDIR") or "/tmp", "cc-cmux-tabs")
+    return os.path.join(md, hashlib.sha1(os.fsencode(dir_)).hexdigest())
+
+def _touch_marker(dir_):
+    try:
+        os.makedirs(os.path.dirname(_marker(dir_)), exist_ok=True)
+        open(_marker(dir_), "w").close()      # `: > marker`: truncate + stamp mtime
+    except OSError:
+        pass                                  # `|| true` today; never fail a dispatch
+
+def _usage(text):
+    print("usage: cc-state " + text, file=sys.stderr)
+    return 2
+
+# ── tasks store ─────────────────────────────────────────────────────────────────
+# Row: time \t branch \t surface-ref \t dir \t caller \t task \t parent \t launch-args
+# (7-field legacy rows are legal and must round-trip as 7 fields).
+
+def cmd_task_add(args):
+    """Append the dispatch-time placeholder row — cc-board.sh log's row (including
+    the '?' fallbacks for an empty surface ref and an underivable branch) with caller
+    and launch-args left empty for task-set-launch. The dir is canonicalized on the
+    way in (the file header's write-side rule). Does NOT stamp the dedup marker:
+    the marker says "a tab actually opened", which only the caller knows — see
+    task-mark-opened."""
+    if len(args) != 5:
+        return _usage("task-add <dir> <branch> <ref> <task> <parent>")
+    d, branch, ref, task, parent = args
+    if not d:
+        return 0                              # today: [ -n "$dir" ] || exit 0
+    d = canon(d)
+    if not branch:
+        branch = _git_branch(d)               # empty arg = derive here, as log does
+    ref = ref or "?"                          # today: ref="${2:-?}"
+    summary = _sanitize(task, 140, True) or "(idle ccteam, no initial prompt)"
+    append_line("tasks", "\t".join(
+        [now_stamp(), branch, ref, d, "", summary, parent, ""]))
+    return 0
+
+def cmd_task_set_launch(args):
+    """Fill caller-ref (field 5) and launch-args (field 8) on the NEWEST row of the
+    dir — the second half of the dispatch that task-add started. No row → silent
+    no-op rc 0 (mirrors task-set-state: nothing to complete)."""
+    if len(args) != 3:
+        return _usage("task-set-launch <dir> <caller-ref> <launch-args>")
+    d, caller, largs = args
+    c = canon(d)
+    def fn(rows):
+        out = list(rows)                       # build NEW rows — fn must never
+        for i in range(len(out) - 1, -1, -1):  # mutate in place, or rewrite()'s
+            f = fields(out[i])                 # out != rows change check compares
+            if len(f) >= 4 and dir_match(f[3], d, c):   # an object against itself
+                f[4] = caller                 # written raw — exactly log's $caller
+                if len(f) >= 8:
+                    f[7] = _sanitize(largs, 200, False)
+                out[i] = "\t".join(f)
+                break
+        return out
+    rewrite("tasks", fn)
+    return 0
+
+def cmd_task_get(args):
+    """The newest row whose dir field matches <dir> under the file-header rule.
+    rc 1 + no output when absent."""
+    if len(args) != 1:
+        return _usage("task-get <dir>")
+    c = canon(args[0])
+    for line in reversed(read_lines("tasks")):
+        f = fields(line)
+        if len(f) >= 4 and dir_match(f[3], args[0], c):
+            print(line)
+            return 0
+    return 1
+
+def cmd_task_list(args):
+    """newest-per-dir + repo filter + dead-dir skip in one pass — what the board
+    render and gwt-resume ask for. Dedup keys on the CANONICAL dir (the render's
+    SEEN[c], which subsumes the raw key since production rows are written
+    canonical); dead dirs are skipped AT READ TIME (resume's `[ -d ]` rule — the
+    file-level sweep is task-prune's job); output is newest-first (tail -r order).
+    --all disables the repo filter, in either flag order (cc-board.sh's contract).
+    --archive instead reads the archive: a history — every row, file order, no
+    dead-dir skip (its dirs are gone by design)."""
+    repo_val, archive, all_flag = None, False, False
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--all":
+            all_flag = True
+        elif a == "--archive":
+            archive = True
+        elif a == "--repo" and i + 1 < len(args):
+            repo_val = args[i + 1]; i += 1
+        else:
+            return _usage("task-list [--all] [--repo <root>] [--archive]")
+        i += 1
+    repo = None if all_flag or repo_val is None else canon(repo_val)
+    def under(c):
+        return not repo or c == repo or c.startswith(repo + "/")
+    if archive:
+        for line in read_lines("archive"):
+            f = fields(line)
+            if len(f) >= 4 and under(canon_or_raw(f[3])):
+                print(line)
+        return 0
+    seen = set()
+    for line in reversed(read_lines("tasks")):
+        f = fields(line)
+        if len(f) < 4 or not f[3] or not os.path.isdir(f[3]):
+            continue
+        c = canon(f[3])
+        if c in seen:
+            continue
+        seen.add(c)
+        if under(c):
+            print(line)
+    return 0
+
+def cmd_task_set_state(args):
+    """The hook's sidecar write. Membership follows the file-header dir rule (an
+    unknown dir is a silent no-op that writes not one byte), the state value is
+    corruption-guarded (a TAB in it must not split the sidecar row), and `ready` is
+    refused outright: readiness stays owned by gwt-done + a clean tree (spec §8
+    invariant 3), and this verb is the one place that rule can be structurally
+    enforced."""
+    if len(args) != 2:
+        return _usage("task-set-state <dir> <state>")
+    d, state = args
+    if state == "ready":
+        print("cc-state: the sidecar never records ready — readiness is gwt-done + "
+              "a clean tree, never a state cell", file=sys.stderr)
+        return 2
+    state = _sanitize_field(state)
+    c = canon(d)
+    if not any(len(f) >= 4 and dir_match(f[3], d, c)
+               for f in (fields(l) for l in read_lines("tasks"))):
+        return 0
+    fresh = "\t".join([c, state, str(int(time.time()))])
+    def fn(rows):
+        return [l for l in rows
+                if not (len(fields(l)) >= 1 and dir_match(fields(l)[0], d, c))] + [fresh]
+    rewrite("status", fn)
+    return 0
+
+def _swap_suuid(la, u):
+    """_ccres_setref's setsuuid: replace the suuid= segment of a launch-args field,
+    keeping model= LAST (a model id may itself contain colons — every parser stops
+    there). Byte-equivalent to the awk, one-colon strip included."""
+    mod, pre = "", la
+    j = la.find("model=")
+    if j != -1:
+        mod, pre = la[j:], la[:j]
+        if pre.endswith(":"):
+            pre = pre[:-1]
+    segs = [s for s in pre.split(":") if s != "" and not s.startswith("suuid=")]
+    segs.append("suuid=" + u)
+    return ":".join(segs) + ((":" + mod) if mod else "")
+
+def cmd_task_set_ref(args):
+    """Resume's refresh: field 3 (surface ref) on EVERY row of the dir (the
+    file-header dir rule), plus the recorded suuid when given. Rows without a
+    launch-args field keep their field count: the $3=r OFS rebuild that expanded
+    7-field rows (spec §3.5 defect 6) is deliberately NOT replicated."""
+    if len(args) not in (2, 3):
+        return _usage("task-set-ref <dir> <ref> [<suuid>]")
+    d, ref = args[0], args[1]
+    su = args[2] if len(args) == 3 else ""
+    c = canon(d)
+    def fn(rows):
+        out = list(rows)                       # new list, not in-place (see
+        for i, line in enumerate(out):         # task-set-launch's note)
+            f = fields(line)
+            if len(f) >= 4 and dir_match(f[3], d, c):
+                f[2] = ref
+                if su and len(f) >= 8:
+                    f[7] = _swap_suuid(f[7], su)
+                out[i] = "\t".join(f)
+        return out
+    rewrite("tasks", fn)
+    return 0
+
+def cmd_task_drop(args):
+    """gwt-rm's row removal, under the file-header dir rule."""
+    if len(args) != 1:
+        return _usage("task-drop <dir>")
+    d = args[0]
+    c = canon(d)
+    def fn(rows):
+        return [l for l in rows
+                if not (len(fields(l)) >= 4 and dir_match(fields(l)[3], d, c))]
+    rewrite("tasks", fn)
+    return 0
+
+def cmd_task_prune(args):
+    """Sweep rows whose dir is gone, from the task list AND the sidecar — both real
+    callers (the board's prune-on-read and gwt-prune) always sweep the pair. Keep
+    rule is today's: dir field non-empty and still a directory."""
+    if args:
+        return _usage("task-prune")
+    for store, col in (("tasks", 3), ("status", 0)):
+        def fn(rows, col=col):
+            return [l for l in rows
+                    if len(fields(l)) > col and fields(l)[col]
+                    and os.path.isdir(fields(l)[col])]
+        rewrite(store, fn)
+    return 0
+
+def cmd_task_archive(args):
+    """Move every row of a branch into the archive (verbatim + merged-at appended,
+    8→9 fields), sweep the sidecar rows of the moved dirs, print the moved dirs.
+    <merged-into> is accepted for the target API but not persisted in Phase A: the
+    archive format is frozen at `row + merged-at` until the engine swap. Under the
+    tasks lock like today (the archive write borrows it), plus the archive's own
+    lock — ordering is always tasks→archive, so no deadlock. A failed tasks rewrite
+    is LOUD (stderr + rc 1), matching _gwt_archive_branch: the task list stays
+    untouched and the archive may have gained the rows — visible, never silent."""
+    if len(args) != 2:
+        return _usage("task-archive <branch> <merged-into>")
+    branch = args[0]
+    if not branch:
+        return 0
+    ts = str(int(time.time()))
+    tp, ap = PATHS["tasks"](), PATHS["archive"]()
+    with lock(tp), lock(ap):
+        lines = read_lines("tasks")          # inside the lock (B1's rule)
+        kept, moved_rows, moved_dirs = [], [], []
+        for line in lines:
+            f = fields(line)
+            if len(f) >= 2 and f[1] == branch:
+                moved_rows.append(line + "\t" + ts)
+                if len(f) >= 4 and f[3]:
+                    moved_dirs.append(f[3])
+            else:
+                kept.append(line)
+        if not moved_rows:
+            return 0
+        try:
+            with open(ap, "a", encoding="utf-8",
+                      errors="surrogateescape", newline="") as f:
+                f.write("".join(r + "\n" for r in moved_rows))
+        except OSError:
+            pass
+        ok = _write_unlocked(tp, kept)
+    if not ok:
+        print("cc-state: archive rewrite failed — task list left untouched "
+              "(the archive may have gained rows)", file=sys.stderr)
+        return 1
+    moved_canon = [(d, canon(d)) for d in moved_dirs]
+    def fn(rows):
+        return [l for l in rows
+                if not any(dir_match(fields(l)[0], d, c) for d, c in moved_canon)]
+    rewrite("status", fn)
+    for d in moved_dirs:
+        print(d)
+    return 0
+
+def cmd_task_mark_opened(args):
+    """Stamp the dedup marker — ONLY after the tab actually opened. task-add
+    deliberately does not do this: a dispatch that recorded its board row but
+    failed to open the tab must leave no marker, or the retry is silently eaten
+    for 120s (cc-dispatch.sh: "failures leave no blocking marker")."""
+    if len(args) != 1:
+        return _usage("task-mark-opened <dir>")
+    _touch_marker(args[0])
+    return 0
+
+def cmd_task_opened_recently(args):
+    """rc 0 = a tab was opened for this dir within <seconds> (the old 120s marker
+    question). Read-only; task-mark-opened is the writer."""
+    if len(args) != 2:
+        return _usage("task-opened-recently <dir> <seconds>")
+    try:
+        win = int(args[1])
+    except ValueError:
+        return _usage("task-opened-recently <dir> <seconds>")
+    try:
+        mt = os.stat(_marker(args[0])).st_mtime
+    except OSError:
+        return 1
+    return 0 if (time.time() - mt) < win else 1
+
+# ── tabs store ──────────────────────────────────────────────────────────────────
+# Row: suuid \t owner \t dir \t session \t time. Empty owner/dir/session are written
+# as "-" ON PURPOSE — `read` collapses runs of TABs, so an empty middle field would
+# shift every later field for the reader. The two ledgers answer different
+# questions ("whose sub-task is this" vs "who opened this tab") and are NEVER
+# deduped against each other; `close` consults them in that order.
+_UUID_CHARS = set("0123456789ABCDEF-")
+
+def _valid_uuid(s):
+    return bool(s) and all(c in _UUID_CHARS for c in s)
+
+def _self_uuid():
+    # the caller's stable surface uuid, uppercased like every ledger comparison
+    return (os.environ.get("CC_CALLER_SURFACE_UUID")
+            or os.environ.get("CMUX_SURFACE_ID") or "").upper()
+
+def _largs_seg(la, key):
+    """_ccpick: the <key>= segment of a launch-args field. model= is composed LAST
+    and may itself contain colons, so every parser stops at it."""
+    for seg in la.split("model=", 1)[0].split(":"):
+        if seg.startswith(key + "="):
+            return seg[len(key) + 1:]
+    return ""
+
+def _identity(s):
+    """close's treatment of a recorded identity (B3): uppercase it, and anything
+    that is not a plain uuid is not an identity at all — a short ref is an address,
+    never an identity, and must never crowd out a real candidate."""
+    s = s.upper()
+    return s if _valid_uuid(s) else ""
+
+def cmd_tab_add(args):
+    """_cctabs_log: only a plain uuid is ever a suuid (a short ref is an address,
+    not an identity — it drifts); anything else is silently NOT recorded, rc 0.
+    An owner that is not a plain uuid is an UNKNOWN owner (written "-"), never a
+    broken row. dir/session get today's TAB/newline collapse; empty → "-"."""
+    if len(args) != 4:
+        return _usage("tab-add <suuid> <owner> <dir> <session-id>")
+    su, owner, d, sid = args
+    su = su.upper()
+    if not _valid_uuid(su):
+        return 0
+    owner = owner.upper()
+    if not _valid_uuid(owner):
+        owner = ""
+    d = d.replace("\t", " ").replace("\n", " ") or "-"
+    sid = sid.replace("\t", " ").replace("\n", " ") or "-"
+    append_line("tabs", "\t".join([su, owner or "-", d, sid, now_stamp()]))
+    return 0
+
+def cmd_tab_list(args):
+    """The ledger read behind `cc-dispatch.sh tabs`: raw rows, minus (without
+    --all) the rows another session opened. A truncated row (a killed writer, a
+    hand edit) is skipped or shown, never a traceback — awk never crashed here.
+    No session identity at all = no filter, same as the shell loop. The cmux
+    liveness join stays in the caller: it is a probe, not state."""
+    if args not in ([], ["--all"]):
+        return _usage("tab-list [--all]")
+    self_u = _self_uuid()
+    for line in read_lines("tabs"):
+        f = fields(line)
+        if not f[0]:
+            continue
+        owner = ("" if len(f) < 2 or f[1] == "-" else f[1])
+        if args == [] and self_u and owner != self_u:
+            continue
+        print(line)
+    return 0
+
+def _tabs_owner_of(suuid):
+    """_cctabs_owner: the NEWEST ledger row for the uuid that actually names an
+    owner ("-" and empty do not count)."""
+    for line in reversed(read_lines("tabs")):
+        f = fields(line)
+        if len(f) > 1 and f[0] == suuid and f[1] not in ("", "-"):
+            return f[1]
+    return ""
+
+def cmd_tab_resolve(args):
+    """Every ledger candidate for a dir, in the priority `close` consults them:
+    one line per candidate, `source \\t suuid \\t owner \\t branch` (source =
+    board | tabs), `-` placeholders for empty owner/branch. Identities get close's
+    own treatment (uppercase; a non-uuid is dropped outright) — a recorded short
+    ref must never masquerade as an identity or crowd out the real tabs candidate.
+    Each candidate carries the owner close would compute HAD it chosen that
+    candidate: the board row's csuuid falling back to the ledger's newest
+    by-uuid owner; the tabs candidate's owner is that by-uuid lookup (close's
+    by-dir owner is dead code — computed, never read). NB: when a board row's
+    suuid is not a valid uuid NO board candidate is emitted, and with it that
+    row's branch is absent from the output too (the tabs candidate carries "-") —
+    harmless to close's decision, but a caller mining branch for display text
+    gets nothing for that row. The facade does NOT choose:
+    liveness probing and the cascade belong to the caller (spec §4), and the cmux
+    session store never enters here. Nothing resolvable → no output, rc 1."""
+    if len(args) != 1:
+        return _usage("tab-resolve <dir>")
+    raw_given = args[0]
+    canon_given = canon(raw_given)
+    out = []
+    for line in reversed(read_lines("tasks")):   # newest board row for the dir
+        f = fields(line)
+        if len(f) >= 4 and f[3] and dir_match(f[3], raw_given, canon_given):
+            su, owner = "", ""
+            if len(f) >= 8:
+                su = _identity(_largs_seg(f[7], "suuid"))
+                owner = _largs_seg(f[7], "csuuid").upper()
+            if su:
+                if not owner:
+                    owner = _tabs_owner_of(su)
+                out.append("\t".join(
+                    ["board", su, owner or "-", (f[1] if len(f) > 1 and f[1] else "-")]))
+            break                               # close reads the newest row only
+    for line in reversed(read_lines("tabs")):    # _cctabs_by_dir: RAW row dir ==
+        f = fields(line)                         # canon(given) or the given string
+        if len(f) >= 3 and f[0] and dir_match(f[2], raw_given, canon_given):
+            su = _identity(f[0])
+            if su:
+                out.append("\t".join(
+                    ["tabs", su, _tabs_owner_of(su) or "-", "-"]))
+            break                               # close reads the newest row only
+    if not out:
+        return 1
+    for line in out:
+        print(line)
+    return 0
+
+def cmd_tab_owner(args):
+    if len(args) != 1:
+        return _usage("tab-owner <suuid>")
+    o = _tabs_owner_of(args[0].upper())
+    if not o:
+        return 1
+    print(o)
+    return 0
+
+def cmd_tab_prune(args):
+    """The !partial invariant, kept STRUCTURAL (spec §8 invariant 4): the argument
+    is the RAW live map — _cctabs_livemap's output, `<short-ref>\\t<uuid>[\\t<ws>]`
+    per live surface plus a final `!partial` sentinel whenever the enumeration was
+    incomplete — and the sentinel is recognized HERE. A caller that pre-extracts a
+    flat uuid list has already thrown the completeness bit away and would hand us
+    "complete-looking" evidence for a partial probe; pruning off it deletes the
+    ledger rows of every tab in an unenumerated workspace (the 2026-08-16
+    incident, unrecoverable). Partial map, empty map, missing map, or a map that
+    yields no keys at all → rc 0, not one row touched. Complete evidence keeps
+    exactly the rows whose suuid is live (keys from field 2, uppercased like the
+    map's own toupper($2)); an emptied ledger deletes its file, as every rewriter
+    here does."""
+    if len(args) != 1:
+        return _usage("tab-prune <live-map-file>")
+    try:
+        with _open_rd(args[0]) as f:
+            map_lines = f.read().split("\n")
+    except OSError:
+        return 0
+    if any(l.strip() == "!partial" for l in map_lines):
+        return 0
+    keys = set()
+    for l in map_lines:
+        f = l.split("\t")
+        if len(f) >= 2 and f[1]:
+            keys.add(f[1].upper())
+    if not keys:
+        return 0
+    def fn(rows):
+        return [l for l in rows
+                if len(fields(l)) > 1 and fields(l)[0] in keys]
+    rewrite("tabs", fn)
+    return 0
+
+# ── verbs ───────────────────────────────────────────────────────────────────────
+def cmd_dump(args):
+    if len(args) != 1 or args[0] not in PATHS:
+        print("usage: cc-state dump tasks|status|archive|tabs", file=sys.stderr)
+        return 2
+    # raw byte passthrough — byte-identical to `cat`, including a missing trailing
+    # newline. Never reconstruct from parsed fields, and never touch the lock:
+    # today's readers take no lock at all (see the lock block's note). A missing
+    # store is an empty store (silent rc 0, today's behaviour) and a vanished
+    # downstream reader is not an error either — but a genuine read failure is
+    # LOUD, like cat's non-zero exit: swallowing it with a blanket `except
+    # OSError` (BrokenPipeError is an OSError!) would report partial output as
+    # success (round-3 gate C3).
+    p = PATHS[args[0]]()
+    try:
+        with open(p, "rb") as f:
+            sys.stdout.buffer.write(f.read())
+    except (FileNotFoundError, BrokenPipeError):
+        pass
+    except OSError as e:
+        print("cc-state: dump %s: %s" % (args[0], e), file=sys.stderr)
+        return 1
+    return 0
+
+VERBS = {
+    "dump": cmd_dump,
+    "task-add": cmd_task_add, "task-set-launch": cmd_task_set_launch,
+    "task-get": cmd_task_get, "task-list": cmd_task_list,
+    "task-set-state": cmd_task_set_state, "task-set-ref": cmd_task_set_ref,
+    "task-drop": cmd_task_drop, "task-prune": cmd_task_prune,
+    "task-archive": cmd_task_archive, "task-mark-opened": cmd_task_mark_opened,
+    "task-opened-recently": cmd_task_opened_recently,
+    "tab-add": cmd_tab_add, "tab-list": cmd_tab_list, "tab-resolve": cmd_tab_resolve,
+    "tab-owner": cmd_tab_owner, "tab-prune": cmd_tab_prune,
+}
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help"):
+        print("usage: cc-state <verb> ... — the single reader/writer of cc-stack state")
+        print("verbs: " + " ".join(sorted(VERBS)))
+        return 2
+    v = argv[0]
+    if v not in VERBS:
+        print("cc-state: unknown verb: " + v, file=sys.stderr)
+        return 2
+    return VERBS[v](argv[1:])
+
+if __name__ == "__main__":
+    try:
+        _rc = main(sys.argv[1:])
+        sys.stdout.flush()   # surface EPIPE INSIDE the try: for a store whose
+                             # writes all return cleanly before `head` exits, the
+                             # broken pipe only shows up at the interpreter's
+                             # exit-time flush — outside every handler, leaking a
+                             # traceback onto stderr for ~90–136KB stores. Flushing
+                             # here makes the handler below reachable at every
+                             # size, both paths (round-3 gate C5).
+        sys.exit(_rc)
+    except BrokenPipeError:
+        # The downstream reader (head) is gone: die quietly. Redirecting the fd to
+        # devnull stops python's own exit-time flush from re-raising onto stderr
+        # (85 bytes of traceback noise per `dump | head` on a big store — B13).
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        sys.exit(0)
