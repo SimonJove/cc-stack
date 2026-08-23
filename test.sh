@@ -3513,6 +3513,198 @@ rm -f "$TF18" "$TF18D" "$TF18O" "$TF18R" "$SF18R" "$TB18" "$TB18D" "$TB18O" "$TB
 unset CC_FAKE_LOG CF_SCREEN
 
 echo ""
+echo "== 35. dispatch state goes through cc-state =="
+# cc-dispatch.sh is on the facade now (state-model Phase A, plan Task 6): the 22 field-level parse
+# points and the mkdir locks are gone; what the file keeps is cmux PROBING and the orchestration.
+# Structural pins first (what may no longer exist / what must survive), then behaviour: the
+# dispatch-window fix (spec §3.1 — the board row used to appear only at the END of a dispatch,
+# up to ~40s after the tab opened, so a crash in between left an open tab with no row AND a dedup
+# marker blocking the retry), the two defect pins this line owns (spec §3.5 #1: _ccres_dropstatus
+# split on whitespace, so a dir WITH A SPACE never lost its sidecar row; #6: _ccres_setref's
+# $3=r OFS rebuild widened 7-field legacy rows to 8), and the H1–H3 shape pins from the brief.
+# The fake cmux snapshots, on the first read-screen AFTER the launch send, whether the board row
+# already exists — a deterministic witness for "the row is there while the trust loop is still
+# running", no racing sleep in the test itself.
+S35=$(mktemp -d); export CC_35_LOG="$S35/log"; export CC_35_SCREEN="$S35/screen"
+sv35TMP="${TMPDIR:-}"; export TMPDIR="$S35/tmp"; mkdir -p "$TMPDIR"
+cat > "$S35/cmux" <<'CMUX35'
+#!/usr/bin/env bash
+case "$1" in
+  ping) exit 0 ;;
+  identify) echo '{ "caller": { "surface_ref": "surface:9", "workspace_ref": "workspace:1" } }' ;;
+  list-workspaces)
+    [ -n "${CC_35_NOWS:-}" ] && exit 0
+    printf '* workspace:1  fake  [selected]\n' ;;
+  list-pane-surfaces) cat "${CC_35_LIVE:-/dev/null}" 2>/dev/null ;;
+  new-surface)
+    n=$(cat "${CC_35_LOG}.nscnt" 2>/dev/null || echo 500); n=$((n+1)); echo "$n" > "${CC_35_LOG}.nscnt"
+    printf 'NEWSURF|surface:%s|%s\n' "$n" "$*" >> "$CC_35_LOG"
+    printf 'OK surface:%s (99999999-7777-7777-7777-%012d) pane:1 (P) workspace:1 (W)\n' "$n" "$n" ;;
+  close-surface) shift; printf 'CLOSE|%s\n' "$*" >> "$CC_35_LOG" ;;
+  send)     shift; printf 'SEND|%s\n' "$*" >> "$CC_35_LOG"
+            case "$*" in *ccteam*|*"cld "*) : > "${CC_35_LOG}.launched" ;; esac ;;
+  send-key) shift; printf 'KEY|%s\n'  "$*" >> "$CC_35_LOG" ;;
+  notify)   shift; printf 'NOTIFY|%s\n' "$*" >> "$CC_35_LOG" ;;
+  read-screen)
+    cat "$CC_35_SCREEN" 2>/dev/null
+    if [ -f "${CC_35_LOG}.launched" ] && [ ! -e "${CC_35_LOG}.saw" ]; then
+      if grep -qF -- "$CC_35_DIR" "${CC_TASKS_FILE:-/dev/none}" 2>/dev/null; then
+        echo row > "${CC_35_LOG}.saw"
+      else
+        echo norow > "${CC_35_LOG}.saw"
+      fi
+    fi ;;
+esac
+exit 0
+CMUX35
+chmod +x "$S35/cmux"
+NB35="$(printf '\xc2\xa0')"
+{ echo "RDY22"; printf '\xe2\x9d\xaf%s\n' "$NB35"; echo "? for shortcuts"; } > "$S35/scr-tui"
+{ echo "RDY22"; printf '\xe2\x9d\xaf%s\n' "$NB35"; } > "$S35/scr-settle"   # no TUI markers: trust loop runs its full course
+OP35="$PATH"
+in35close(){ sed -n '/^close)/,/^;;/p' "$CC/cc-dispatch.sh" | grep -c "$1" | awk '{print ($1>0)?"yes":"no"}'; }
+
+# ── structure: the facade carries the state, the shell keeps the probe ─────────────────────
+eq "35 close resolves via tab-resolve"    "$(grep -c 'cc-state" tab-resolve' "$CC/cc-dispatch.sh")" "1"
+eq "35 close still probes liveness itself" "$(in35close '_cctabs_livemap')" "yes"
+eq "35 cmux session-store fallback untouched" "$(in35close 'CC_CMUX_SESSIONS')" "yes"
+eq "35 cc-board log call is gone"         "$(grep -c 'cc-board.sh" log' "$CC/cc-dispatch.sh")" "0"
+# NB: there is deliberately NO "no tabs-file awk left" structural assertion here. The old
+# offenders were MULTILINE awk invocations (the awk -F'\t' and the "$_tf" argument sit on
+# different physical lines), so every line-based grep counts 0 against the old code too — an
+# always-green assertion that reads like coverage while testing nothing (gate round 2). The real
+# guards on "the ledger is not parsed by hand any more": `_cctabs_lock` = 0 below (the lock every
+# direct rewrite needed), `cc-state" tab-resolve` = 1 above, and the behavioural suites — §18
+# (close/tabs over both ledgers), §21 (the sourced prune fragment), §26 (workspace-scope prune).
+eq "35 no mkdir lock left"     "$(grep -c '_cctabs_lock' "$CC/cc-dispatch.sh")" "0"
+# the facade never forks a probe: cmux names in it are backend facts (the $TMPDIR marker dir,
+# CMUX_SURFACE_ID), not dependencies. (It may NAME cmux; it may not RUN anything but git.)
+eq "35 git is the only command cc-state runs" \
+  "$(grep -oE 'subprocess\.run\(\["[a-z-]+"' "$CC/cc-state" | sort -u | tr '\n' ',')" \
+  'subprocess.run(["git",'
+
+# ── the dispatch window (spec §3.1): the board row exists WHILE the tab is still settling ───
+cn35(){ CDPATH= cd -- "$1" >/dev/null 2>&1 && pwd -P; }
+DD35="$(cn35 "$(mktemp -d)")"; TF35=$(mktemp -u); TB35=$(mktemp -u)   # physical: the row records surface's canonical form
+: > "$CC_35_LOG"; rm -f "${CC_35_LOG}.nscnt" "${CC_35_LOG}.saw" "${CC_35_LOG}.launched"
+export CC_35_DIR="$DD35"; export CC_35_LIVE="$S35/live.empty"; : > "$CC_35_LIVE"
+CC_35_SCREEN="$S35/scr-settle" \
+env PATH="$S35:$OP35" TMPDIR="$TMPDIR" CC_TASKS_FILE="$TF35" CC_TABS_FILE="$TB35" \
+  CC_SEND_FAILLOG="$S35/fail" CC_SEND_VERIFY_SEC=0.1 CC_LAUNCH_FILE="$S35/launch" \
+  CC_WT_PRETRUST=0 CC_WT_SESSION_ID="abcdef01-1234-4567-890a-bcdef0123456" \
+  CC_WT_PERMISSION_MODE=plan CC_CALLER_SURFACE_UUID="CCCCCCCC-3333-3333-3333-333333333333" \
+  bash "$CC/cc-dispatch.sh" surface "$DD35" "window probe brief" >/dev/null 2>&1
+eq "35 board row exists while the tab is still settling" "$(cat "${CC_35_LOG}.saw" 2>/dev/null)" "row"
+eq "35 dispatch opened exactly one tab"  "$(grep -c 'NEWSURF' "$CC_35_LOG")" "1"
+eq "35 completed row has its launch args" "$(awk -F'\t' -v d="$DD35" '$4==d{print ($8 ~ /uuid=/)?"y":"n"}' "$TF35")" "y"
+eq "35 completed row has its caller ref"  "$(awk -F'\t' -v d="$DD35" '$4==d{print $5}' "$TF35")" "surface:9"
+M35="$TMPDIR/cc-cmux-tabs/$(printf '%s' "$DD35" | shasum -a 1 | cut -d' ' -f1)"
+eq "35 dispatch stamped the dedup marker" "$([ -e "$M35" ] && echo yes || echo no)" "yes"
+
+# H2 window: a fresh marker silently eats the retry; a 121s-stale one lets it through
+n35b=$(grep -c 'NEWSURF' "$CC_35_LOG")
+env PATH="$S35:$OP35" TMPDIR="$TMPDIR" CC_TASKS_FILE="$TF35" CC_TABS_FILE="$TB35" \
+  CC_SEND_FAILLOG="$S35/fail" CC_SEND_VERIFY_SEC=0.1 CC_WT_PRETRUST=0 \
+  bash "$CC/cc-dispatch.sh" surface "$DD35" "retry brief" >/dev/null 2>&1
+eq "35 fresh marker eats the retry"  "$([ "$(grep -c 'NEWSURF' "$CC_35_LOG")" = "$n35b" ] && [ "$(wc -l < "$TF35" | tr -d ' ')" = 1 ] && echo yes || echo no)" "yes"
+touch -t "$(date -v-121S '+%Y%m%d%H%M.%S')" "$M35"
+: > "$CC_35_LOG"; rm -f "${CC_35_LOG}.nscnt"
+CC_35_SCREEN="$S35/scr-tui" \
+env PATH="$S35:$OP35" TMPDIR="$TMPDIR" CC_TASKS_FILE="$TF35" CC_TABS_FILE="$TB35" \
+  CC_SEND_FAILLOG="$S35/fail" CC_SEND_VERIFY_SEC=0.1 CC_WT_PRETRUST=0 \
+  bash "$CC/cc-dispatch.sh" surface "$DD35" "retry brief" >/dev/null 2>&1
+eq "35 stale (121s) marker lets the retry through" "$(grep -c 'NEWSURF' "$CC_35_LOG")" "1"
+
+# ── H1 shape: close's refusal and partial-evidence sentences, byte for byte ────────────────
+UA35="AAAAAAAA-1111-1111-1111-111111111111"; UB35="BBBBBBBB-2222-2222-2222-222222222222"
+UP35="CCCCCCCC-3333-3333-3333-333333333333"; UO35="DDDDDDDD-4444-4444-4444-444444444444"
+R35="$(mktemp -d)"; mkdir -p "$R35/.claude/worktrees/wt35"; WA35="$R35/.claude/worktrees/wt35"
+printf '  surface:100\t%s\tw1\n' "$UA35" > "$S35/live.one"
+TF35C=$(mktemp -u); TB35C=$(mktemp -u); echo '{}' > "$S35/store35.json"
+cl35(){ ( cd "$R35" && env PATH="$S35:$OP35" CC_TASKS_FILE="$TF35C" CC_TABS_FILE="$TB35C" \
+    CC_CMUX_SESSIONS="$S35/store35.json" CC_CALLER_SURFACE_UUID="${2:-$UP35}" CLAUDECODE=1 \
+    CC_35_NOWS="${3:-}" CC_35_LIVE="${4:-$S35/live.one}" \
+    bash "$CC/cc-dispatch.sh" close "${1:-$WA35}" ) 2>&1; }
+# both ledgers name no owner: the refusal an automated caller gets
+printf '2026-01-01 00:00:01\tfeat/h1a\tsurface:101\t%s\tsurface:9\tno owner row\tmain\tuuid=u1:provider=anthropic:pm=auto:suuid=%s\n' "$WA35" "$UA35" > "$TF35C"
+printf '%s\t-\t%s\tu1\t2026-01-01 00:00:00\n' "$UA35" "$WA35" > "$TB35C"
+cl35 > "$S35/h1a.out"; h1a_rc=$?
+eq "35 H1 no-owner refusal rc" "$h1a_rc" "1"
+eq "35 H1 no-owner refusal sentence" \
+  "$(grep -c 'refusing: no dispatching parent recorded for this dir and the branch is not marked ready — treat it as human-opened' "$S35/h1a.out")" "1"
+# no workspace list at all = the least complete evidence: nothing closed, and the claim is qualified
+printf '  surface:300\t%s\tw1\n' "$UP35" > "$S35/live.other"
+cl35 "$WA35" "" 1 "$S35/live.other" > "$S35/h1b.out"; h1b_rc=$?
+eq "35 H1 partial probe rc" "$h1b_rc" "0"
+eq "35 H1 partial probe says nothing to do" \
+  "$(grep -c 'no live tab resolves to this directory' "$S35/h1b.out")" "1"
+eq "35 H1 partial probe qualifies its claim" \
+  "$(grep -c 'cmux workspace enumeration was incomplete — the tab may be alive in a workspace unseen by this probe' "$S35/h1b.out")" "1"
+# board identity dead, ledger identity live: the cascade takes the LIVE one and the recorded
+# parent still comes off the board row (owner = board csuuid, not the ledger's opener)
+printf '2026-01-01 00:00:01\tfeat/h1c\tsurface:101\t%s\tsurface:9\tdead board id\tmain\tuuid=u2:provider=anthropic:pm=auto:csuuid=%s:suuid=%s\n' "$WA35" "$UO35" "$UB35" > "$TF35C"
+printf '%s\t%s\t%s\tu2\t2026-01-01 00:00:00\n' "$UA35" "$UA35" "$WA35" > "$TB35C"
+: > "$CC_35_LOG"
+cl35 "$WA35" "$UO35" > "$S35/h1c.out"
+eq "35 cascade picks the LIVE identity" \
+  "$(grep -c "resolved : surface:100  uuid=$UA35" "$S35/h1c.out")/$(grep -cF "CLOSE|--surface $UA35" "$CC_35_LOG")" "1/1"
+eq "35 parent stays the board row's csuuid" "$(grep -c "recorded : parent=$UO35" "$S35/h1c.out")" "1"
+
+# ── resume: the two defect pins + the verbatim-dir invariant (H3) ───────────────────────────
+FH35=$(mktemp -d); mkdir -p "$FH35/.config"; cp -R "$CC" "$FH35/.config/cc-stack"
+RD35="$(mktemp -d)"
+DSP35="$RD35/wt space"; D735="$RD35/wt7"                            # the space dir is spec §3.5 #1's fixture
+mkdir "$DSP35" "$D735"
+# the third row's dir is recorded by its LOGICAL path string (mktemp prints /var/... on macOS;
+# cd+pwd -P would give /private/var/... — two strings, one dir: the H3 edge)
+LOGD35="$(mktemp -d)"; PHYD35="$(cd "$LOGD35" && pwd -P)"
+SP35="33333333-3333-3333-3333-333333333333"; S735="44444444-4444-4444-4444-444444444444"
+TF35R=$(mktemp -u); SF35R=$(mktemp -u)
+printf '2026-01-01 00:00:01\tfeat/sp35\tsurface:12\t%s\tsurface:1\tspace dir\tmain\tuuid=11111111-1111-1111-1111-111111111111:provider=anthropic:pm=auto\n' "$DSP35" >  "$TF35R"
+printf '2026-01-01 00:00:02\tfeat/f7-35\tsurface:13\t%s\tsurface:1\tseven field row\tmain\n' "$D735" >> "$TF35R"
+printf '2026-01-01 00:00:03\tfeat/log35\tsurface:14\t%s\tsurface:1\tlogical dir row\tmain\tuuid=55555555-5555-5555-5555-555555555555:provider=anthropic:pm=plan\n' "$LOGD35" >> "$TF35R"
+printf '%s\tblocked\t100\n' "$DSP35" > "$SF35R"
+printf '%s\tidle\t100\n' "$LOGD35" >> "$SF35R"
+printf '%s\tworking\t100\n' "$RD35/elsewhere" >> "$SF35R"
+python3 - "$SP35" "$DSP35" "$S735" "$D735" > "$S35/store35b.json" <<'PY35'
+import json, sys
+sp, dsp, s7, d7 = sys.argv[1:5]
+json.dump({"sessions": {
+  "33333333-0000-0000-0000-000000000001": {"surfaceId": sp, "cwd": dsp, "updatedAt": 200},
+  "44444444-0000-0000-0000-000000000002": {"surfaceId": s7, "cwd": d7, "updatedAt": 200},
+}, "version": 3}, sys.stdout)
+PY35
+{ printf '  surface:41\t%s\tw1\n' "$SP35"; printf '  surface:42\t%s\tw1\n' "$S735"; } > "$S35/live.resume"
+: > "$CC_35_LOG"; rm -f "${CC_35_LOG}.nscnt"
+CC_35_LIVE="$S35/live.resume" CC_35_SCREEN="$S35/scr-tui" \
+env HOME="$FH35" PATH="$S35:$OP35" TMPDIR="$TMPDIR" CC_TASKS_FILE="$TF35R" CC_STATUS_FILE="$SF35R" \
+  CC_TABS_FILE="$(mktemp -u)" CC_CMUX_SESSIONS="$S35/store35b.json" CC_RESUME_SETTLE=0 \
+  CC_SEND_VERIFY_SEC=0.1 CC_WT_PRETRUST=0 CC_SEND_FAILLOG="$S35/fail" \
+  bash -c 'printf "y\n" | "$0" resume --all' "$FH35/.config/cc-stack/cc-dispatch.sh" >/dev/null 2>&1
+# spec §3.5 #1 — _ccres_dropstatus split on whitespace; a dir WITH A SPACE never lost its row
+eq "35 resume clears a space-dir sidecar row" "$(grep -cF "$DSP35" "$SF35R")" "0"
+eq "35 resume clears the reopened dir's sidecar row" "$(grep -cF "$LOGD35" "$SF35R")" "0"
+eq "35 resume keeps unrelated sidecar rows"  "$(grep -cF "$RD35/elsewhere" "$SF35R")" "1"
+# spec §3.5 #6 — the old $3=r OFS rebuild widened legacy rows; the facade rewrite must not
+eq "35 resume keeps a 7-field row 7 fields" \
+  "$(awk -F'\t' -v d="$D735" '$4==d{print NF}' "$TF35R")" "7"
+eq "35 7-field row still got its ref refreshed" \
+  "$(awk -F'\t' -v d="$D735" '$4==d{print $3}' "$TF35R")" "surface:42"
+# H3 — the recorded dir string survives the refresh as the row's own field (the facade matches it
+# through the canonical form; what it writes back is the RECORDED string), and the reopened tab
+# went to that dir (surface canonicalizes for cmux, as it always has)
+eq "35 refreshed row keeps its logical dir string" \
+  "$(awk -F'\t' -v d="$LOGD35" '$4==d{print $4}' "$TF35R")" "$LOGD35"
+eq "35 logical row's tab reopened in its dir" \
+  "$(grep 'NEWSURF' "$CC_35_LOG" | grep -cF -- "--working-directory $PHYD35")" "1"
+
+rm -rf "$S35" "$FH35" "$R35" "$RD35" "$DD35"
+rm -f "$TF35" "$TB35" "$TF35C" "$TB35C" "$TF35R" "$SF35R"
+unset CC_35_LOG CC_35_SCREEN CC_35_DIR CC_35_LIVE
+if [ -n "$sv35TMP" ]; then export TMPDIR="$sv35TMP"; else unset TMPDIR; fi
+cc_sandbox_ledgers
+
+echo ""
 echo "== 25. commit gate: git's own pre-commit hook (migrated 2026-08-16) =="
 # The gate that says "a worktree sub-task may not commit without the human" used to be a PreToolUse
 # hook that parsed the TEXT of every Bash command and guessed the commit's target directory out of
