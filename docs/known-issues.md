@@ -537,6 +537,25 @@ checkout / 安装目录只读」(dispatch-fixes 线在加)。长期根治归 bac
 - 无论哪种,**恢复手段已经有了且实测可用**:`cc-dispatch.sh send <ref> "继续"` 就能把它推回去
   (本次即如此);真卡死到键盘不响应时走 `close` + `resume`(见下一条)。
 
+## busy 判定对每个 turn 的头 ~1 秒是瞎的(2026-08-23,feat/ccsend-queued 采样实测,OPEN)
+
+```
+CCSEND_BUSY_PATTERNS_DEFAULT='^(·|✢|✳|✶|✻|✽) .*[(][0-9]+[smh]'
+
+  MISS  <✽ Zesting… >                        ← turn 刚开始的形态,没有时长括号
+  HIT   <✽ Zesting… (3s · ↓ 1.2k tokens)>    ← ~1s 之后才渲染出括号
+```
+
+45 帧/秒的实况采样里,一个 turn 开头连续 **60 帧(≈1.3 s)** 全是无括号形态,`_ccsend_busyhit` 全 MISS。
+
+**为什么没顺手放宽 pattern**(ccsend-queued 线的判断,父会话复核认可):
+① `_ccsend_busyhit` 匹配的是**整屏任意一行**,不是自底向上取最后一个 ——
+放宽成 `<glyph> <word>…` 会被 transcript 里的正文命中;
+② busyhit 一命中就**整个跳过 post-send verify** —— 拿它换这 1 秒窗口,
+代价是别处所有真 parked 都不再被兜住。这个改动要单独设计,不该顺手做。
+
+**影响面不止 cc-send**:任何"这个 tab 在忙吗"的判断都吃这套 pattern。
+
 ## cc-send parked 假阳性的根因找到了:"Press up to edit queued messages"(2026-08-22 晚,面包屑抓到)
 
 audit-0821 的 dispatch-fixes 线让报警带上**匹配行原文**,这次直接把根因交出来了:
