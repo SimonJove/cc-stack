@@ -7,9 +7,9 @@
 # Usage: cc-board.sh log <worktree-dir> <surface_ref> <caller_surface> <initial-prompt> [parent-branch] [launch-args]
 #          append one worktree sub-task record (the single write point; absorbs cc-tasks-log.sh)
 # Usage: cc-board.sh [--all] [--archive]
-#   (default)  live board: worktree-tasks.tsv joined with the worktree-status.tsv sidecar
+#   (default)  live board: the task list (via cc-state) joined with the status sidecar
 #   --all      disable the repo filter (rows from every repo)
-#   --archive  render worktree-tasks-archive.tsv (merged tasks; what gwt-log shows)
+#   --archive  render the task archive (merged tasks; what gwt-log shows)
 # Columns (TAB before STATUS keeps the historical header contract): TAB | BRANCH | PARENT |
 #   STATUS | DIR | TASK.
 #   TAB     cmux surface liveness (one list-pane-surfaces call PER WORKSPACE when ping succeeds —
@@ -20,18 +20,25 @@
 #           then cc-merge.sh get-parent's trunk heuristic; "-" when nothing resolves
 #   STATUS  sidecar join on dir: working(23m) / idle(2h) / blocked(5m) / "-" ("?" age on a
 #           malformed ts) — never "ready": readiness stays owned by gwt-done + a clean tree
-# Row rules: rows whose dir no longer exists are pruned on read (locked rewrite under the
-#   same mkdir lock the log subcommand appends with) — from the tasks list AND from the status
-#   sidecar, which nothing but gwt-prune/gwt-rm used to sweep; the NEWEST row per dir wins (the
-#   archive keeps every row — it's a log, and its dirs are often gone by design, and rendering
-#   it never rewrites either live file).
-# Reading the TSVs: awk -F'\t' only, and rewrites re-emit whole rows — see the discipline note
-#   below; a `read` loop collapses runs of TAB and fossilizes the shift on the next rewrite.
-# Repo filter: only rows under the caller's MAIN repo root (the _cc_gitroot discipline, see the
-#   F1 note below — git-common-dir resolved INSIDE the target dir, so a linked worktree maps to
-#   its parent repo; --show-toplevel would answer the worktree itself), BOTH sides canonicalized
-#   with pwd -P — git reports the physical /private/var/... form on macOS while a stored row can
-#   carry the logical /var/... form; outside any repo (or with --all) everything shows.
+# Row rules: the render owns no state access anymore — cc-state task-list answers "which rows
+#   does this board show" (newest-per-dir, dead dirs skipped at read, repo filter inside the
+#   facade); cc-state task-prune (live board only) is the locked sweep of the pair (tasks list
+#   AND status sidecar) that a read used to do inline; the archive keeps every row in file
+#   order (it's a log, its dirs are often gone by design, and rendering it rewrites nothing).
+# Reading rows: awk -F'\t' only, over the facade's TSV output — see the discipline note below;
+#   a `read` loop collapses runs of TAB and would shift every field after an empty one.
+# Repo filter: only rows under the caller's MAIN repo root — the root is computed HERE (the
+#   _cc_gitroot discipline, see the F1 note below — git-common-dir resolved INSIDE the target
+#   dir, so a linked worktree maps to its parent repo; --show-toplevel would answer the
+#   worktree itself) and handed to `cc-state task-list --repo`, which canonicalizes both sides
+#   (realpath) so the physical /private/var/... form on macOS still meets a stored /var/... row;
+#   outside any repo (or with --all) everything shows.
+# Dir form: rows are trusted as written — production writes pwd -P paths and cc-state task-add
+#   canonicalizes on write. The render's old read-side re-canonicalization (the CANON join
+#   table) is gone with the facade swap: a hand-written logical-form row renders with its
+#   recorded string (the honest record of how it was logged — gate-ruled INTENTIONAL), while
+#   its STATUS still joins, because the sidecar join lives in the facade's --with-state and
+#   keys on the dir rule that knows both the /var and the /private/var form.
 set -u
 
 # ── log subcommand: append one worktree sub-task record (absorbs cc-tasks-log.sh) ─────────
@@ -96,50 +103,30 @@ done
 SELF="$(cd "$(dirname "$0")" 2>/dev/null && pwd -P)"
 MERGE="$SELF/cc-merge.sh"
 [ -f "$MERGE" ] || MERGE="$HOME/.config/cc-stack/cc-merge.sh"
+STATE="$SELF/cc-state"
+[ -f "$STATE" ] || STATE="$HOME/.config/cc-stack/cc-state"
 
 tasks="${CC_TASKS_FILE:-$HOME/.config/cc-stack/worktree-tasks.tsv}"
 status="${CC_STATUS_FILE:-$HOME/.config/cc-stack/worktree-status.tsv}"
 arch="${CC_ARCHIVE_FILE:-$HOME/.config/cc-stack/worktree-tasks-archive.tsv}"
-if [ -n "$archive" ]; then f="$arch"; else f="$tasks"; fi
 
-ccb_canon1(){ CDPATH= cd -- "$1" >/dev/null 2>&1 && pwd -P; }   # one-shot (forks); the render uses the batched map below
+ccb_canon1(){ CDPATH= cd -- "$1" >/dev/null 2>&1 && pwd -P; }   # one-shot (forks); the repo-root block below
 
 # ── TSV access discipline (2026-08-16 audit, F1) ───────────────────────────────────────
-# NEVER `while IFS=$'\t' read -r a b c …` over these files. TAB is IFS *whitespace*, so bash
-# AND zsh collapse RUNS of it: one empty field (parent on a detached HEAD — cc-dispatch.sh's
+# NEVER `while IFS=$'\t' read -r a b c …` over TSV rows. TAB is IFS *whitespace*, so bash AND
+# zsh collapse RUNS of it: one empty field (parent on a detached HEAD — cc-dispatch.sh's
 # `git symbolic-ref --short HEAD` is empty there — or caller on a hand-written row) shifts every
-# later field left. Displaying a shifted row is cosmetic; a rewriter that re-printf's the shifted
-# VARIABLES writes the shift back and makes it permanent — launch-args lands in the PARENT column,
-# after which gwt-resume finds no uuid= (degrades the tab to idle) and `cc-dispatch.sh close`
-# finds no csuuid/suuid (fail-closed: refuses to close the tab; the "three tabs only a human
-# could close" incident). So: field access goes through awk -F'\t' (the idiom cc-dispatch.sh's
-# resume block already documents), and every rewrite re-emits $0 VERBATIM, selecting rows by line
-# number. That is also what keeps 7-field legacy rows, 8-field live rows and 9-field archive rows
-# byte-identical across a rewrite — no format migration, no placeholder backfill.
+# later field left. Displaying a shifted row is cosmetic; a REWRITER that re-printf's the shifted
+# variables writes the shift back and makes it permanent (launch-args lands in the PARENT column,
+# after which gwt-resume finds no uuid= and `cc-dispatch.sh close` fail-closes). The board no
+# longer rewrites anything — cc-state owns every write now — but the reading rule stands:
+# field access goes through awk -F'\t', selecting by NUMBER so 7-field legacy rows, 8-field live
+# rows and 9-field archive rows all pass through byte-identically.
 US="$(printf '\037')"   # record delimiter for awk→shell handoffs: NOT IFS whitespace, so `read`
                         # preserves empty fields between two of them (a TAB would collapse them)
 NL='
 '
 ccb_has(){ case "$1" in *"$2"*) return 0 ;; esac; return 1; }   # substring test, fork-free
-ccb_dead_lines(){  # <file> <dir-field-no> → line numbers whose dir field is empty or gone
-  local _l="" _d="" _out=""
-  while IFS=$'\t' read -r _l _d; do
-    [ -n "$_d" ] && [ -d "$_d" ] || _out="$_out $_l"
-  done < <(awk -F'\t' -v c="$2" '{print NR "\t" $(c)}' "$1")
-  printf '%s' "$_out"
-}
-ccb_drop_lines(){  # <file> <line numbers> → rewrite <file> without them, every kept row verbatim
-  local _tmp="$1.tmp.$$"
-  awk -v drop="$2" 'BEGIN{n=split(drop,a," "); for(i=1;i<=n;i++) D[a[i]]=1} !(FNR in D)' "$1" > "$_tmp" || return 1
-  mv "$_tmp" "$1"
-  [ -s "$1" ] || rm -f "$1"
-  return 0
-}
-ccb_lock(){    # <file> → take the shared mkdir lock (atomic; macOS lacks flock), "1" when acquired
-  local _i=0
-  while [ "$_i" -lt 60 ]; do mkdir "$1.lock" 2>/dev/null && { printf '1'; return 0; }; sleep 0.05; _i=$((_i+1)); done
-  return 0
-}
 
 # repo-filter root: the caller's git top-level from PWD, canonicalized ("" → no filter)
 # F1 fix: use the same discipline as _cc_gitroot in cc-dispatch.sh — a linked worktree must resolve
@@ -178,32 +165,44 @@ if [ -z "$all" ]; then
   fi
 fi
 
-# ── prune-on-read (live board only): drop rows whose dir no longer exists ──────────────
-# Same rewrite discipline as worktree.zsh's _gwt_tasks_rewrite: read→rewrite under the mkdir
-# lock shared with the log subcommand's append, so a concurrent append can't be lost. Rows are
-# selected by LINE NUMBER and re-emitted verbatim — see the TSV access discipline above.
-if [ -z "$archive" ] && [ -f "$tasks" ]; then
-  got="$(ccb_lock "$tasks")"
-  ccb_drop_lines "$tasks" "$(ccb_dead_lines "$tasks" 4)"
-  [ -n "$got" ] && rmdir "$tasks.lock" 2>/dev/null
+# ── prune-on-read (live board only) ────────────────────────────────────────────────────
+# ONE facade call replaces the two inline locked sweeps this render used to run. cc-state
+# task-prune always sweeps the pair — the tasks list AND the status sidecar (which used to be
+# swept by nothing but gwt-prune/gwt-rm and grew forever) — under the single lock the facade
+# owns, with the same keep rule: dir field non-empty and still a directory. Live board only:
+# the archive is history and its dirs are gone by design, and the SIDECAR must not be swept as
+# a side effect of reading history either.
+if [ -z "$archive" ]; then
+  "$STATE" task-prune
 fi
 
-# ── sidecar prune-on-read (live board only) ────────────────────────────────────────────
-# worktree-status.tsv used to be swept only by gwt-prune / gwt-rm, so it grew forever (9 rows of
-# long-dead test dirs on the author's machine, the oldest three days old). The board already asks
-# "does this dir still exist?" once per row, so sweeping the sidecar here is free. Its own mkdir
-# lock — the one cc-hooks.sh status appends under — not the tasks lock. Live board only: the
-# archive is history and its dirs are gone by design, but the SIDECAR is live state either way,
-# so `--archive` must leave it alone rather than sweep it as a side effect of reading history.
-if [ -z "$archive" ] && [ -f "$status" ]; then
-  sgot="$(ccb_lock "$status")"
-  ccb_drop_lines "$status" "$(ccb_dead_lines "$status" 1)"
-  [ -n "$sgot" ] && rmdir "$status.lock" 2>/dev/null
+# ── the rows: one facade call ──────────────────────────────────────────────────────────
+# task-list = newest-per-dir + repo filter + dead-dir skip in one pass, newest-first — exactly
+# what the render's old inline pipeline (tail -r + the awk SEEN dedup + the shell case filter)
+# produced. --repo gets the root computed above; --all, or an empty root (outside any repo),
+# means no filter. --archive reads the history store instead: every row, file order, same
+# repo filter. --with-state (live board only) appends the sidecar's state + epoch per row and
+# joins on the facade's dir rule — a legacy logical /var row still finds the canonical
+# /private/var key the hook writes, which a caller-side join on the raw string cannot
+# (gate round 2). The archive never displays state, so it skips the decoration.
+if [ -n "$archive" ]; then
+  wstate=""
+else
+  wstate="--with-state"
+fi
+if [ -n "$all" ] || [ -z "$root" ]; then
+  rows_src="$("$STATE" task-list ${archive:+--archive} $wstate)"
+else
+  rows_src="$("$STATE" task-list ${archive:+--archive} $wstate --repo "$root")"
 fi
 
-if [ ! -f "$f" ]; then
-  if [ -n "$archive" ]; then echo "no archived tasks"; else echo "no registered worktree tasks"; fi
-  exit 0
+if [ -z "$rows_src" ]; then
+  if [ -n "$archive" ]; then
+    [ -f "$arch" ] || { echo "no archived tasks"; exit 0; }
+    echo "no records"; exit 0    # the store exists but nothing renders (e.g. all rows foreign)
+  fi
+  [ -f "$tasks" ] || { echo "no registered worktree tasks"; exit 0; }
+  echo "no records"; exit 0      # same split the old render kept: file gone ≠ nothing matched
 fi
 
 # ── tab liveness: one cmux probe per WORKSPACE (live board only) ──────────────────────
@@ -245,19 +244,17 @@ some_live=""
 if [ -n "$live" ]; then
   while IFS= read -r r; do
     if ccb_has "$live" "$r"; then some_live=1; break; fi
-  done < <(awk -F'\t' '$3 != "" {print $3}' "$f")
+  done < <("$STATE" dump tasks | awk -F'\t' '$3 != "" {print $3}')
 fi
 
 # ── batched joins (F13) ────────────────────────────────────────────────────────────────
-# The board is the most-run command in this stack and it used to fork 4-5 times PER ROW — a
-# `pwd -P` subshell, a `grep` for the newest-per-dir dedup, a `grep` for tab liveness, an `awk`
-# over the sidecar, a `git config` for the merge target — plus the `x="$(helper)"` capture
-# itself, which is another fork each. 40 rows cost 421ms here.
-# Every one of those is a JOIN, so each source is now read ONCE into a table and all the joins
-# happen in the single awk pass that builds the render stream (awk hashes; the bash 3.2
-# alternative — string tables scanned with ## / case — measured 4x SLOWER than forking at 40
-# rows, because a leading-`*` glob over a growing string is quadratic). The shell loop below
-# then only formats: no forks, no scans. Fallbacks that cannot be batched (a row that is not a
+# The board is the most-run command in this stack and used to fork 4-5 times PER ROW. The state
+# joins (newest-per-dir, dir canonicalization, the dead-dir question) now all happen inside
+# cc-state task-list; the two GIT joins below stay here — branch → merge target and the
+# registered-worktree list — read ONCE PER REPO instead of once per row, and joined in the single
+# awk pass that builds the render stream (awk hashes; the bash 3.2 alternative — string tables
+# scanned with ## / case — measured 4x SLOWER than forking at 40 rows). The shell loop below then
+# only formats: no forks, no scans. Fallbacks that cannot be batched (a row that is not a
 # registered worktree of any repo) keep the original per-row git calls.
 ccb_now="$(date +%s)"
 ccb_age_v=""
@@ -271,25 +268,14 @@ ccb_age(){   # <unix-ts> → ccb_age_v = 23m / 2h / 5d; "?" on a malformed ts
   else ccb_age_v="$(( age / 86400 ))d"; fi
 }
 
-# TABLE 1 — dir → physical dir. One subshell for ALL of them: cd and pwd are builtins, so the
-# cost was never the resolution, it was the `$( )` around each one. Relative rows keep resolving
-# against the board's own cwd (we cd back every iteration).
-ccb_pwd0="$PWD"
-ccb_dirs="$(awk -F'\t' '$4 != "" {print $4}' "$f" | sort -u)"
-ccb_cmap="$(printf '%s\n' "$ccb_dirs" | while IFS= read -r _d; do
-    [ -n "$_d" ] || continue
-    CDPATH= cd -P -- "$_d" 2>/dev/null && printf '%s\t%s\n' "$_d" "$PWD"   # -P: $PWD is LOGICAL without it
-    cd -- "$ccb_pwd0" 2>/dev/null || :
-  done)"
-
-# TABLE 2/3 — branch → merge target, read once PER REPO instead of once per row, plus the repo's
-# registered-worktree list. A worktree shares its repo's config, so the candidate root derived
-# from the layout (<root>/.claude/worktrees/<n> or <root>/.worktrees/<n>) is only TRUSTED for a
-# dir git itself lists as a worktree of it. Anything else — a hand-written row, a nested repo, an
-# exotic layout — falls back to the original per-row `git -C <dir> config`, so a branch name that
+# TABLE 2/3 — branch → merge target, plus the repo's registered-worktree list, one read per
+# repo. A worktree shares its repo's config, so the candidate root derived from the row dir's
+# layout (<root>/.claude/worktrees/<n> or <root>/.worktrees/<n>) is only TRUSTED for a dir git
+# itself lists as a worktree of it. Anything else — a hand-written row, a nested repo, an exotic
+# layout — falls back to the original per-row `git -C <dir> config`, so a branch name that
 # exists in two repos can never put the wrong merge target in the column.
 ccb_pmap=""; ccb_pwt=""; ccb_roots="$NL"
-while IFS=$'\t' read -r _raw _c; do
+while IFS= read -r _c; do
   [ -n "$_c" ] || continue
   case "$_c" in
     */.claude/worktrees/*) _r="${_c%/.claude/worktrees/*}" ;;
@@ -311,21 +297,21 @@ while IFS=$'\t' read -r _raw _c; do
   ccb_pwt="$ccb_pwt$(git -C "$_r" worktree list --porcelain 2>/dev/null \
       | awk -v r="$_r" '/^worktree /{print r "\t" substr($0,10)}')
 "
-done <<< "$ccb_cmap"
+done <<< "$(printf '%s\n' "$rows_src" | awk -F'\t' '$4 != "" {print $4}' | sort -u)"
 
 # ── render ─────────────────────────────────────────────────────────────────────────────
-# Live board reads the file bottom-up so the FIRST time a dir appears is its newest record (and
-# every later row for that dir is dropped); the archive keeps every row in file order (it's a
-# history). One awk pass picks the displayed fields BY NUMBER — which is what makes the trailing
-# fields a non-issue: the archive's merged-at (8th on a legacy row, 9th behind launch-args) is
-# simply not selected and can no longer be absorbed into PARENT — and joins every table above,
-# emitting a US-delimited stream the shell only has to format. US, not TAB: it is not IFS
-# whitespace, so `read` keeps a row's empty fields instead of collapsing them.
+# Input is the facade's row list — newest-first, deduped, repo-filtered for the live board,
+# and state-decorated (--with-state appends state \t epoch; '-' + '' when the sidecar has no
+# row); every row in file order for the archive, undecorated. One awk pass picks the displayed
+# fields BY NUMBER — which is what makes the trailing fields a non-issue: the archive's
+# merged-at (8th on a legacy row, 9th behind launch-args) is simply not selected and can no
+# longer be absorbed into PARENT — and joins the tables above, emitting a US-delimited stream
+# the shell only has to format. US, not TAB: it is not IFS whitespace, so `read` keeps a row's
+# empty fields instead of collapsing them.
 # Tables travel in the ENVIRONMENT rather than -v: awk expands escape sequences in a -v value,
 # which would corrupt any path holding a backslash.
-rows="$({ [ -z "$archive" ] && tail -r "$f" || cat "$f"; } | \
-  CCB_CMAP="$ccb_cmap" CCB_SMAP="$([ -f "$status" ] && cat "$status" 2>/dev/null)" \
-  CCB_PMAP="$ccb_pmap" CCB_PWT="$ccb_pwt" CCB_LIVE="$live" CCB_ARCH="$archive" \
+rows="$(printf '%s\n' "$rows_src" | \
+  CCB_PMAP="$ccb_pmap" CCB_PWT="$ccb_pwt" CCB_LIVE="$live" \
   awk -F'\t' -v OFS="$US" '
   function lastidx(s, t,   p, off, at) {           # last occurrence of t in s (0 = none)
     off = 0; at = 0
@@ -333,21 +319,18 @@ rows="$({ [ -z "$archive" ] && tail -r "$f" || cat "$f"; } | \
     return at
   }
   BEGIN {
-    n = split(ENVIRON["CCB_CMAP"], L, "\n")                       # raw dir → physical dir
-    for (i = 1; i <= n; i++) { p = index(L[i], "\t"); if (p) CANON[substr(L[i], 1, p-1)] = substr(L[i], p+1) }
-    n = split(ENVIRON["CCB_SMAP"], L, "\n")                       # dir → state \t ts (last row wins)
-    for (i = 1; i <= n; i++) { p = index(L[i], "\t"); if (p) ST[substr(L[i], 1, p-1)] = substr(L[i], p+1) }
     n = split(ENVIRON["CCB_PMAP"], L, "\n")                       # root, branch → merge target
     for (i = 1; i <= n; i++) { if (split(L[i], F, "\t") == 3) PP[F[1], F[2]] = F[3] }
     n = split(ENVIRON["CCB_PWT"], L, "\n")                        # root, dir → registered worktree
     for (i = 1; i <= n; i++) { if (split(L[i], F, "\t") == 2) WT[F[1], F[2]] = 1 }
-    LIVE = ENVIRON["CCB_LIVE"]; ARCH = ENVIRON["CCB_ARCH"]
+    LIVE = ENVIRON["CCB_LIVE"]
   }
   $4 != "" {
-    c = ($4 in CANON) ? CANON[$4] : $4
-    if (ARCH == "") { if (c in SEEN) next; SEEN[c] = 1 }
-    st = ""; ts = ""
-    if (c in ST) { s = ST[c]; p = index(s, "\t"); if (p) { st = substr(s, 1, p-1); ts = substr(s, p+1) } else st = s }
+    c = $4
+    st = ($(NF-1) == "-" ? "" : $(NF-1)); ts = $NF                  # facade-joined sidecar columns
+                                                                    # (last two: the pair appends after
+                                                                    #  launch-args on 8-field rows, after
+                                                                    #  parent on 7-field legacy rows)
     rt = ""
     p = lastidx(c, "/.claude/worktrees/"); if (p > 0) rt = substr(c, 1, p-1)
     else { p = lastidx(c, "/.worktrees/"); if (p > 0) rt = substr(c, 1, p-1) }
@@ -359,9 +342,6 @@ rows="$({ [ -z "$archive" ] && tail -r "$f" || cat "$f"; } | \
 n=0; out=""
 while IFS="$US" read -r cdir br ref task parent state sts parcfg auth livehit candroot; do
   [ -n "$cdir" ] || continue
-  if [ -n "$root" ]; then
-    case "$cdir" in "$root"|"$root"/*) ;; *) continue ;; esac
-  fi
   if [ -n "$archive" ]; then
     tab="-"; cell="-"
   else
