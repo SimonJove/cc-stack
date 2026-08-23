@@ -56,6 +56,10 @@ CC_SELF="$( (CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd -P) 2>/dev/nu
 #                                         silently pretend success
 #   input line has text                 → a human is composing → sleep 0.5, retry (their submit
 #                                         empties the line; the next round preempts)
+#   input line = queued-message hint    → the target ALREADY holds queued messages, i.e. it IS
+#                                         working — same terminal state as the busy fast-path:
+#                                         send NOW and report "(queued)", never hold, never verify
+#                                         (patterns: CC_SEND_QUEUED_PATTERNS)
 #   timeout (CC_SEND_TIMEOUT, def 60s)  → cmux notify (held duration + a blocked-by preview of
 #                                         the blocking line: CC_SEND_PREVIEW_CHARS, def 40, 0=off),
 #                                         then RE-NOTIFY every CC_SEND_HEARTBEAT_SEC (def 300,
@@ -96,14 +100,54 @@ CCSEND_LINES=40        # read-screen window: wide enough that a wrapped draft's 
 # miss but not a silent one; a literal paren is [(].
 CCSEND_BUSY_PATTERNS_DEFAULT='^(·|✢|✳|✶|✻|✽) .*[(][0-9]+[smh]'
 
-_ccsend_eval() {       # stdin: screen text → prints "empty<TAB>line" | "busy<TAB>line" | "unknown"
-                       # (the state evaluator; the line text after the tab feeds the blocked-by
-                       # preview of the hold notify — read-only reuse of the same capture, the
-                       # delivered text never passes through here. "unknown" deliberately carries
-                       # NO tab so exact string compares against it keep working, _ccsend_calibrate)
-  awk -v pl="${CC_SEND_INPUT_PATTERNS:-$CCSEND_PATTERNS_DEFAULT}" '
+# Queued-message patterns (hardening layer 6, 2026-08-23) — the OTHER thing a claude input box
+# renders instead of a draft. When the target has messages QUEUED, the box holds no text at all;
+# it holds a HINT, drawn inside the box with the ordinary prompt prefix:
+#
+#     ────────────────────────────────────────────
+#     ❯ Press up to edit queued messages          ← live probe, byte-exact: ❯ + ASCII space + text
+#     ────────────────────────────────────────────
+#
+# To the bottom-up scan in _ccsend_eval that is indistinguishable from "someone left a draft in
+# the box" — which is exactly how it produced the parked FALSE ALARM of 2026-08-22 23:16 (the
+# breadcrumb's matched line was this hint verbatim). So the verdict has a THIRD value: the hint is
+# matched against the post-prompt REST of the input line (never against the raw line — the input
+# patterns above own the prompt end of it, and widening THEM would weaken real parked detection,
+# which is the one thing this must not do). Same list contract as the two lists above:
+# CC_SEND_QUEUED_PATTERNS (colon-separated ERE list) REPLACES the default, entries auto-anchor to
+# the START of the rest, and empty entries are SKIPPED — an empty ERE matches every rest, which
+# would classify a genuinely parked draft as "queued" and silence the true positives.
+#
+# Live probe 2026-08-23 (claude 2.1.233 + cmux, own tab, 45 frames/s across an idle→send→queued
+# transition), which is also why this cannot be fixed by widening the busy fast-path instead:
+#   frame  state
+#   s0001  busyhit MISS, box "❯ " empty              ← the gate reads here: the target IS idle
+#   s0003  busyhit MISS, box "❯ Press up …"          ← +45ms: queued ALREADY, and still no hit
+#   s0040  busyhit HIT,  box "❯ Press up …"          ← +0.8s: only now does busyhit see anything
+# The send ITSELF is what makes the target work (cmux's `send` submits on every embedded newline,
+# so a multi-line payload's first line starts a turn and the rest lands in the queue) — a target
+# that reads idle at the gate can be queueing 45ms later. And busyhit is blind for that first
+# ~1s because a turn OPENS with a duration-less working line, byte-exact from the same probe:
+#     "\xe2\x9c\xbd Zesting\xe2\x80\xa6 "   →  ✽ Zesting…      (glyph, gerund, ellipsis, no parens)
+# while CCSEND_BUSY_PATTERNS_DEFAULT requires "([0-9]+[smh]" — the duration only appears once the
+# turn is ~1s old. Widening THAT list is the wrong lever anyway: busyhit matches ANY line of the
+# capture, so a looser "<glyph> <word>…" entry would also fire on transcript prose, and a busyhit
+# hit SKIPS the post-send verify entirely — it would buy this window at the cost of every parked
+# message elsewhere. The hint is up from the first frame, sits in the input box where only the
+# live composer renders, and is the earlier, narrower, harder signal.
+CCSEND_QUEUED_PATTERNS_DEFAULT='^Press up to edit queued messages'
+
+_ccsend_eval() {       # stdin: screen text → "empty<TAB>line" | "busy<TAB>line" | "queued<TAB>line"
+                       # | "unknown" (the state evaluator; the line text after the tab feeds the
+                       # blocked-by preview of the hold notify — read-only reuse of the same
+                       # capture, the delivered text never passes through here. "unknown"
+                       # deliberately carries NO tab so exact string compares against it keep
+                       # working, _ccsend_calibrate)
+  awk -v pl="${CC_SEND_INPUT_PATTERNS:-$CCSEND_PATTERNS_DEFAULT}" \
+      -v ql="${CC_SEND_QUEUED_PATTERNS:-$CCSEND_QUEUED_PATTERNS_DEFAULT}" '
     BEGIN {
       n = split(pl, P, ":")
+      nq = split(ql, Q, ":")
       nbsp = sprintf("%c", 194) sprintf("%c", 160)   # U+00A0 no-break space, UTF-8 byte pair — the
                                                      # claude TUI renders the empty input line as
                                                      # prompt + NBSP cursor placeholder (probed), so
@@ -126,7 +170,16 @@ _ccsend_eval() {       # stdin: screen text → prints "empty<TAB>line" | "busy<
             sub(/^[ \t]+/, "", rest)         # NBSP cursor placeholder → space; trimmed so the
                                              # preview shows the draft, not a leading blank
                                              # (all-whitespace still reads empty below)
-            print ((rest ~ /^[ \t\r]*$/) ? "empty" : "busy") "\t" rest
+            st = (rest ~ /^[ \t\r]*$/) ? "empty" : "busy"
+            if (st == "busy")                # a non-empty box is only a DRAFT if it is not the
+              for (k = 1; k <= nq; k++) {    # queued-message hint (see the block comment above)
+                q = Q[k]; sub(/^\^/, "", q)
+                if (q == "") continue        # empty entry: an empty ERE matches EVERY rest → every
+                                             # parked draft would read "queued" and the true
+                                             # positives would go silent. Skip, exactly like above.
+                if (match(rest, "^" q)) { st = "queued"; break }
+              }
+            print st "\t" rest
             exit
           }
         }
@@ -175,6 +228,14 @@ _ccsend_verify() {     # $1 = ref — post-send verification, EMPTY-path deliver
                        # the raw send DID return OK, and a cmux hiccup must not fail an honest
                        # delivery. CC_SEND_VERIFY_SEC (default 1) spaces the re-reads (tests
                        # shrink it).
+                       # rc 2 = QUEUED: the box holds the queued-message HINT, not a draft — the
+                       # send landed and the target is working through its queue. This is the
+                       # empty-path twin of the busy fast-path's legal end state, and it is
+                       # reachable on BOTH re-reads: the target goes idle → queued inside the send
+                       # itself (probed 2026-08-23, see CCSEND_QUEUED_PATTERNS_DEFAULT), and the
+                       # ONE Enter retry can submit a genuinely parked draft into a target that is
+                       # working by then. No retry is fired on a queued box — there is nothing in
+                       # it to submit, and the queue is not ours to poke.
   local ref verdict w line_text _ccsend_crumb_txt
   ref="$1"
   w="${CC_SEND_VERIFY_SEC:-1}"; case "$w" in ''|*[!0-9.]*|.*|*.|*.*.*) w=1 ;; esac
@@ -182,11 +243,13 @@ _ccsend_verify() {     # $1 = ref — post-send verification, EMPTY-path deliver
   verdict="$(cmux read-screen --surface "$ref" --lines "$CCSEND_LINES" 2>/dev/null | _ccsend_eval)"
   line_text="${verdict#*$'\t'}"  # F2 fix: capture the matched line text for the breadcrumb
   case "${verdict%%$'\t'*}" in
+    queued) return 2 ;;                                                 # delivered, target working
     busy) cmux send-key --surface "$ref" Enter >/dev/null 2>&1 || true   # the ONE retry
           sleep "$w"
           verdict="$(cmux read-screen --surface "$ref" --lines "$CCSEND_LINES" 2>/dev/null | _ccsend_eval)"
           line_text="${verdict#*$'\t'}"
           case "${verdict%%$'\t'*}" in
+            queued) return 2 ;;                                         # the retry submitted it
             busy) # F2 fix: include the matched line text (truncated to 120 chars, TAB/newlines stripped) in the breadcrumb
                   _ccsend_crumb_txt="$(printf '%s' "$line_text" | tr '\t' ' ' | tr '\n' ' ' | cut -c1-120)"
                   echo "✗ cc-send: sent to $ref but the input line still holds text after one Enter retry — the message may be parked in the composer; finish it by hand (see docs/known-issues.md)" >&2
@@ -198,7 +261,7 @@ _ccsend_verify() {     # $1 = ref — post-send verification, EMPTY-path deliver
 }
 
 _ccsend() {            # $1 = surface ref, $2 = text — the gate loop
-  local ref text to hb pv start now next_at scr verdict line dur prev
+  local ref text to hb pv start now next_at scr verdict line dur prev vrc
   command -v cmux >/dev/null 2>&1 || { echo "✗ cc-send: cmux not found" >&2; return 1; }
   ref="$1"; text="$2"
   to="${CC_SEND_TIMEOUT:-60}";        case "$to" in ''|*[!0-9]*) to=60 ;; esac
@@ -217,6 +280,13 @@ _ccsend() {            # $1 = surface ref, $2 = text — the gate loop
     verdict="$(printf '%s\n' "$scr" | _ccsend_eval)"
     case "${verdict%%$'\t'*}" in
       empty) break ;;
+      queued) # queued fast-path: the box holds the queued-message hint, so the target is working
+              # even though its working indicator has not rendered yet (it lags by ~0.8s — probed
+              # 2026-08-23). Same terminal state as the busy fast-path above: send now, no hold
+              # (holding for a hint that only clears when the target drains its queue is pointless),
+              # no notify, no post-send verify.
+              _ccsend_raw "$ref" "$text" && echo "✔ cc-send: delivered to $ref (queued — target working)"
+              return $? ;;
       busy)  line="${verdict#*$'\t'}" ;;     # latest blocking line → the notify blocked-by preview
       *)     # read-screen failure OR unrecognized layout → fail-open NOW (worst case = status quo)
              [ "${CC_SEND_QUIET:-0}" = "1" ] || \
@@ -244,8 +314,12 @@ _ccsend() {            # $1 = surface ref, $2 = text — the gate loop
   # _ccsend_raw already sends its own Enter, so parked launch text is submitted by that; and
   # launch sends here were historically plain fail-open (no verify, no retry) with no known
   # parking case the retry ever saved.
-  [ "${CC_SEND_NOVERIFY:-0}" = "1" ] || { _ccsend_verify "$ref" || return 1; }
-  echo "✔ cc-send: delivered to $ref"
+  vrc=0; [ "${CC_SEND_NOVERIFY:-0}" = "1" ] || { _ccsend_verify "$ref"; vrc=$?; }
+  case "$vrc" in
+    0) echo "✔ cc-send: delivered to $ref" ;;
+    2) echo "✔ cc-send: delivered to $ref (queued — target working)" ;;   # verify saw the hint
+    *) return 1 ;;
+  esac
 }
 
 _ccsend_calibrate() {  # $1 = ref, $2 = dir — self-calibration (hardening layer 4), called right

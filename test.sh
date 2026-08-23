@@ -1665,7 +1665,13 @@ case "$1" in
             case "$*" in *Enter*)
               [ -n "${CC_FAKE_FLUSH_AT:-}" ] && {
                 n=$(grep -c 'Enter$' "$CC_FAKE_LOG" 2>/dev/null); n=${n:-0}
-                [ "$n" -ge "$CC_FAKE_FLUSH_AT" ] && printf '\xe2\x9d\xaf\xc2\xa0\n' > "$CC_FAKE_SCREEN"; } ;; esac ;;
+                if [ "$n" -ge "$CC_FAKE_FLUSH_AT" ]; then
+                  # CC_FAKE_FLUSH_TO=<file> flushes TO that screen instead of the empty input line
+                  # (the retry submits the parked draft into a target that is working by then, so
+                  # what the box shows next is the queued-message hint, not a bare prompt)
+                  if [ -n "${CC_FAKE_FLUSH_TO:-}" ]; then cp "$CC_FAKE_FLUSH_TO" "$CC_FAKE_SCREEN"
+                  else printf '\xe2\x9d\xaf\xc2\xa0\n' > "$CC_FAKE_SCREEN"; fi
+                fi; } ;; esac ;;
   notify)   shift; printf 'NOTIFY|%s\n' "$*" >> "$CC_FAKE_LOG" ;;
   read-screen)
     [ -n "${CC_FAKE_FAIL:-}" ] && exit 1
@@ -1700,6 +1706,25 @@ spun(){ printf '%s Befuddling\xe2\x80\xa6 (2m 26s \xc2\xb7 \xe2\x86\x93 14.2k to
 { spun "$SP"; echo "$R20"; printf '%s%s\n'    "$P" "$NB";               echo "$R20"; } > "$FS/scr-spin-empty"
 { echo "WORKING hard now (always)"; echo "$R20"; printf '%s%s%s\n' "$P" "$NB" 'queued msg text'; } > "$FS/scr-custom-busy"
 printf '%s%s%s\n' "$P" "$NB" '[Pasted text +1]'                    > "$FS/scr-parked"     # text parked in the composer after send
+# queued-state fixtures — byte-exact from the 2026-08-23 live probe (own tab, 45 frames/s across an
+# idle → send → queued transition). The box holds the HINT, drawn with the ordinary prompt prefix
+# and an ASCII space (NOT the NBSP placeholder), and for the first ~0.8s NO working indicator is on
+# screen (frame s0003) — the indicator only renders later (s0040). scr-queued-nospin is therefore
+# the fixture that matters: it is the state the busy fast-path cannot see and the state the
+# 2026-08-22 23:16 breadcrumb caught ("matched line: \"Press up to edit queued messages\"").
+QH='Press up to edit queued messages'
+{ echo "$R20"; printf '%s %s\n' "$P" "$QH"; echo "$R20"; echo "  status"; } > "$FS/scr-queued-nospin"
+{ spun "$SP"; echo "$R20"; printf '%s %s\n' "$P" "$QH"; echo "$R20"; }      > "$FS/scr-queued-spin"
+# true-parked fixtures — the 2026-08-22 TRUE positive, pressed to its real shape: a ~1100-char
+# multi-line message of which only the first screen-width chunk reached the box, three Enters never
+# submitted it, and the process sat at 0.7% CPU (so: no working indicator either). A short toy draft
+# would pass these assertions for the wrong reason; the two adversarial ones sit right on the
+# start-anchor boundary — a draft that CONTAINS the hint, and one that starts with a PREFIX of it.
+PLONG='打回清单 · 只有第一屏宽进了输入框:'
+for _i in 1 2 3 4 5 6 7 8; do PLONG="$PLONG 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"; done
+printf '%s%s%s\n' "$P" "$NB" "$PLONG"                              > "$FS/scr-parked-long"
+printf '%s%s%s\n' "$P" "$NB" "看第三行 $QH 那句"                    > "$FS/scr-parked-contains"
+printf '%s%s%s\n' "$P" "$NB" 'Press up to edit the deploy plan'    > "$FS/scr-parked-prefix"
 { echo "$R20"; printf '%s%s%s\n' "$P" "$NB" 'user is drafting 0123456789ABCDEFGHIJ'; echo "$R20"; } > "$FS/scr-longdraft"
 # 1) empty input line → immediate send (both renderer fixtures), no notify, no crumb
 csend_reset "$FS/scr-full-empty"
@@ -1847,6 +1872,90 @@ eq "verify park-fail one retry"  "$(grep -c 'KEY|.*Enter' "$CC_FAKE_LOG")" "2"
 eq "verify park-fail no success" "$(grep -c '✔ cc-send: delivered' "$FS/out")" "0"
 eq "verify park-fail loud msg"   "$(grep -c '✗ cc-send: sent' "$FS/out")" "1"
 eq "verify park-fail crumb"      "$(grep -c 'parked after send' "$FL" 2>/dev/null)" "1"
+# 6e) queued-message state (2026-08-23): the input box holds the QUEUED-MESSAGE HINT, not a draft.
+# That is a DELIVERED end state — the empty-path twin of the busy fast-path — and reporting it as
+# parked is the false alarm of 2026-08-22 23:16 (a re-send would duplicate the message). Both sides
+# are asserted here: the queued state must go quiet, and the TRUE parked positives must stay loud.
+# ── queued side ──
+# (A) the live false positive verbatim: gate sees an EMPTY box → sends → the target was idle and the
+# send itself made it work, so the box comes back holding the hint with NO working indicator yet.
+csend_reset "$FS/scr-full-empty"
+CC_FAKE_ON_SEND="$FS/scr-queued-nospin" CC_SEND_FAILLOG="$FL" \
+  bash "$CC/cc-dispatch.sh" send surface:1 "queued after send" >"$FS/out" 2>&1; rcs=$?
+eq "queued verify rc0"           "$rcs" "0"
+eq "queued verify says queued"   "$(grep -cF '(queued' "$FS/out")" "1"
+eq "queued verify no park msg"   "$(grep -c '✗ cc-send: sent' "$FS/out")" "0"
+eq "queued verify no Enter retry" "$(grep -c 'KEY|.*Enter' "$CC_FAKE_LOG")" "1"
+eq "queued verify no crumb"      "$([ -f "$FL" ] && echo yes || echo no)" "no"
+# (B) gate side: the hint is already up when cc-send arrives and the working indicator is NOT (the
+# ~0.8s lag) — the busy fast-path cannot see it, so the queued verdict has to take the same exit.
+# CC_SEND_TIMEOUT/CC_FAKE_CLEAR_AT are the safety net: a regression degrades to hold→clear→send and
+# the "(queued" assert catches it instead of hanging.
+csend_reset "$FS/scr-queued-nospin"
+CC_SEND_TIMEOUT=1 CC_FAKE_CLEAR_AT=4 CC_SEND_FAILLOG="$FL" \
+  bash "$CC/cc-dispatch.sh" send surface:1 "queued at gate" >"$FS/out" 2>&1; rcs=$?
+eq "queued gate rc0"             "$rcs" "0"
+eq "queued gate sends now"       "$(grep -cF 'queued at gate' "$CC_FAKE_LOG")" "1"
+eq "queued gate says queued"     "$(grep -cF '(queued' "$FS/out")" "1"
+eq "queued gate no notify"       "$(grep -c 'NOTIFY|' "$CC_FAKE_LOG")" "0"
+eq "queued gate one Enter"       "$(grep -c 'KEY|.*Enter' "$CC_FAKE_LOG")" "1"
+eq "queued gate no crumb"        "$([ -f "$FL" ] && echo yes || echo no)" "no"
+# with the indicator on screen the busy fast-path wins first — same exit, asserted so the two
+# paths can never disagree about what a queued box means
+csend_reset "$FS/scr-queued-spin"
+CC_SEND_TIMEOUT=1 CC_FAKE_CLEAR_AT=4 CC_SEND_FAILLOG="$FL" \
+  bash "$CC/cc-dispatch.sh" send surface:1 "queued with spinner" >"$FS/out" 2>&1
+eq "queued+spinner says queued"  "$(grep -cF '(queued' "$FS/out")" "1"
+eq "queued+spinner no crumb"     "$([ -f "$FL" ] && echo yes || echo no)" "no"
+# (C) the ONE Enter retry submits a genuinely parked draft into a target that is working by then →
+# the second re-read shows the hint. Delivered, not parked.
+csend_reset "$FS/scr-full-empty"
+CC_FAKE_ON_SEND="$FS/scr-parked" CC_FAKE_FLUSH_AT=2 CC_FAKE_FLUSH_TO="$FS/scr-queued-nospin" \
+  CC_SEND_FAILLOG="$FL" bash "$CC/cc-dispatch.sh" send surface:1 "retry into queue" >"$FS/out" 2>&1; rcs=$?
+eq "retry→queued rc0"            "$rcs" "0"
+eq "retry→queued says queued"    "$(grep -cF '(queued' "$FS/out")" "1"
+eq "retry→queued one retry"      "$(grep -c 'KEY|.*Enter' "$CC_FAKE_LOG")" "2"
+eq "retry→queued no crumb"       "$([ -f "$FL" ] && echo yes || echo no)" "no"
+# ── true-parked side: none of the above may buy silence for a real park ──
+# (D) the 2026-08-22 true positive's own shape: one screen width of a long multi-line message stuck
+# in the box, no working indicator, Enter swallowed twice
+csend_reset "$FS/scr-full-empty"
+CC_FAKE_ON_SEND="$FS/scr-parked-long" CC_SEND_FAILLOG="$FL" \
+  bash "$CC/cc-dispatch.sh" send surface:1 "long park" >"$FS/out" 2>&1; rcs=$?
+eq "long park rc1"               "$rcs" "1"
+eq "long park loud msg"          "$(grep -c '✗ cc-send: sent' "$FS/out")" "1"
+eq "long park no success line"   "$(grep -c '✔ cc-send: delivered' "$FS/out")" "0"
+eq "long park crumbs"            "$(grep -c 'parked after send' "$FL" 2>/dev/null)" "1"
+# (E)/(F) the start-anchor boundary: a draft that CONTAINS the hint, and one that starts with a
+# PREFIX of it, are drafts — matching them anywhere but at the start of the rest would go silent
+csend_reset "$FS/scr-full-empty"
+CC_FAKE_ON_SEND="$FS/scr-parked-contains" CC_SEND_FAILLOG="$FL" \
+  bash "$CC/cc-dispatch.sh" send surface:1 "contains hint" >"$FS/out" 2>&1; rcs=$?
+eq "park containing hint rc1"    "$rcs" "1"
+eq "park containing hint crumbs" "$(grep -c 'parked after send' "$FL" 2>/dev/null)" "1"
+csend_reset "$FS/scr-full-empty"
+CC_FAKE_ON_SEND="$FS/scr-parked-prefix" CC_SEND_FAILLOG="$FL" \
+  bash "$CC/cc-dispatch.sh" send surface:1 "prefix hint" >"$FS/out" 2>&1; rcs=$?
+eq "park on hint prefix rc1"     "$rcs" "1"
+eq "park on hint prefix crumbs"  "$(grep -c 'parked after send' "$FL" 2>/dev/null)" "1"
+# (G) CC_SEND_QUEUED_PATTERNS REPLACES the default (no union) and SKIPS empty entries. The empty
+# entry is the dangerous one: an empty ERE matches every rest, so a parked draft would read
+# "queued" and every true positive would go silent — the exact failure this knob must not have.
+csend_reset "$FS/scr-full-empty"
+CC_FAKE_ON_SEND="$FS/scr-parked-long" CC_SEND_QUEUED_PATTERNS=':' CC_SEND_FAILLOG="$FL" \
+  bash "$CC/cc-dispatch.sh" send surface:1 "empty entry park" >"$FS/out" 2>&1; rcs=$?
+eq "queued empty-entry skipped"  "$rcs" "1"
+eq "queued empty-entry crumbs"   "$(grep -c 'parked after send' "$FL" 2>/dev/null)" "1"
+csend_reset "$FS/scr-full-empty"
+CC_FAKE_ON_SEND="$FS/scr-queued-nospin" CC_SEND_QUEUED_PATTERNS='^No such hint' CC_SEND_FAILLOG="$FL" \
+  bash "$CC/cc-dispatch.sh" send surface:1 "queued override" >"$FS/out" 2>&1; rcs=$?
+eq "queued override replaces"    "$rcs" "1"
+eq "queued override no queued"   "$(grep -cF '(queued' "$FS/out")" "0"
+csend_reset "$FS/scr-full-empty"
+CC_FAKE_ON_SEND="$FS/scr-parked-prefix" CC_SEND_QUEUED_PATTERNS='^Press up to edit the deploy' \
+  CC_SEND_FAILLOG="$FL" bash "$CC/cc-dispatch.sh" send surface:1 "queued custom" >"$FS/out" 2>&1; rcs=$?
+eq "queued override matches new" "$rcs" "0"
+eq "queued override says queued"  "$(grep -cF '(queued' "$FS/out")" "1"
 # 7) calibration: breadcrumb on pattern miss; hit stays silent; read-fail is not drift
 csend_reset "$FS/scr-prompt"
 CC_SEND_FAILLOG="$FL" bash "$CC/cc-dispatch.sh" calibrate surface:9 /tmp/cal-x >/dev/null 2>&1; rcs=$?
@@ -1866,6 +1975,7 @@ eq "raw cmux send sites = RDY + raw-exit" "$(grep -cE '^[[:space:]]*cmux send ' 
 eq "cc-hooks.sh has no send site"         "$(grep -c 'cmux send' "$CC/cc-hooks.sh")" "0"
 grep -q 'cc-dispatch.sh send \$caller_surface' "$CC/cc-dispatch.sh" && ok "backchannel teaches cc-send" || no "backchannel teaches cc-send" missing present
 PATH="$OPATH"; unset CC_FAKE_LOG CC_FAKE_SCREEN CC_SEND_VERIFY_SEC; rm -rf "$FS"
+cc_sandbox_ledgers
 
 echo ""
 echo "== 22. install.sh CLI / idempotence / backups + the rules doc's gwt-done form =="
