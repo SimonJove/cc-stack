@@ -2421,6 +2421,31 @@ eq "32 --compact drops an empty-dir row"   "$(grep -c 'empty dir' "$CC_TASKS_FIL
 eq "32 --compact preserves file order"     "$(cut -f6 "$CC_TASKS_FILE" | tr '\n' ',')" "w2 row,NEW dup,"
 rm -rf "$S32F"
 
+# ── task-list --with-state: the sidecar join belongs to the facade ────────────────
+# The board used to get legacy rows right only by re-canonicalizing EVERY dir on
+# read — the half of spec 3.5 defect 3 this phase removes. Drop that and a caller
+# joining on the raw string shows '-' for exactly the rows defect 3 is about, which
+# is a STATUS regression, not a cosmetic one. So the facade owns the join.
+S32S=$(mktemp -d); D32S="$S32S/wt"; mkdir -p "$D32S"
+export CC_TASKS_FILE="$S32S/t.tsv" CC_STATUS_FILE="$S32S/s.tsv"
+L32S="$S32S/wt"; P32S="$(cd "$D32S" && pwd -P)"
+# the row is recorded LOGICAL (/var/...), the hook writes the sidecar CANONICAL
+# (/private/var/...) because cc-hooks.sh does cd + pwd -P before calling the facade
+printf '2026-01-01 00:00:00\tfeat/leg\ts:1\t%s\tc\tlegacy row\tcamp\tu\n' "$L32S" > "$CC_TASKS_FILE"
+printf '%s\tworking\t111\n' "$P32S" > "$CC_STATUS_FILE"
+eq "32 without --with-state the row is untouched" \
+  "$("$CC/cc-state" task-list --all | awk -F'\t' '{print NF}')" "8"
+eq "32 --with-state joins a logical row to a canonical sidecar key" \
+  "$("$CC/cc-state" task-list --all --with-state | awk -F'\t' '{print $9}')" "working"
+eq "32 --with-state carries the epoch through" \
+  "$("$CC/cc-state" task-list --all --with-state | awk -F'\t' '{print $10}')" "111"
+# a row with no sidecar still gets the two fields, so the column count never varies
+: > "$CC_STATUS_FILE"
+eq "32 --with-state pads a stateless row" \
+  "$("$CC/cc-state" task-list --all --with-state | awk -F'\t' '{print NF"/"$9}')" "10/-"
+rm -rf "$S32S"
+
+
 
 rm -rf "$S32" "$S32B" "$S32R" "$S32RO" "$D32A" "$D32B" "$LIVE32" "$R32A" "$R32B" "$V32"
 rm -f "$S32/live.empty" "$S32/live.missing" "$S32/live.part" "$S32/live.one" "$S32/live.none" 2>/dev/null

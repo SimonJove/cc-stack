@@ -377,8 +377,18 @@ def cmd_task_list(args):
     file-level sweep is task-prune's job); output is newest-first (tail -r order).
     --all disables the repo filter, in either flag order (cc-board.sh's contract).
     --archive instead reads the archive: a history — every row, file order, no
-    dead-dir skip (its dirs are gone by design)."""
-    repo_val, archive, all_flag = None, False, False
+    dead-dir skip (its dirs are gone by design).
+
+    --with-state appends the sidecar's state and its epoch as two extra fields ('-'
+    and '' when there is none). The join belongs HERE, not in the caller: it keys on
+    dir_match, so a legacy logical /var row still finds the canonical /private/var
+    key the hook writes (spec 3.5 defect 3 — the board used to get this right only
+    by re-canonicalizing every dir on READ, which is the half of defect 3 we are
+    removing). A caller doing the join itself keys on the raw string and silently
+    shows '-' for exactly those rows. It also keeps the API question-oriented
+    (design 2, conclusion 3): one call answers "the board's rows and their state"
+    instead of the caller making a second one per store."""
+    repo_val, archive, all_flag, with_state = None, False, False, False
     i = 0
     while i < len(args):
         a = args[i]
@@ -386,11 +396,24 @@ def cmd_task_list(args):
             all_flag = True
         elif a == "--archive":
             archive = True
+        elif a == "--with-state":
+            with_state = True
         elif a == "--repo" and i + 1 < len(args):
             repo_val = args[i + 1]; i += 1
         else:
-            return _usage("task-list [--all] [--repo <root>] [--archive]")
+            return _usage("task-list [--all] [--repo <root>] [--archive] [--with-state]")
         i += 1
+    state_rows = []
+    if with_state:
+        state_rows = [fields(l) for l in read_lines("status")]
+
+    def decorate(line, row_dir, row_canon):
+        if not with_state:
+            return line
+        for sf in state_rows:
+            if len(sf) >= 2 and dir_match(sf[0], row_dir, row_canon):
+                return line + "\t" + sf[1] + "\t" + (sf[2] if len(sf) > 2 else "")
+        return line + "\t-\t"
     repo = None if all_flag or repo_val is None else canon(repo_val)
     def under(c):
         return not repo or c == repo or c.startswith(repo + "/")
@@ -398,7 +421,7 @@ def cmd_task_list(args):
         for line in read_lines("archive"):
             f = fields(line)
             if len(f) >= 4 and under(canon_or_raw(f[3])):
-                print(line)
+                print(decorate(line, f[3], canon(f[3])))
         return 0
     seen = set()
     for line in reversed(read_lines("tasks")):
@@ -410,7 +433,7 @@ def cmd_task_list(args):
             continue
         seen.add(c)
         if under(c):
-            print(line)
+            print(decorate(line, f[3], c))
     return 0
 
 def cmd_task_set_state(args):
