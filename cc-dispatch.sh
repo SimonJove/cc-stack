@@ -284,26 +284,14 @@ _ccsend_calibrate() {  # $1 = ref, $2 = dir — self-calibration (hardening laye
 # surface map is dropped. Never prune off an INCOMPLETE map — neither an empty one (cmux
 # unreachable) nor a partial one (a workspace that could not be enumerated); not having looked
 # there is not evidence that the tab died. See the workspace-scope block below.
+#
+# STATE ACCESS (state-model Phase A): every read/write of the four TSV stores — this ledger
+# included — goes through the cc-state facade; what stays in THIS file is cmux PROBING (the live
+# map and its completeness) and the orchestration that decides on top of both. Writes: tab-add;
+# reads: tab-list / tab-resolve / tab-owner; the prune: tab-prune (it takes the RAW live map and
+# recognizes the !partial sentinel itself, so the invariant below travels with the evidence).
 _cctabs_file(){ printf '%s' "${CC_TABS_FILE:-$HOME/.config/cc-stack/opened-tabs.tsv}"; }
 _cctabs_uc(){ printf '%s' "${1:-}" | tr 'abcdefghijklmnopqrstuvwxyz' 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'; }
-_cctabs_lock(){ # $1 = file — same atomic-mkdir discipline as the board's append (macOS lacks flock)
-  _tl="$1.lock"; _ti=0
-  while [ "$_ti" -lt 60 ]; do mkdir "$_tl" 2>/dev/null && return 0; sleep 0.05; _ti=$((_ti+1)); done
-  return 1
-}
-_cctabs_log(){ # $1 = surface uuid, $2 = owner surface uuid, $3 = dir, $4 = claude session uuid
-  _tu="$(_cctabs_uc "${1:-}")"; _to="$(_cctabs_uc "${2:-}")"
-  case "$_tu" in ''|*[!0-9A-F-]*) return 0 ;; esac        # only ever a plain uuid, never a ref
-  case "$_to" in *[!0-9A-F-]*) _to="" ;; esac
-  _tf="$(_cctabs_file)"
-  _td="$(printf '%s' "${3:-}" | tr '\t\n' '  ')"
-  _tsid="$(printf '%s' "${4:-}" | tr '\t\n' '  ')"
-  _tgot=""; _cctabs_lock "$_tf" && _tgot=1
-  printf '%s\t%s\t%s\t%s\t%s\n' "$_tu" "${_to:--}" "${_td:--}" "${_tsid:--}" "$(date '+%Y-%m-%d %H:%M:%S')" \
-    >> "$_tf" 2>/dev/null || true
-  [ -n "$_tgot" ] && rmdir "$_tf.lock" 2>/dev/null
-  return 0
-}
 # ── workspace scope (2026-08-16) ────────────────────────────────────────────────────────────
 # `cmux list-pane-surfaces` lists ONE workspace — the caller's ($CMUX_WORKSPACE_ID) — and the CLI
 # has NO "every workspace" flag (live-probed 2026-08-16: 8 surfaces from the default call, 13 when
@@ -379,7 +367,7 @@ _cctabs_where(){ # $1 = live map, $2 = surface uuid → the workspace ref it was
   printf '%s\n' "${1:-}" | awk -F'\t' -v u="${2:-}" '$2==u{print $3; exit}'
 }
 _cctabs_prune(){ # $1 = live map (optional; probed when omitted) — drop rows whose surface is gone
-  _tf="$(_cctabs_file)"; [ -f "$_tf" ] || return 0
+  _tl_f="$(_cctabs_file)"; [ -f "$_tl_f" ] || return 0
   _tlm="${1:-$(_cctabs_livemap)}"
   [ -n "$_tlm" ] || return 0                              # no map = no evidence = no pruning
   # INVARIANT (2026-08-16): absence of evidence is NEVER evidence of death, and it only ever gets
@@ -387,39 +375,19 @@ _cctabs_prune(){ # $1 = live map (optional; probed when omitted) — drop rows w
   # unreachable — prunes nothing either, genuinely dead rows included. Deleting a live row is
   # irreversible (its owner is gone, `close` fail-closes, a human has to clean up in the UI);
   # keeping a dead row costs one stale line that the next COMPLETE read sweeps. Never weaken this
-  # into "prune within the workspaces we could see".
-  _cctabs_partial "$_tlm" && return 0
-  _tgot=""; _cctabs_lock "$_tf" && _tgot=1
-  _ttmp="$_tf.tmp.$$"
-  printf '%s\n' "$_tlm" | awk -F'\t' 'NF>=2{print toupper($2)}' > "$_ttmp.live" 2>/dev/null
-  # NB: the live keys are read via getline-in-BEGIN, NOT the usual NR==FNR idiom — same reason
-  # _ccres_setref/_ccres_dropstatus do (see the note there). With an EMPTY key file NR==FNR never
-  # flips (on the first line of the SECOND file NR is still == FNR), so awk would swallow the whole
-  # ledger as keys, print nothing, and the mv + `[ -s ]` below would DELETE opened-tabs.tsv —
-  # losing every helper tab's recorded owner, after which `close` fail-closes on all of them and
-  # the human has to go close tabs in the UI. An empty key set is "no evidence": prune NOTHING,
-  # matching the guard above. (A failed mv needs no rollback: rename is atomic, so the ledger keeps
-  # its old content and the tmp is swept on the next line.)
-  if awk -F'\t' -v mf="$_ttmp.live" '
-        BEGIN{ n=0; while ((getline l < mf) > 0) if (l != "") { k[l]=1; n++ } close(mf) }
-        n==0{ print; next }
-        $1!="" && ($1 in k)' "$_tf" > "$_ttmp" 2>/dev/null; then
-    mv "$_ttmp" "$_tf" 2>/dev/null
-  fi
-  rm -f "$_ttmp" "$_ttmp.live" 2>/dev/null
-  [ -s "$_tf" ] || rm -f "$_tf" 2>/dev/null
-  [ -n "$_tgot" ] && rmdir "$_tf.lock" 2>/dev/null
+  # into "prune within the workspaces we could see". The guard itself now lives in the facade:
+  # cc-state tab-prune recognizes the !partial sentinel in the RAW map handed to it (a caller that
+  # pre-extracted a uuid list would have thrown the completeness bit away), and an empty key set
+  # prunes nothing there for the same reason it did here.
+  # The facade path resolves like CC_SELF does at the top of this script — this function is also
+  # lifted out and SOURCED by test.sh (§21), where CC_SELF is unset and $0 is the test runner.
+  _tl_c="${CC_SELF:-}"
+  [ -n "$_tl_c" ] || _tl_c="$( (CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd -P) 2>/dev/null )"
+  [ -n "$_tl_c" ] || _tl_c="$HOME/.config/cc-stack"
+  _tl_m="$(mktemp "${TMPDIR:-/tmp}/cctabs-prune.XXXXXXXX")" || return 0
+  printf '%s\n' "$_tlm" > "$_tl_m" 2>/dev/null && "$_tl_c/cc-state" tab-prune "$_tl_m" 2>/dev/null
+  rm -f "$_tl_m" 2>/dev/null
   return 0
-}
-_cctabs_owner(){ # $1 = surface uuid → the owner recorded for it (newest row; "" when none)
-  _tf="$(_cctabs_file)"; [ -f "$_tf" ] || return 0
-  awk -F'\t' -v u="$(_cctabs_uc "${1:-}")" \
-    '$1==u && $2!="" && $2!="-"{o=$2} END{if(o!="")print o}' "$_tf" 2>/dev/null
-}
-_cctabs_by_dir(){ # $1 = canonical dir, $2 = dir as given → "suuid<TAB>owner" of the newest row
-  _tf="$(_cctabs_file)"; [ -f "$_tf" ] || return 0
-  awk -F'\t' -v a="${1:-}" -v b="${2:-}" \
-    '($3==a || $3==b) && $1!=""{u=$1; o=$2} END{if(u!="") print u "\t" ((o=="-")?"":o)}' "$_tf" 2>/dev/null
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -707,17 +675,10 @@ ok=""; for _ in 1 2 3 4 5 6; do cmux ping >/dev/null 2>&1 && { ok=1; break; }; s
 [ -n "$ok" ] || { _fail "cmux ping unreachable (likely restarting), no tab opened"; exit 1; }
 
 # Dedup (best effort): if a tab was opened for this dir within 120s, don't repeat. Only CHECK here;
-# write the marker after success (failures leave no blocking marker). SKIPPED in resume mode: a
-# marker left by the pre-crash dispatch is exactly what must not eat the reopen.
-marker=""
-if [ -z "$rsmode" ]; then
-  marker_dir="${TMPDIR:-/tmp}/cc-cmux-tabs"
-  mkdir -p "$marker_dir" 2>/dev/null || true
-  marker="$marker_dir/$(printf '%s' "$abspath" | shasum -a 1 2>/dev/null | cut -d' ' -f1)"
-fi
-if [ -n "$marker" ] && [ -e "$marker" ]; then
-  now=$(date +%s 2>/dev/null || echo 0); mt=$(stat -f %m "$marker" 2>/dev/null || echo 0)
-  [ $((now - mt)) -lt 120 ] && exit 0
+# task-mark-opened stamps it after success (failures leave no blocking marker). SKIPPED in resume
+# mode: a marker left by the pre-crash dispatch is exactly what must not eat the reopen.
+if [ -z "$rsmode" ] && "$CC_SELF/cc-state" task-opened-recently "$abspath" 120; then
+  exit 0
 fi
 
 # Copy gitignored-but-needed files (.env etc.) so hook-path sub-tasks also get their environment (matches gwt-new/gwt-claude)
@@ -794,8 +755,24 @@ suuid="$(printf '%s\n' "$nsout" | awk '{for(i=1;i<NF;i++) if ($i ~ /^surface:[0-
   | awk -v r="$ref" 'NF>=2 && $1==r{print $2; exit}')"
 case "$suuid" in *[!0-9A-Fa-f-]*) suuid="" ;; esac    # never record anything but a plain uuid
 
-# Opened successfully; write the dedup marker now
-[ -n "$marker" ] && : > "$marker" 2>/dev/null || true
+# Opened successfully. Register the placeholder board row NOW and stamp the dedup marker.
+# state-model §3.1 (window A): the row used to be written at the END of the dispatch — after the
+# RDY probe, the launch send, and the trust/TUI loop, up to ~40s later — while the marker was
+# stamped HERE, so a crash in between left an open tab with NO board row AND a marker blocking the
+# retry for 120s. task-add at tab-open closes that window (a crash now leaves an incomplete but
+# VISIBLE row); task-set-launch at the end fills in the two facts only known by then (caller ref,
+# launch args). Two verbs on purpose: task-add must NOT stamp the marker — a dispatch that failed
+# after this point must leave no marker, or the retry is silently eaten (cc-board.sh log's old
+# "Only CHECK here; write the marker after success" rule, now structural in the facade).
+# The merge target (5th arg) reads the same git config capture-dispatch recorded on BOTH dispatch
+# paths before the tab opened — the same single authority the end-of-dispatch log call used.
+if [ -z "$rsmode" ]; then
+  _mt=""
+  _mtb="$(git -C "$abspath" symbolic-ref --short HEAD 2>/dev/null)"
+  [ -n "$_mtb" ] && [ -n "${root:-}" ] && _mt="$(git -C "$root" config --get "branch.$_mtb.ccMergeInto" 2>/dev/null)"
+  "$CC_SELF/cc-state" task-add "$abspath" "" "$ref" "$prompt" "${_mt:-}"
+  "$CC_SELF/cc-state" task-mark-opened "$abspath"
+fi
 
 # Wait for the shell to be ready (only counts once the marker command's OUTPUT appears, avoiding the shell-init race)
 # RDY stays a RAW send by decision (2026-08-15): the target is the fresh SHELL, not a claude TUI —
@@ -969,18 +946,13 @@ if [ -n "$pf" ] && [ -z "$tui" ]; then
 fi
 
 # ── Register into the task list (so gwt-status can show "which worktree is doing what") ──
-# F5: 5th arg = the merge target CAPTURE recorded (git config branch.<b>.ccMergeInto) — the same
-# single authority both dispatch paths went through above, not the caller cwd branch (config and
-# TSV used to disagree; once gwt-rm --branch deletes the config, the archive showed the wrong
-# parent forever). Empty (self-target / nothing recorded) → empty column; the board falls back
-# to its trunk heuristic. 6th arg = launch-args (8th TSV field, what gwt-resume replays).
+# The second half of the task-add written at tab-open: fill the caller ref (5th field) and the
+# launch args (8th field, what gwt-resume replays). The merge target (7th field) went in with
+# task-add — the same git config capture both dispatch paths recorded before the tab opened (F5's
+# single authority), so an empty target still means "board falls back to its trunk heuristic".
 # SKIPPED in resume mode: the row already exists; `cc-dispatch.sh resume` refreshes its surface ref.
 if [ -z "$rsmode" ]; then
-  _mt=""
-  _mtb="$(git -C "$abspath" symbolic-ref --short HEAD 2>/dev/null)"
-  [ -n "$_mtb" ] && [ -n "${root:-}" ] && _mt="$(git -C "$root" config --get "branch.$_mtb.ccMergeInto" 2>/dev/null)"
-  "$HOME/.config/cc-stack/cc-board.sh" log "$abspath" "$ref" "${caller_surface:-}" "$prompt" \
-    "${_mt:-}" "${largs:-}"
+  "$CC_SELF/cc-state" task-set-launch "$abspath" "${caller_surface:-}" "${largs:-}"
 fi
 
 # ── Register into the opened-tabs ledger (who opened which tab) ──
@@ -994,7 +966,7 @@ fi
 tabsid="$sid"
 [ -n "$rsmode" ] && tabsid="$(printf '%s' "$CC_WT_LAUNCH_CMD" \
   | awk '{for(i=1;i<NF;i++) if ($i=="--resume") {print $(i+1); exit}}')"
-_cctabs_log "$suuid" "$csuuid" "$abspath" "$tabsid"
+"$CC_SELF/cc-state" tab-add "$suuid" "$csuuid" "$abspath" "$tabsid"
 
 echo "✔ new tab : $ref  ${suuid:+uuid=$suuid  }cwd=$abspath  $(if [ -n "$rsmode" ]; then echo '(resume launch sent)'; elif [ -n "$prompt" ]; then echo '(initial prompt sent)'; else echo '(idle ccteam)'; fi)"
 [ -n "$caller_surface" ] && echo "✔ backchannel: the new claude can report back via cc-dispatch.sh send $caller_surface \"<message>\""
@@ -1131,51 +1103,43 @@ _ccpick(){ # $1 = launch-args field, $2 = key → value ("" when absent); model 
 # The dir may already be GONE (gwt-rm --close removes the worktree first) — canonicalize when we
 # still can, otherwise keep the string as given and compare both forms against the board.
 ccan="$(ccb_canon "$cdir")"; [ -n "$ccan" ] || ccan="$cdir"
-tasks="${CC_TASKS_FILE:-$HOME/.config/cc-stack/worktree-tasks.tsv}"
 cstore="${CC_CMUX_SESSIONS:-$HOME/.cmuxterm/claude-hook-sessions.json}"
 self_uuid="$(_ccuc "${CC_CALLER_SURFACE_UUID:-${CMUX_SURFACE_ID:-}}")"
 
 # ── ① board row (newest for this dir) → recorded identities ──
-# The pair is emitted as "branch<TAB>launch-args" with a "-" placeholder for an empty branch:
-# `read` collapses runs of TABs, so an empty leading field would shift the launch-args field
-# (docs/known-issues.md, the TAB-collapse entry).
-brow=""; bbranch=""
-if [ -f "$tasks" ]; then
-  brow="$(awk -F'\t' '$4!=""{print ($2==""?"-":$2) "\t" $4 "\t" $8}' "$tasks" 2>/dev/null \
-    | while IFS=$'\t' read -r _bb _bd _la; do
-      [ -n "$_bd" ] || continue
-      _bc="$(ccb_canon "$_bd")"; [ -n "$_bc" ] || _bc="$_bd"
-      { [ "$_bc" = "$ccan" ] || [ "$_bd" = "$cdir" ]; } || continue
-      printf '%s\t%s\n' "$_bb" "$_la"
-    done | tail -1)"
-  if [ -n "$brow" ]; then
-    bbranch="${brow%%$'\t'*}"; [ "$bbranch" = "-" ] && bbranch=""
-    brow="${brow#*$'\t'}"
-  fi
+# task-get answers "the newest row of this dir" under the same raw-or-canonical match the awk
+# scan used (the dir may be gone; a legacy logical-path row still finds its canonical caller).
+# branch comes off the row itself — it feeds the gwt-done unlock (_cc_rowdone), which must keep
+# working even when the row carries no valid surface identity (tab-resolve then emits NO board
+# candidate at all, and with it no branch). The identities come off the launch-args STRING
+# (_ccpick reads k=v segments, not TSV fields); owner deliberately keeps the raw csuuid —
+# validity is only ever enforced on the TAB uuid.
+brow="$("$CC_SELF/cc-state" task-get "$cdir" 2>/dev/null)"; bbranch=""; blargs=""
+if [ -n "$brow" ]; then
+  bbranch="$(printf '%s\n' "$brow" | cut -f2)"
+  blargs="$(printf '%s\n' "$brow" | cut -f8)"
 fi
-tuuid="$(_ccuc "$(_ccpick "$brow" suuid)")"
-owner="$(_ccuc "$(_ccpick "$brow" csuuid)")"
+tuuid="$(_ccuc "$(_ccpick "$blargs" suuid)")"
+owner="$(_ccuc "$(_ccpick "$blargs" csuuid)")"
 case "$tuuid" in *[!0-9A-F-]*) tuuid="" ;; esac
 
 live="$(_cctabs_livemap)"
 _cctabs_prune "$live"                    # lazy pruning: rows whose surface is gone (live map only)
-tref=""
-[ -n "$tuuid" ] && tref="$(printf '%s\n' "$live" | awk -F'\t' -v u="$tuuid" '$2==u{print $1; exit}')"
 
-# ── ①b opened-tabs ledger — the SECOND ledger, consulted whenever the board comes up short ──
-# Transition case hit in the first live use of this primitive: a child dispatched BEFORE the
-# board carried suuid has a task row with no recorded surface identity at all, so the board
-# resolution above yields nothing. The opened-tabs ledger records every tab this stack opened
-# (worktree or not) keyed by dir, and carries the owner too — so it fills in BOTH gaps. Both
-# ledgers are consulted, board first; they are never deduped against each other.
-tabrow="$(_cctabs_by_dir "$ccan" "$cdir")"
-tabuuid="$(_cctabs_uc "${tabrow%%$'\t'*}")"; tabowner=""
-[ -n "$tabrow" ] && tabowner="$(_cctabs_uc "${tabrow#*$'\t'}")"
-case "$tabuuid" in *[!0-9A-F-]*) tabuuid=""; tabowner="" ;; esac
-if [ -z "$tref" ] && [ -n "$tabuuid" ]; then
-  tref="$(printf '%s\n' "$live" | awk -F'\t' -v u="$tabuuid" '$2==u{print $1; exit}')"
-  [ -n "$tref" ] && tuuid="$tabuuid"
-fi
+# ── ①b the two ledgers' candidates, in the order close consults them ──
+# tab-resolve hands back EVERY candidate — the board row's identity first, then the opened-tabs
+# ledger's — with close's own identity rules already applied (uppercase; a short ref is an
+# address, never an identity, and is dropped outright). The facade does NOT choose: which
+# candidate is THE tab is a liveness question, liveness is a cmux probe (spec §3.2), so the
+# cascade — first candidate whose uuid is alive wins — stays here. The ledgers are never deduped
+# against each other; both appear, priority ordered.
+tref=""
+while IFS=$'\t' read -r _cand_src cand_s _cand_o _cand_b; do
+  [ -n "$cand_s" ] || continue
+  tref="$(printf '%s\n' "$live" | awk -F'\t' -v u="$cand_s" '$2==u{print $1; exit}')"
+  [ -n "$tref" ] && { tuuid="$cand_s"; break; }
+done <<< "$("$CC_SELF/cc-state" tab-resolve "$cdir" 2>/dev/null)"
+[ -n "$tref" ] || tuuid=""
 if [ -z "$tref" ]; then
   # fallback: cmux agent session store — newest session whose cwd IS this dir (covers tabs the
   # board predates, i.e. rows written before suuid existed)
@@ -1212,7 +1176,7 @@ fi
 # Owner: the board's csuuid is the sub-task record; when it has none (pre-ledger row, or a tab
 # that is not a sub-task at all) the opened-tabs ledger's owner for THIS surface stands in.
 tabowner_u=""
-[ -n "$tuuid" ] && tabowner_u="$(_cctabs_uc "$(_cctabs_owner "$tuuid")")"
+[ -n "$tuuid" ] && tabowner_u="$(_ccuc "$("$CC_SELF/cc-state" tab-owner "$tuuid" 2>/dev/null)")"
 [ -n "$owner" ] || owner="$tabowner_u"
 
 # ── ② print the resolution BEFORE acting (never close something you did not name out loud) ──
@@ -1310,11 +1274,14 @@ echo "── opened tabs ($tabs_f) ──"
 [ -n "$tabs_live" ] || echo "  ⚠ cmux unreachable — liveness unknown, nothing pruned"
 [ -n "$tabs_part" ] && echo "  ⚠ cmux workspace enumeration incomplete — liveness partial, nothing pruned (rows below print dead? rather than dead)"
 printf '%-12s  %-36s  %-6s  %-36s  %s\n' REF UUID STATE OWNER DIR
+# Rows come off the facade (tab-list applies the this-session filter unless --all, the same
+# owner-rule this loop used to apply inline); what stays here is the liveness JOIN — a cmux
+# probe, not state. Field access on the row stream uses the same `read` as before: the facade
+# writes "-" placeholders for empty owner/session, so no run-of-TABs collapse can shift fields.
 tabs_n=0
 while IFS=$'\t' read -r t_u t_o t_d t_s t_ts; do
   [ -n "$t_u" ] || continue
   [ "$t_o" = "-" ] && t_o=""
-  if [ -z "$tabs_all" ] && [ -n "$tabs_self" ] && [ "$t_o" != "$tabs_self" ]; then continue; fi
   t_ref="$(printf '%s\n' "$tabs_live" | awk -F'\t' -v u="$t_u" '$2==u{print $1; exit}')"
   if [ -n "$t_ref" ]; then
     t_state="alive"                     # a HIT is solid evidence however partial the probe was
@@ -1328,7 +1295,7 @@ while IFS=$'\t' read -r t_u t_o t_d t_s t_ts; do
   [ -n "$tabs_self" ] && [ "$t_o" = "$tabs_self" ] && t_own="$t_o (self)"
   printf '%-12s  %-36s  %-6s  %-36s  %s\n' "$t_ref" "$t_u" "$t_state" "$t_own" "$t_d"
   tabs_n=$((tabs_n+1))
-done < "$tabs_f"
+done <<< "$("$CC_SELF/cc-state" tab-list ${tabs_all:+"--all"} 2>/dev/null)"
 if [ "$tabs_n" -eq 0 ]; then
   if [ -n "$tabs_all" ]; then echo "  (no tabs recorded)"
   else echo "  (no tabs opened by this session — cc-dispatch.sh tabs --all shows every row)"; fi
@@ -1368,7 +1335,6 @@ command -v cmux >/dev/null 2>&1 && cmux ping >/dev/null 2>&1 || {
   echo "✗ can't reach cmux, aborting (gwt-resume reopens tabs — it needs cmux)" >&2; exit 1; }
 
 tasks="${CC_TASKS_FILE:-$HOME/.config/cc-stack/worktree-tasks.tsv}"
-statusf="${CC_STATUS_FILE:-$HOME/.config/cc-stack/worktree-status.tsv}"
 ccb_canon(){ CDPATH= cd -- "$1" >/dev/null 2>&1 && pwd -P; }   # same canonicalization as the board
 
 # ── ① native restore (fail-soft) ──
@@ -1440,6 +1406,11 @@ if [ -n "$store_map" ] && [ -n "$live_pairs" ]; then
 fi
 
 # ── board rows: newest per canonical dir, dir exists, repo filter (off with --all) ──
+# task-list answers that whole question in one pass (newest-per-dir keyed on the CANONICAL dir,
+# dead dirs skipped at read time — gone dirs are prune's business —, repo filter unless --all,
+# newest-first output). The row stream is still TSV, so the awk→shell handoff below keeps the
+# same US (0x1f) delimiter discipline as cc-board.sh: TAB is IFS whitespace and collapses runs
+# of it, breaking empty fields (F7).
 [ -f "$tasks" ] || { echo "no registered worktree tasks (nothing to resume)"; exit 0; }
 repo_root=""
 if [ -z "$res_all" ]; then
@@ -1451,82 +1422,30 @@ if [ -z "$res_all" ]; then
     [ -n "$repo_root" ] || repo_root=""
   fi
 fi
-# Field extraction via awk, NOT a bash read loop: bash (and zsh) collapse consecutive TAB
-# delimiters, so a row with an empty caller field would shift every later field.
-# F7 fix: use the same US (0x1f) delimiter discipline as cc-board.sh — TAB is IFS whitespace and
-# collapses runs of it, breaking empty fields. The awk→shell handoff uses US instead of TAB.
-task_rows="$(tail -r "$tasks" | awk -F'\t' '$4 != "" { print $4 "\037" $2 "\037" $3 "\037" $6 "\037" $8 }')"
-rows=""; seen_dirs=""
+# (an unresolvable repo_root reaches the facade as an empty --repo value, which filters nothing —
+# the same "everything shows" fallback the inline case-statement had)
+if [ -n "$res_all" ]; then
+  task_rows="$("$CC_SELF/cc-state" task-list --all 2>/dev/null \
+    | awk -F'\t' '$4 != "" { print $4 "\037" $2 "\037" $3 "\037" $6 "\037" $8 }')"
+else
+  task_rows="$("$CC_SELF/cc-state" task-list --repo "$repo_root" 2>/dev/null \
+    | awk -F'\t' '$4 != "" { print $4 "\037" $2 "\037" $3 "\037" $6 "\037" $8 }')"
+fi
+rows=""
 US="$(printf '\037')"
 while IFS="$US" read -r r_dir r_br r_ref r_task r_largs; do
   [ -n "$r_dir" ] || continue
+  # canonical form for the live-map join and the refresh verbs below; the RECORDED string is
+  # what step ③ launches with (the "recorded dir verbatim" invariant) and what stays in the row
   c="$(ccb_canon "$r_dir")"; [ -n "$c" ] || c="$r_dir"
-  printf '%s\n' "$seen_dirs" | grep -qxF -- "$c" && continue     # newest row per dir wins
-  seen_dirs="$seen_dirs$c
-"
-  [ -d "$r_dir" ] || continue                                    # gone dirs: prune's business
-  if [ -n "$repo_root" ]; then
-    case "$c" in "$repo_root"|"$repo_root"/*) ;; *) continue ;; esac
-  fi
   rows="${rows}${c}${US}${r_dir}${US}${r_br}${US}${r_ref}${US}${r_task}${US}${r_largs}
 "
 done <<< "$(printf '%s\n' "$task_rows")"
 
-# ── helpers (bash 3.2 safe; awk-keyed rewrites under the shared mkdir lock) ──
-_ccres_keys(){ # $1 = file, $2 = field no, $3 = canon dir → prints the RAW values whose field
-               # canonicalizes to $3 (exact-string keyed downstream; survives empty fields)
-  awk -F'\t' -v fn="$2" '{ print $(fn) }' "$1" 2>/dev/null | sort -u | while IFS= read -r _k; do
-    [ -n "$_k" ] || continue
-    _kc="$(ccb_canon "$_k")"; [ -n "$_kc" ] || _kc="$_k"
-    [ "$_kc" = "$3" ] && printf '%s\n' "$_k"
-  done
-  return 0
-}
-_ccres_setref(){ # $1 = canon dir, $2 = new ref, $3 = new surface uuid ("" = leave suuid alone) —
-                 # rewrite field 3 (surface) and refresh the launch-args suuid on EVERY row of that
-                 # dir. Surface UUIDs are minted per surface, so a cmux restart invalidates the
-                 # recorded one; leaving it stale would make the tab-close gate refuse a legitimate
-                 # parent close (fail-closed, but wrong) — the ledger must track the new tab.
-  f="$tasks"; [ -f "$f" ] || return 0
-  lock="$f.lock"; got=""
-  i=0; while [ "$i" -lt 60 ]; do mkdir "$lock" 2>/dev/null && { got=1; break; }; sleep 0.05; i=$((i+1)); done
-  match="$f.match.$$"; _ccres_keys "$f" 4 "$1" > "$match"
-  tmp="$f.tmp.$$"
-  # NB: the match keys are read via getline-in-BEGIN, NOT the usual NR==FNR idiom — with an
-  # EMPTY match file that idiom never flips and would rewrite/drop EVERY row (a dir with no
-  # row in this file must leave it untouched).
-  awk -v r="$2" -v su="${3:-}" -v mf="$match" -F'\t' -v OFS='\t' '
-    function setsuuid(la, u,   i, n, seg, pre, mod, out) {
-      mod = ""; pre = la
-      i = index(la, "model=")                       # model is composed LAST and may hold colons
-      if (i > 0) { mod = substr(la, i); pre = substr(la, 1, i-1); sub(/:$/, "", pre) }
-      out = ""; n = split(pre, seg, ":")
-      for (i = 1; i <= n; i++) {
-        if (seg[i] == "" || seg[i] ~ /^suuid=/) continue
-        out = (out == "" ? seg[i] : out ":" seg[i])
-      }
-      out = (out == "" ? "suuid=" u : out ":suuid=" u)
-      return (mod == "" ? out : out ":" mod)
-    }
-    BEGIN{while((getline l < mf) > 0) m[l]=1; close(mf)}
-    m[$4]{ $3=r; if (su != "") $8 = setsuuid($8, su) } {print}' "$f" > "$tmp"
-  mv "$tmp" "$f"; [ -s "$f" ] || rm -f "$f"
-  rm -f "$match"
-  [ -n "$got" ] && rmdir "$lock" 2>/dev/null
-  return 0
-}
-_ccres_dropstatus(){ # $1 = canon dir — drop the agent-state sidecar rows of that dir
-  f="$statusf"; [ -f "$f" ] || return 0
-  lock="$f.lock"; got=""
-  i=0; while [ "$i" -lt 60 ]; do mkdir "$lock" 2>/dev/null && { got=1; break; }; sleep 0.05; i=$((i+1)); done
-  match="$f.match.$$"; _ccres_keys "$f" 1 "$1" > "$match"
-  tmp="$f.tmp.$$"
-  awk -v mf="$match" 'BEGIN{while((getline l < mf) > 0) m[l]=1; close(mf)} !m[$1]' "$f" > "$tmp"
-  mv "$tmp" "$f"; [ -s "$f" ] || rm -f "$f"
-  rm -f "$match"
-  [ -n "$got" ] && rmdir "$lock" 2>/dev/null
-  return 0
-}
+# ── helpers (bash 3.2 safe) ──
+# The state rewrites these used to do by hand (field-3/suuid refresh, sidecar sweep) are facade
+# verbs now: task-set-ref (same dir rule, same suuid swap, and it does NOT widen a 7-field
+# legacy row the way the old awk's $3=r OFS rebuild did) and task-clear-state.
 _ccres_parse(){ # $1 = launch-args field → _u/_p/_pm/_m globals; empty when absent/invalid.
                 # model is composed LAST by the writer, so it may itself contain colons.
   _u=""; _p=""; _pm=""; _m=""
@@ -1572,8 +1491,8 @@ while IFS="$US" read -r c r_dir r_br r_ref r_task r_largs; do
     [ "$_p" != "" ] && [ "$_p" != "anthropic" ] && act="restored-warn"
     # refresh BOTH the short ref and the recorded surface uuid — a restored tab is a NEW surface
     live_uuid="$(printf '%s\n' "$live_pairs" | awk -F'\t' -v r="$live_ref" '$2==r{print $1; exit}')"
-    _ccres_setref "$c" "$live_ref" "$live_uuid"
-    _ccres_dropstatus "$c"
+    "$CC_SELF/cc-state" task-set-ref "$c" "$live_ref" "$live_uuid"
+    "$CC_SELF/cc-state" task-clear-state "$c"
     plan="${plan}${c}${US}${r_dir}${US}${r_br}${US}${r_task}${US}${act}${US}${live_ref}
 "
     n_rest=$((n_rest+1))
@@ -1642,8 +1561,8 @@ if [ "$n_re" -gt 0 ]; then
     [ -n "$newuuid" ] || newuuid="$(cmux list-pane-surfaces --id-format both 2>/dev/null | sed 's/^\*//' \
       | awk -v r="$newref" 'NF>=2 && $1==r{print $2; exit}')"
     if [ -n "$newref" ]; then
-      _ccres_setref "$c" "$newref" "$newuuid"
-      _ccres_dropstatus "$c"
+      "$CC_SELF/cc-state" task-set-ref "$c" "$newref" "$newuuid"
+      "$CC_SELF/cc-state" task-clear-state "$c"
       echo "✔ $r_br → $newref  ($([ "$r_act" = "reopen-idle" ] && echo "idle ccteam — no session recorded" || echo "resumed: $r_cmd"))"
     else
       echo "⚠ $r_br: surface failed to open a tab for $r_dir (see cc-failures.log)"
@@ -1704,7 +1623,7 @@ if [ -z "$wsuuid" ]; then
   wsref="$(printf '%s\n' "$wsout" | grep -oE 'surface:[0-9]+' | head -1)"
   [ -n "$wsref" ] && wsuuid="$(_cctabs_livemap | awk -F'\t' -v r="$wsref" '$1==r{print $2; exit}')"
 fi
-_cctabs_log "$wsuuid" "${CC_CALLER_SURFACE_UUID:-${CMUX_SURFACE_ID:-}}" "$abspath" ""
+"$CC_SELF/cc-state" tab-add "$wsuuid" "${CC_CALLER_SURFACE_UUID:-${CMUX_SURFACE_ID:-}}" "$abspath" ""
 exit 0
 ;;
 
