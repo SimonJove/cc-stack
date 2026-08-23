@@ -4287,6 +4287,94 @@ eq "clause 4 teaches the absolute path" "$(printf '%s' "$W4" | grep -c '~/.confi
 eq "clause 4 warns the bare name is zsh-only" "$(printf '%s' "$W4" | grep -c 'zsh function')" "1"
 rm -rf "$GD"
 echo ""
+echo ""
+echo "== 36. worktree.zsh state via cc-state =="
+# Phase A on the zsh layer (docs/state-model.md): every state mutation goes through the
+# facade, so the four mkdir-lock loops, the _gwt_dead_lines/_gwt_drop_lines dropper, the
+# predicate rewriters and gwt-prune's tail-r dedup pipeline are gone from worktree.zsh.
+# What stays is the zsh interaction layer: messages, guards, and the two named shims
+# (_gwt_tasks_drop_dir / _gwt_archive_branch) older callers still invoke by name.
+eq "36 no zsh lock loops left"       "$(grep -c 'mkdir "\$lock"' "$CC/worktree.zsh")" "0"
+eq "36 no hand-rolled line dropper"  "$(grep -c '_gwt_drop_lines' "$CC/worktree.zsh")" "0"
+eq "36 no dead-line collector left"  "$(grep -c '_gwt_dead_lines' "$CC/worktree.zsh")" "0"
+eq "36 no predicate rewriters left"  "$(grep -cE '_gwt_(tasks|status)_rewrite' "$CC/worktree.zsh")" "0"
+eq "36 gwt-rm clears state by dir"   "$(grep -c 'task-clear-state' "$CC/worktree.zsh")" "1"
+# gwt-prune's three messages survive the facade swap byte-for-byte (the had/-s shape against
+# the facade's empty-set-deletes-file lifecycle) — gwt-rm's sidecar drop uses clear-state,
+# not prune, because that dir may still exist when the row must go (the 2026-08-22 ruling).
+cn36(){ CDPATH= cd -- "$1" >/dev/null 2>&1 && pwd -P; }
+zw36(){ zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; $*" ; }
+S36=$(mktemp -d); T36="$S36/t.tsv"; ST36="$S36/s.tsv"; A36="$S36/a.tsv"
+export CC_TASKS_FILE="$T36" CC_STATUS_FILE="$ST36" CC_ARCHIVE_FILE="$A36"
+L36='uuid=36363636-1111-2222-3333-444444444444:provider=glm:pm=auto:model=g1'
+D36A="$(cn36 "$(mktemp -d)")"; D36B="$(cn36 "$(mktemp -d)")"; D36D="$S36/gone"   # D36D never created
+zw36 gwt-prune >"$S36/p0" 2>&1; eq "36 prune: no list says so" "$(cat "$S36/p0")" "list is empty"
+printf '2026-01-01 00:00:01\tfeat/A\tsurface:71\t%s\tsurface:9\tthirtysix A\tmain\t%s\n' "$D36A" "$L36" > "$T36"
+printf '%s\tidle\t1700000001\n%s\tworking\t1700000002\n' "$D36A" "$D36D" > "$ST36"
+zw36 gwt-prune >"$S36/p1" 2>&1; eq "36 prune: live rows compacted" "$(cat "$S36/p1")" "✔ task list compacted"
+eq "36 prune keeps the live sidecar row"  "$(grep -cF "$D36A" "$ST36")" "1"
+eq "36 prune swept the dead sidecar row"  "$(grep -cF "$D36D" "$ST36" 2>/dev/null)" "0"
+# a list whose dirs are ALL gone (or a pre-existing empty file) empties AND removes the file —
+# the facade deletes an emptied store; the had-check keeps the three messages distinguishable
+rm -rf "$D36A"
+zw36 gwt-prune >"$S36/p2" 2>&1; eq "36 prune: all dead says emptied" "$(cat "$S36/p2")"$'\n'"$([ -f "$T36" ] && echo kept || echo gone)" "✔ emptied (no live records)"$'\n'"gone"
+: > "$T36"
+zw36 gwt-prune >"$S36/p3" 2>&1; eq "36 prune: empty file says emptied" "$(cat "$S36/p3")"$'\n'"$([ -f "$T36" ] && echo kept || echo gone)" "✔ emptied (no live records)"$'\n'"gone"
+mkdir -p "$D36A"
+# _gwt_archive_branch through the facade: the archived row is the tasks row VERBATIM with
+# merged-at appended (8→9 fields), launch-args and the empty caller field intact
+printf '2026-01-01 00:00:02\tfeat/B\tsurface:72\t%s\t\tarch B (empty caller)\tmain\t%s\n' "$D36B" "$L36" > "$T36"
+printf '2026-01-01 00:00:03\tfeat/C\tsurface:73\t%s\tsurface:9\tarch C stays\tfeat/B\t%s\n' "$D36A" "$L36" >> "$T36"
+printf '%s\tidle\t1700000003\n%s\tidle\t1700000004\n' "$D36B" "$D36A" > "$ST36"
+O36="$(zw36 "_gwt_archive_branch feat/B")"; r36=$?
+eq "36 archive summary line"              "$O36" "  ↳ archived 1 record(s) for feat/B (see gwt-log)"
+eq "36 archive row keeps every field"     "$(awk -F'\t' '$2=="feat/B"{print NF}' "$A36")" "9"
+eq "36 archive keeps the empty caller"    "$(awk -F'\t' '$2=="feat/B"{print $5"|"$8}' "$A36")" "|$L36"
+eq "36 archive leaves other branches"     "$(awk -F'\t' '$2=="feat/C"' "$T36" | wc -l | tr -d ' ')" "1"
+eq "36 archive swept the moved sidecar"   "$(grep -cF "$D36B" "$ST36")" "0"
+eq "36 archive kept the other sidecar"    "$(grep -cF "$D36A" "$ST36")" "1"
+# defects 4/5 (spec §3.5): an archive rewrite failure is LOUD — rc 1 out of the shim,
+# stderr names it, the task list is left untouched — the rc is never eaten
+printf '2026-01-01 00:00:04\tfeat/F\tsurface:74\t%s\tsurface:9\tfail me\tmain\t%s\n' "$D36A" "$L36" > "$T36"
+cp "$T36" "$S36/t.before"; : > "$S36/f.out"; : > "$S36/f.err"
+chmod 500 "$S36"
+zw36 "_gwt_archive_branch feat/F" >"$S36/f.out" 2>"$S36/f.err"; r36f=$?
+chmod 700 "$S36"
+eq "36 archive failure rc1"               "$r36f" "1"
+eq "36 archive failure surfaces"          "$(grep -c 'archive rewrite failed' "$S36/f.err")" "1"
+eq "36 archive failure leaves tasks untouched" "$(cmp -s "$T36" "$S36/t.before" && echo same || echo differ)" "same"
+# and it is equally audible through gwt-merge itself — the call site does not swallow it
+R36=$(mktemp -d)
+( cd "$R36"; git init -q; git config user.email t@t; git config user.name t; git commit -q --allow-empty -m i
+  git branch -M main; mkdir -p .claude; git worktree add -q .claude/worktrees/wtF36 -b feat/F36 >/dev/null )
+"$CC/cc-merge.sh" set-parent "$R36" feat/F36 main
+"$CC/cc-merge.sh" done "$R36" feat/F36 true
+( cd "$R36/.claude/worktrees/wtF36" && git commit -q --allow-empty -m f36 )
+printf '2026-01-01 00:00:05\tfeat/F36\tsurface:75\t%s\tsurface:9\tmerge fail archive\tmain\t%s\n' "$R36/.claude/worktrees/wtF36" "$L36" > "$T36"
+chmod 500 "$S36"
+M36="$(printf '\ny\n' | zw36 "cd '$R36'; gwt-merge feat/F36" 2>&1)"; m36=$?
+chmod 700 "$S36"
+eq "36 merge itself still exits 0"        "$m36" "0"
+eq "36 archive failure audible through gwt-merge" "$(echo "$M36" | grep -c 'archive rewrite failed')" "1"
+# defect 2 (spec §3.5): _gwt_archive_branch matched on branch NAME alone, so merging feat/S
+# in repo A archived repo B's feat/S rows too. gwt-merge now scopes the archive call to its
+# own repo root; B's same-name row must survive untouched.
+R36A=$(mktemp -d); R36B=$(mktemp -d)
+( cd "$R36A"; git init -q; git config user.email t@t; git config user.name t; git commit -q --allow-empty -m i
+  git branch -M main; mkdir -p .claude; git worktree add -q .claude/worktrees/wtS -b feat/S >/dev/null )
+WS36A="$R36A/.claude/worktrees/wtS"; WS36B="$R36B/wtS"; mkdir -p "$WS36B"
+"$CC/cc-merge.sh" set-parent "$R36A" feat/S main
+"$CC/cc-merge.sh" done "$R36A" feat/S true
+( cd "$WS36A" && git commit -q --allow-empty -m s36 )
+printf '2026-01-01 00:00:06\tfeat/S\tsurface:76\t%s\tsurface:9\trepo A same-branch\tmain\t%s\n' "$WS36A" "$L36" > "$T36"
+printf '2026-01-01 00:00:07\tfeat/S\tsurface:77\t%s\tsurface:9\trepo B same-branch\tmain\t%s\n' "$WS36B" "$L36" >> "$T36"
+printf '\ny\n' | zw36 "cd '$R36A'; gwt-merge feat/S" >/dev/null 2>&1
+eq "36 archiving in repo A leaves repo B's row alone" "$(grep -c 'repo B same-branch' "$T36")" "1"
+eq "36 repo A's own row did move"                     "$(grep -c 'repo A same-branch' "$T36" 2>/dev/null)" "0"
+eq "36 only repo A's row reached the archive"         "$(grep -c 'same-branch' "$A36")" "1"
+eq "36 gwt-merge scopes its archive call"             "$(grep -c '_gwt_archive_branch "$child" "$root"' "$CC/worktree.zsh")" "1"
+rm -rf "$S36" "$R36" "$D36A" "$D36B" "$R36A" "$R36B" "$WS36B"; cc_sandbox_ledgers
+
 echo "== 19b. fail-closed path guards (partial-shell incident 2026-08-16) =="
 # Real incident: a partially-loaded shell had gwt-rm but not _gwt_dir → wtpath="/<name>" (fs ROOT)
 # fed to `git worktree remove`. Every _gwt_dir-built path must now fail closed via _gwt_wt_path.
