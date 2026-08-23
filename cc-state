@@ -101,7 +101,8 @@ def _stale_seconds():
 # transition. Two deliberate properties, both lifted from today's callers:
 #   · a writer never blocks forever: it waits up to 3s — the same 60×0.05s ceiling
 #     every shell lock loop has — and then proceeds UNLOCKED, exactly what
-#     cc-board.sh log / cc-hooks.sh status / _cctabs_log do when the loop runs out;
+#     cc-board.sh log (retired, Task 9) / cc-hooks.sh status / _cctabs_log did when
+#     the loop ran out;
 #   · a lock dir older than CC_STATE_LOCK_STALE (default 60s) is reclaimed — the
 #     holder died (today a stale lock dir taxes every later writer the full 3s
 #     wait, forever). No legitimate holder keeps the lock for 60s; the longest
@@ -260,8 +261,9 @@ def fields(line):
     return line.split("\t")
 
 def _sanitize(text, maxlen, pipes_to_slash):
-    """cc-board.sh log's cleaning, byte for byte: TAB and newline collapse to one
-    space each, task summaries additionally trade | for / (keeps TSV and the
+    """The retired cc-board.sh log's cleaning (the writer these bytes were frozen
+    from — test.sh §32's oracle, Task 9), byte for byte: TAB and newline collapse to
+    one space each, task summaries additionally trade | for / (keeps TSV and the
     `column` board intact), then the cut. largs gets no pipe translation. Truncates
     by CHARACTER (see the deviations note in the header)."""
     s = text.replace("\t", " ").replace("\n", " ")
@@ -276,7 +278,8 @@ def _sanitize_field(text):
     return text.replace("\t", " ").replace("\n", " ")
 
 def _git_branch(dir_):
-    """`git -C <dir> rev-parse --abbrev-ref HEAD`, '?' when it fails (log's rule) —
+    """`git -C <dir> rev-parse --abbrev-ref HEAD`, '?' when it fails (the retired
+    log's rule) —
     but a CLEAN '?' (see the deviations note: the shell capture can splice a
     printed "HEAD" onto the fallback). rc 0 with empty output writes an EMPTY
     field — replicated, not second-guessed."""
@@ -314,8 +317,9 @@ def _usage(text):
 # (7-field legacy rows are legal and must round-trip as 7 fields).
 
 def cmd_task_add(args):
-    """Append the dispatch-time placeholder row — cc-board.sh log's row (including
-    the '?' fallbacks for an empty surface ref and an underivable branch) with caller
+    """Append the dispatch-time placeholder row — the retired cc-board.sh log's row
+    (its recorded bytes are test.sh §32's frozen oracle, Task 9; including the '?'
+    fallbacks for an empty surface ref and an underivable branch) with caller
     and launch-args left empty for task-set-launch. The dir is canonicalized on the
     way in (the file header's write-side rule). Does NOT stamp the dedup marker:
     the marker says "a tab actually opened", which only the caller knows — see
@@ -324,11 +328,11 @@ def cmd_task_add(args):
         return _usage("task-add <dir> <branch> <ref> <task> <parent>")
     d, branch, ref, task, parent = args
     if not d:
-        return 0                              # today: [ -n "$dir" ] || exit 0
+        return 0                              # the retired log: [ -n "$dir" ] || exit 0
     d = canon(d)
     if not branch:
-        branch = _git_branch(d)               # empty arg = derive here, as log does
-    ref = ref or "?"                          # today: ref="${2:-?}"
+        branch = _git_branch(d)               # empty arg = derive here, as the retired log did
+    ref = ref or "?"                          # the retired log: ref="${2:-?}"
     summary = _sanitize(task, 140, True) or "(idle ccteam, no initial prompt)"
     append_line("tasks", "\t".join(
         [now_stamp(), branch, ref, d, "", summary, parent, ""]))
@@ -347,7 +351,7 @@ def cmd_task_set_launch(args):
         for i in range(len(out) - 1, -1, -1):  # mutate in place, or rewrite()'s
             f = fields(out[i])                 # out != rows change check compares
             if len(f) >= 4 and dir_match(f[3], d, c):   # an object against itself
-                f[4] = caller                 # written raw — exactly log's $caller
+                f[4] = caller                 # written raw — exactly the retired log's $caller
                 if len(f) >= 8:
                     f[7] = _sanitize(largs, 200, False)
                 out[i] = "\t".join(f)

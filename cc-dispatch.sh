@@ -762,8 +762,9 @@ case "$suuid" in *[!0-9A-Fa-f-]*) suuid="" ;; esac    # never record anything bu
 # retry for 120s. task-add at tab-open closes that window (a crash now leaves an incomplete but
 # VISIBLE row); task-set-launch at the end fills in the two facts only known by then (caller ref,
 # launch args). Two verbs on purpose: task-add must NOT stamp the marker — a dispatch that failed
-# after this point must leave no marker, or the retry is silently eaten (cc-board.sh log's old
-# "Only CHECK here; write the marker after success" rule, now structural in the facade).
+# after this point must leave no marker, or the retry is silently eaten (the retired
+# cc-board.sh log's old "Only CHECK here; write the marker after success" rule, now
+# structural in the facade).
 # The merge target (5th arg) reads the same git config capture-dispatch recorded on BOTH dispatch
 # paths before the tab opened — the same single authority the end-of-dispatch log call used.
 if [ -z "$rsmode" ]; then

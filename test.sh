@@ -141,30 +141,6 @@ mkdir -p "$R1/plain"
 eq "non-worktree target: no dispatch" "$(run "$(pay "$R1" "${P}git worktree add plain -b feat/P")")" ""
 rm -rf "$R1" "$R2" "$EP1"
 
-echo "== 2. cc-board.sh log (task registration) =="
-export CC_TASKS_FILE=$(mktemp -u)
-"$CC/cc-board.sh" log "/tmp/nodir_A" "surface:1" "surface:9" "task	with tab|pipe" "feat/par" "uuid=11111111-2222-3333-4444-555555555555:provider=kimi:pm=plan:model=glm-4.6"
-eq "writes 8 fields"          "$(awk -F'\t' 'NR==1{print NF}' "$CC_TASKS_FILE")" "8"
-eq "7th field is parent"      "$(awk -F'\t' 'NR==1{print $7}' "$CC_TASKS_FILE")" "feat/par"
-eq "8th field is launch-args" "$(awk -F'\t' 'NR==1{print $8}' "$CC_TASKS_FILE")" "uuid=11111111-2222-3333-4444-555555555555:provider=kimi:pm=plan:model=glm-4.6"
-eq "task sanitized (no tab)"  "$(awk -F'\t' 'NR==1{print ($6 ~ /\t/)?"bad":"ok"}' "$CC_TASKS_FILE")" "ok"
-# launch-args sanitization: a TAB inside the value must never split the row
-"$CC/cc-board.sh" log "/tmp/nodir_B" "surface:2" "surface:9" "t2" "feat/p2" "uuid=u1:provider=kimi:pm=auto	mod"
-eq "launch-args sanitized"    "$(awk -F'\t' 'NR==2{print NF}' "$CC_TASKS_FILE")" "8"
-# round-trip: a logged row renders on the board (dir must exist — prune-on-read drops dead dirs;
-# --all so the repo filter can't hide the foreign row)
-RT=$(mktemp -d)
-"$CC/cc-board.sh" log "$RT" "surface:2" "surface:1" "round trip task" "feat/rt"
-eq "log→board round-trip" "$(CC_TASKS_FILE="$CC_TASKS_FILE" CC_STATUS_FILE=/dev/null bash "$CC/cc-board.sh" --all 2>/dev/null | grep -c 'round trip task')" "1"
-# pre-feature 7-field rows: survive the prune-on-read rewrite VERBATIM (bash read gives the last
-# variable the remainder with its TABs, so nothing shifts) and still render
-RT2=$(mktemp -d); CRT2="$(cd "$RT2" && pwd -P)"
-printf '2026-01-01 00:00:00\tfeat/OLD\tsurface:7\t%s\tsurface:1\told row task\tmain\n' "$CRT2" >> "$CC_TASKS_FILE"
-CC_STATUS_FILE=/dev/null bash "$CC/cc-board.sh" --all >/dev/null 2>&1
-eq "old 7-field row kept"     "$(awk -F'\t' -v d="$CRT2" '$4==d{print NF}' "$CC_TASKS_FILE" | sort -u)" "7"
-eq "old row still renders"    "$(CC_TASKS_FILE="$CC_TASKS_FILE" CC_STATUS_FILE=/dev/null bash "$CC/cc-board.sh" --all 2>/dev/null | grep -c 'old row task')" "1"
-rm -rf "$RT" "$RT2"; rm -f "$CC_TASKS_FILE"; cc_sandbox_ledgers   # back to the sandbox, NOT the live default
-
 echo ""
 echo "== 33. cc-hooks.sh status via cc-state =="
 # The status hook now delegates every state write to the facade (plan Task 4): parse the event,
@@ -197,13 +173,16 @@ s33run(){ printf '%s' "$(s33pay "$1" "$2" "${3:-}")" | bash "$CC/cc-hooks.sh" st
 o33="$(s33run UserPromptSubmit "$B33")"; rc33=$?
 eq "33 hook writes nothing to stdout/stderr" "$o33" ""
 eq "33 hook always exits 0" "$rc33" "0"
-eq "33 working written through the facade" "$(cut -f2 "$CC_STATUS_FILE")" "working"
+eq "33 working written through the facade" "$("$CC/cc-state" dump status | cut -f2)" "working"
+# (Task 8) sidecar VALUE reads go through the facade from here on — `dump status` is the raw
+# read verb; its byte-passthrough is itself pinned in §32, so these greps/awks still see
+# exactly the bytes the hook + facade wrote (they are NOT excused like §32's direct reads)
 # H2: a PATH without python3 (cat still on it — the payload must arrive) degrades to a silent
 # no-op: exit 0, not a byte out, not one new sidecar row
 NP33="$S33/nopy"; mkdir "$NP33"
 # env re-execs bash THROUGH the restricted PATH, so the interpreter itself must be on it
 ln -s /bin/bash "$NP33/bash"; ln -s /bin/cat "$NP33/cat"; ln -s /usr/bin/dirname "$NP33/dirname"
-n33=$(wc -l < "$CC_STATUS_FILE" | tr -d ' ')
+n33=$("$CC/cc-state" dump status | wc -l | tr -d ' ')
 o33np="$(printf '%s' "$(s33pay UserPromptSubmit "$B33" '')" | env PATH="$NP33" bash "$CC/cc-hooks.sh" status 2>&1)"; rc33np=$?
 eq "33 no python3 degrades to exit 0" "$rc33np" "0"
 eq "33 no python3 writes nothing" "$o33np" ""
@@ -211,7 +190,7 @@ eq "33 no python3 writes nothing" "$o33np" ""
 # python3, so a no-python hook cannot write; it is indirectly covered by the R2 sibling
 # "unregistered dir writes no row" and stays as a contract guard for any future python-free
 # write leg)
-eq "33 no python3 adds no sidecar row" "$(wc -l < "$CC_STATUS_FILE" | tr -d ' ')" "$n33"
+eq "33 no python3 adds no sidecar row" "$("$CC/cc-state" dump status | wc -l | tr -d ' ')" "$n33"
 # F8 fast path, pinned by ASSERTION this time (round-2 gate): with NO board file the hook must
 # not start python3 even once — the prefilter predates the facade, is payload-independent,
 # sits on the hottest path in the stack, and task-set-state would be a silent no-op anyway,
@@ -234,16 +213,16 @@ eq "33 no board: zero python3 starts (F8)" "$(wc -l < "$S33F8/pylog" | tr -d ' '
 o33u="$(s33run UserPromptSubmit "$U33")"; rc33u=$?
 eq "33 unregistered dir is silent" "$o33u" ""
 eq "33 unregistered dir exits 0" "$rc33u" "0"
-eq "33 unregistered dir writes no row" "$(grep -cF "$U33" "$CC_STATUS_FILE")" "0"
+eq "33 unregistered dir writes no row" "$("$CC/cc-state" dump status | grep -cF "$U33")" "0"
 # H1: the legacy LOGICAL row gains a state — the old exact-match awk never joined it (defect 3)
 # — and the sidecar row is keyed PHYSICAL, the form the board render joins on
 eq "33 H1 fixture is a logical/physical pair" "$([ "$V33" != "$P33" ] && echo yes || echo no)" "yes"
 o33l="$(s33run UserPromptSubmit "$V33")"
 eq "33 logical-cwd event is silent" "$o33l" ""
-eq "33 legacy logical row gains state (H1/defect 3)" "$(awk -F'\t' -v d="$P33" '$1==d{print $2}' "$CC_STATUS_FILE")" "working"
+eq "33 legacy logical row gains state (H1/defect 3)" "$("$CC/cc-state" dump status | awk -F'\t' -v d="$P33" '$1==d{print $2}')" "working"
 # contract 3: after every event this hook fires, the sidecar holds no ready (the facade refuses
 # the value outright — §32 pins that refusal; this pins the disk after the hook ran)
-eq "33 sidecar never holds ready" "$(grep -c ready "$CC_STATUS_FILE")" "0"
+eq "33 sidecar never holds ready" "$("$CC/cc-state" dump status | grep -c ready)" "0"
 # structure: the lock loop and the read-modify-write are gone from the hook; exactly one
 # facade call remains; and the no-board fast path is PRESENT (round-2 gate — the membership
 # awk it used to feed is gone, the [ -f ] gate itself stays)
@@ -259,8 +238,9 @@ eq "33 no apostrophe inside the heredoc body" "$S33H" "0"
 rm -rf "$S33" "$S33F8" "$V33" "$B33" "$U33"; cc_sandbox_ledgers   # back to the sandbox before §2b re-exports
 
 echo "== 2b. cc-hooks.sh status: agent-state sidecar =="
-# Board rows must hold pwd -P-canonical dirs — exactly what cc-board.sh log writes in production
-# (mktemp hands back /var/... which pwd -P resolves to /private/var/... on macOS).
+# Board rows must hold pwd -P-canonical dirs — exactly what the write path produces in
+# production (cc-state task-add since Task 9; the retired cc-board.sh log before it;
+# mktemp hands back /var/... which pwd -P resolves to /private/var/... on macOS).
 cn(){ CDPATH= cd -- "$1" >/dev/null 2>&1 && pwd -P; }
 SB="$(cn "$(mktemp -d)")"; NB="$(cn "$(mktemp -d)")"; RD="$(cn "$(mktemp -d)")"   # SB: board dir  NB: not on the board  RD: render-only
 export CC_TASKS_FILE=$(mktemp -u) CC_STATUS_FILE=$(mktemp -u)
@@ -269,19 +249,21 @@ hj(){ python3 -c 'import json,sys; print(json.dumps({"hook_event_name":sys.argv[
 hr(){ printf '%s' "$1" | "$CC/cc-hooks.sh" status 2>&1; }               # hook runner: stdout+stderr together
 hs(){ local o rc; o="$(hr "$1")"; rc=$?; eq "$2 silent" "$o" ""; eq "$2 exit0" "$rc" "0"; }   # HARD RULES: prints nothing, exits 0 — every path
 hs "$(hj UserPromptSubmit "$SB" '')" "UPS board-dir"
-eq "UPS writes working"        "$(awk -F'\t' -v d="$SB" '$1==d{print $2}' "$CC_STATUS_FILE")" "working"
-eq "ts is unix epoch"          "$(awk -F'\t' -v d="$SB" '$1==d{print ($3 ~ /^[0-9]+$/)?"ok":"no"}' "$CC_STATUS_FILE")" "ok"
+# (Task 8) sidecar reads through the facade's raw read verb — see the §33 note; expected
+# values below are UNCHANGED from the direct-file era, only the read path moved
+eq "UPS writes working"        "$("$CC/cc-state" dump status | awk -F'\t' -v d="$SB" '$1==d{print $2}')" "working"
+eq "ts is unix epoch"          "$("$CC/cc-state" dump status | awk -F'\t' -v d="$SB" '$1==d{print ($3 ~ /^[0-9]+$/)?"ok":"no"}')" "ok"
 hs "$(hj Stop "$SB" '')" "Stop board-dir"
-eq "Stop updates to idle"      "$(awk -F'\t' -v d="$SB" '$1==d{print $2}' "$CC_STATUS_FILE")" "idle"
-eq "one row per dir"           "$(wc -l < "$CC_STATUS_FILE" | tr -d ' ')" "1"
+eq "Stop updates to idle"      "$("$CC/cc-state" dump status | awk -F'\t' -v d="$SB" '$1==d{print $2}')" "idle"
+eq "one row per dir"           "$("$CC/cc-state" dump status | wc -l | tr -d ' ')" "1"
 hs "$(hj Notification "$SB" 'Claude needs your permission to use Bash')" "permission notification"
-eq "permission → blocked"      "$(awk -F'\t' -v d="$SB" '$1==d{print $2}' "$CC_STATUS_FILE")" "blocked"
-tsb=$(awk -F'\t' -v d="$SB" '$1==d{print $3}' "$CC_STATUS_FILE"); sleep 1
+eq "permission → blocked"      "$("$CC/cc-state" dump status | awk -F'\t' -v d="$SB" '$1==d{print $2}')" "blocked"
+tsb=$("$CC/cc-state" dump status | awk -F'\t' -v d="$SB" '$1==d{print $3}'); sleep 1
 hs "$(hj Notification "$SB" 'Task completed successfully')" "non-permission notification"
-eq "non-perm keeps state"      "$(awk -F'\t' -v d="$SB" '$1==d{print $2}' "$CC_STATUS_FILE")" "blocked"
-eq "non-perm keeps ts"         "$(awk -F'\t' -v d="$SB" '$1==d{print $3}' "$CC_STATUS_FILE")" "$tsb"
+eq "non-perm keeps state"      "$("$CC/cc-state" dump status | awk -F'\t' -v d="$SB" '$1==d{print $2}')" "blocked"
+eq "non-perm keeps ts"         "$("$CC/cc-state" dump status | awk -F'\t' -v d="$SB" '$1==d{print $3}')" "$tsb"
 hs "$(hj UserPromptSubmit "$NB" '')" "UPS non-board-dir"
-eq "non-board dir writes no row" "$(grep -cF "$NB" "$CC_STATUS_FILE")" "0"
+eq "non-board dir writes no row" "$("$CC/cc-state" dump status | grep -cF "$NB")" "0"
 hs "not json" "malformed stdin"
 hs "" "empty stdin"
 # gwt-status rendering against a fabricated tasks+status pair: working/idle/blocked with age, dash when no row
@@ -301,15 +283,21 @@ eq "header has TAB+STATUS" "$(echo "$ROUT" | head -1 | grep -c 'TAB.*STATUS')" "
 # gwt-prune sweeps status rows whose dir no longer exists (sidecar stays consistent with the board)
 rm -rf "$RD3"
 CC_TASKS_FILE="$CC_TASKS_FILE" CC_STATUS_FILE="$CC_STATUS_FILE" zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; gwt-prune" >/dev/null 2>&1
-eq "prune sweeps dead status row" "$(grep -cF "$RD3" "$CC_STATUS_FILE")" "0"
-eq "prune keeps live status rows" "$(wc -l < "$CC_STATUS_FILE" | tr -d ' ')" "2"
+# (Task 8, §4-trap cases) these two test the SWEEP's side effect on what is on disk, so the
+# read verb is `dump status` (raw passthrough) — a filtered verb like the board view would
+# hide dead rows at read time and make "swept" vacuously green
+eq "prune sweeps dead status row" "$("$CC/cc-state" dump status | grep -cF "$RD3")" "0"
+eq "prune keeps live status rows" "$("$CC/cc-state" dump status | wc -l | tr -d ' ')" "2"
 # gwt-rm drops the status row of the removed dir (same bookkeeping as the task list)
 RR=$(mktemp -d); ( cd "$RR"; git init -q; git config user.email t@t; git config user.name t; git commit -q --allow-empty -m i
   mkdir .claude; git worktree add -q .claude/worktrees/wtS -b feat/S >/dev/null )
 SW="$(cd "$RR/.claude/worktrees/wtS" && pwd -P)"
 printf '%s\tidle\t%s\n' "$SW" "$(date +%s)" >> "$CC_STATUS_FILE"
 CC_TASKS_FILE="$CC_TASKS_FILE" CC_STATUS_FILE="$CC_STATUS_FILE" zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; cd '$RR'; gwt-rm wtS" >/dev/null 2>&1
-eq "gwt-rm drops status row" "$(grep -cF "$SW" "$CC_STATUS_FILE" 2>/dev/null)" "0"
+# (Task 8 edge) the emptied sidecar may not even EXIST here: old form `grep -cF … 2>/dev/null`
+# printed 0 for a missing file; `dump status` of a missing file is silent rc 0 with no bytes,
+# and grep -c on empty input still prints 0 — same assertion, same value, no error path left
+eq "gwt-rm drops status row" "$("$CC/cc-state" dump status | grep -cF "$SW")" "0"
 # install.sh registers the cc-hooks.sh subcommands idempotently and strips stale
 # registrations from pre-refactor installs (cc-notify + the two absorbed hook scripts)
 IH=$(mktemp -d)
@@ -391,8 +379,11 @@ eq "logical row dir still shows"   "$(brd "$BRD" | grep -c 'board task W1')" "1"
 # prune-on-read: dead-dir rows are dropped from the tasks file by the render itself (mkdir-lock rewrite)
 printf '2026-01-01 00:00:05\tfeat/G\tsurface:35\t%s\tsurface:1\tdead dir row\tmain\n' "$BRD/gone" >> "$CC_TASKS_FILE"
 brd "$BRD" >/dev/null
-eq "prune drops dead-dir row"      "$(grep -c 'dead dir row' "$CC_TASKS_FILE")" "0"
-eq "prune keeps live rows"         "$(wc -l < "$CC_TASKS_FILE" | tr -d ' ')" "4"
+# (Task 8, §4-trap cases) both assert the SWEEP's side effect on disk, so the read verb is
+# `dump tasks` (raw passthrough) — `task-list` skips dead dirs and dedups per dir AT READ
+# TIME, so it would report "0"/"4" even if the sweep never ran: vacuously green
+eq "prune drops dead-dir row"      "$("$CC/cc-state" dump tasks | grep -c 'dead dir row')" "0"
+eq "prune keeps live rows"         "$("$CC/cc-state" dump tasks | wc -l | tr -d ' ')" "4"
 DF=$(mktemp -u); printf '2026-01-01 00:00:05\tfeat/G\tsurface:35\t%s\tsurface:1\tdead dir row\tmain\n' "/tmp/cc-board-gone-$$" > "$DF"
 eq "all-dead message"              "$(CC_TASKS_FILE="$DF" CC_STATUS_FILE=/dev/null bash "$CC/cc-board.sh" 2>/dev/null)" "no registered worktree tasks"
 eq "all-dead removes file"         "$([ -f "$DF" ] && echo yes || echo no)" "no"
@@ -2123,6 +2114,13 @@ echo "== 32. cc-state facade (Phase A: one lock, one access path, TSV backend) =
 # are EXACTLY what today's hand-rolled awk/mkdir-lock code produces — same sanitization, same
 # fallbacks, same empty-set-deletes-file behaviour — so the round-2 lines can swap callers without
 # any observable change. mktemp everywhere (a worktree tests itself, siblings run in parallel).
+# TASK-8 EXCEPTION — the direct reads in this section STAY. Elsewhere the suite reads state
+# through cc-state verbs, not through the files (a storage-format change must not redden
+# unrelated sections); but §32's whole job is to pin the FORMAT: the frozen log oracle, the
+# 7-field round-trips, dump's byte-passthrough, the 8/9-field layouts, the sidecar row shape.
+# Here the raw file IS the object under test — converting these reads to facade calls would
+# make the facade vouch for itself (compare cc-state with cc-state, always green) and delete
+# this campaign's only byte contract. Read-side swaps belong to the OTHER sections' lines.
 S32=$(mktemp -d); export CC_TASKS_FILE="$S32/t.tsv" CC_STATUS_FILE="$S32/s.tsv" \
   CC_ARCHIVE_FILE="$S32/a.tsv" CC_TABS_FILE="$S32/b.tsv"
 printf '2026-01-01 00:00:00\tfeat/x\tsurface:1\t/d/x\tsurface:9\tdo x\tcamp\tuuid=u1\n' > "$CC_TASKS_FILE"
@@ -2155,12 +2153,14 @@ eq "32 stale lock reclaimed fast by a writer" "$(( t1 - t0 < 3 ? 1 : 0 ))" "1"
 eq "32 stale lock dir removed" "$([ -d "$CC_TASKS_FILE.lock" ] && echo yes || echo no)" "no"
 eq "32 write survived the reclaim" "$("$CC/cc-state" dump tasks | grep -c 'stale lock')" "1"
 
-# ── Task 2: the tasks-store verbs (byte contract of cc-board.sh log / cc-hooks.sh
-# status / the worktree.zsh rewriters / cc-dispatch.sh's $TMPDIR marker) ──────────
+# ── Task 2: the tasks-store verbs (byte contract of the retired cc-board.sh log —
+# frozen as the oracle below — / cc-hooks.sh status / the worktree.zsh rewriters /
+# cc-dispatch.sh's $TMPDIR marker) ──────────
 S32B=$(mktemp -d); export CC_TASKS_FILE="$S32B/t.tsv" CC_STATUS_FILE="$S32B/s.tsv" \
   CC_ARCHIVE_FILE="$S32B/a.tsv" CC_TABS_FILE="$S32B/b.tsv"
-# task-add / task-get: the placeholder row is exactly cc-board.sh log's row with
-# caller+largs left empty for task-set-launch to fill at the end of the dispatch
+# task-add / task-get: the placeholder row is exactly the retired cc-board.sh log's
+# row (see the frozen oracle below) with caller+largs left empty for task-set-launch
+# to fill at the end of the dispatch
 "$CC/cc-state" task-add /d/y feat/y surface:2 'do y' camp
 eq "32 task-add appends"        "$("$CC/cc-state" task-get /d/y | cut -f2)" "feat/y"
 eq "32 task-add 8 fields"       "$("$CC/cc-state" task-get /d/y | awk -F'\t' '{print NF}')" "8"
@@ -2169,32 +2169,58 @@ eq "32 placeholder caller+largs empty" "$("$CC/cc-state" task-get /d/y | awk -F'
 "$CC/cc-state" task-set-launch /d/y surface:9 'uuid=u2:pm=auto'
 eq "32 set-launch fills field 8" "$("$CC/cc-state" task-get /d/y | cut -f8)" "uuid=u2:pm=auto"
 eq "32 set-launch fills field 5" "$("$CC/cc-state" task-get /d/y | cut -f5)" "surface:9"
-# H1 byte oracle: same inputs through TODAY's writer (cc-board.sh log) and the facade
-# must produce the identical row — sanitization (tab/nl→space, |→/, 140/200 cut) and
-# both fallbacks (branch '?', the idle-prompt summary) included; only field 1 (time)
-# may differ. log gets the branch from git itself; task-add derives it (empty arg).
+# H1 byte oracle, FROZEN (Task 9): cc-board.sh log — the writer this facade replaced —
+# had no production caller left and was deleted, so these expected values are its
+# RECORDED output at commit 3edabd17890825a8d6fec59c3072ffa0cf9bcbb1 (2026-08-23) for
+# exactly the inputs below. They are LITERALS, never computed: the oracle needs a
+# reference INDEPENDENT of the facade under test — deriving the expectation from
+# sanitization code of our own would compare the facade with itself, always green,
+# proving nothing (the class of failure this section exists to catch). Field 1 is the
+# wall-clock timestamp and is excluded; $2..$8 are frozen field for field. CHANGING
+# THESE BYTES IS NOT FIXING A TEST: it means the on-disk row format changed — a
+# docs/state-model.md byte-contract change that must land in the same commit.
 # The task/largs texts are deliberately LONGER than the 140/200 cut lines so the
-# truncation itself is inside the oracle's compared bytes (round-2 B6: an oracle
-# fixture that never crosses the boundary proved nothing when the cap was mutated).
+# truncation itself is inside the compared bytes (round-2 B6: an oracle fixture that
+# never crosses the boundary proved nothing when the cap was mutated).
 LONGOR="$(printf 'or	task|test ')$(python3 -c 'print("x"*250)')"
 LONGOR2="$(printf 'uuid=o1:pm=auto	model ')$(python3 -c 'print("y"*250)')"
-"$CC/cc-board.sh" log /d/oracle s:5 c:9 "$LONGOR" feat/or "$LONGOR2"
+F32OR1='?|s:5|/d/oracle|c:9|or task/test xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx|feat/or|uuid=o1:pm=auto model yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy'
+flds32='{print $2"|"$3"|"$4"|"$5"|"$6"|"$7"|"$8}'
 "$CC/cc-state" task-add /d/oracle '' s:5 "$LONGOR" feat/or
 "$CC/cc-state" task-set-launch /d/oracle c:9 "$LONGOR2"
-# last two rows of the file = today's writer (tail -2 head -1), then the facade's.
-# No NR guard (round-2 B6: `NR>1` on one-line input made both sides empty and the
-# assertion vacuous — it must actually compare bytes to be an oracle).
-flds32='{print $2"|"$3"|"$4"|"$5"|"$6"|"$7"|"$8}'
-eq "32 facade matches today's log writer field-for-field" \
-  "$(tail -1 "$CC_TASKS_FILE" | awk -F'\t' "$flds32")" \
-  "$(tail -2 "$CC_TASKS_FILE" | head -1 | awk -F'\t' "$flds32")"
-# B7: log's `ref="${2:-?}"` — an empty surface ref becomes '?' on BOTH sides
-"$CC/cc-board.sh" log /d/oref "" c:9 "ref fallback" feat/or2 "uuid=o2"
+# no NR guard, and no tail -2 dance any more (round-2 B6: `NR>1` on one-line input made
+# both sides empty and the assertion vacuous; the log-side row it used to tail off is
+# gone, so the facade row is compared straight against the frozen literal)
+eq "32 facade writes the frozen log bytes (sanitize + both cuts)" \
+  "$(tail -1 "$CC_TASKS_FILE" | awk -F'\t' "$flds32")" "$F32OR1"
+# B7: the retired log's ref="${2:-?}" — an empty surface ref became '?'; task-add
+# replicates it (ref or "?"). Same provenance as F32OR1.
+F32OR2='?|?|/d/oref|c:9|ref fallback|feat/or2|uuid=o2'
 "$CC/cc-state" task-add /d/oref '' '' "ref fallback" feat/or2
 "$CC/cc-state" task-set-launch /d/oref c:9 "uuid=o2"
-eq "32 empty ref falls back to ? on both sides" \
-  "$(tail -1 "$CC_TASKS_FILE" | awk -F'\t' "$flds32")" \
-  "$(tail -2 "$CC_TASKS_FILE" | head -1 | awk -F'\t' "$flds32")"
+eq "32 empty ref falls back to ? (frozen)" \
+  "$(tail -1 "$CC_TASKS_FILE" | awk -F'\t' "$flds32")" "$F32OR2"
+# ── migrated from §2 (log's own section, retired with it in Task 9) ────────────────────
+# §2 tested the log ENTRY POINT. Its assertions that tested still-live behaviour moved
+# here in facade form; the rest died with the entry. Classification (full table in the
+# Task 9 gate report): "7th field is parent" / "8th field is launch-args" / "task
+# sanitized" / "launch-args sanitized" are SUBSUMED by the frozen F32OR1 (it pins $2..$8
+# byte for byte, TAB and | inside the compared bytes); the three groups below carry what
+# the frozen oracle does not: the full two-verb write's field count, the write→render
+# agreement across the cc-state → cc-board boundary, and the empty-dir guard the facade
+# replicated from log ([ -n "$dir" ] || exit 0 → task-add returns 0, writes nothing).
+RT32="$(cd "$(mktemp -d)" && pwd -P)"    # live dir: the sweep inside the render must keep it
+RTF32=$(mktemp -u)
+CC_TASKS_FILE="$RTF32" "$CC/cc-state" task-add "$RT32" '' surface:2 'round trip task' feat/rt
+CC_TASKS_FILE="$RTF32" "$CC/cc-state" task-set-launch "$RT32" surface:1 ''
+eq "32 full write keeps 8 fields" "$(awk -F'\t' '{print NF}' "$RTF32")" "8"
+eq "32 facade-written row renders on the board" \
+  "$(CC_TASKS_FILE="$RTF32" CC_STATUS_FILE=/dev/null bash "$CC/cc-board.sh" --all 2>/dev/null | grep -c 'round trip task')" "1"
+rm -f "$RTF32"
+N32E="$(wc -l < "$CC_TASKS_FILE" | tr -d ' ')"
+"$CC/cc-state" task-add '' feat/x s:1 'no dir' p; rc=$?
+eq "32 task-add empty dir rc0" "$rc" "0"
+eq "32 task-add empty dir writes no row" "$(wc -l < "$CC_TASKS_FILE" | tr -d ' ')" "$N32E"
 # H1 fallbacks and truncation
 "$CC/cc-state" task-add /d/h3 feat/h3 s:1 "" p3
 eq "32 empty task falls back" "$("$CC/cc-state" task-get /d/h3 | cut -f6)" "(idle ccteam, no initial prompt)"
@@ -2274,6 +2300,14 @@ eq "32 task-prune sweeps dead task rows" "$(grep -c '/d/' "$CC_TASKS_FILE")" "0"
 eq "32 task-prune keeps live task rows" "$(grep -c "$LIVE32" "$CC_TASKS_FILE")" "1"
 eq "32 task-prune sweeps the sidecar too" "$(grep -c '/d/dead' "$CC_STATUS_FILE")" "0"
 eq "32 task-prune keeps live sidecar rows" "$(grep -c "$LIVE32" "$CC_STATUS_FILE")" "1"
+# (migrated from §2) a legacy 7-field row is legal in a live store and must survive the
+# sweep AS 7 FIELDS — the set-ref pins above prove 7-field survival through a REWRITE,
+# not through the prune sweep, and a naive read-loop rewrite of this row shape is the
+# TAB-collapse hazard class this store was built never to commit
+printf '2026-01-01 00:00:00\tfeat/OLD7\tsurface:7\t%s\tsurface:1\told row task\tmain\n' "$LIVE32" >> "$CC_TASKS_FILE"
+"$CC/cc-state" task-prune
+eq "32 7-field row survives the sweep as 7 fields" "$(awk -F'\t' '$2=="feat/OLD7"{print NF}' "$CC_TASKS_FILE")" "7"
+eq "32 7-field row still renders" "$(CC_STATUS_FILE=/dev/null bash "$CC/cc-board.sh" --all 2>/dev/null | grep -c 'old row task')" "1"
 # task-archive: row verbatim + merged-at (8→9 fields), moved dirs on stdout, sidecar
 # rows of the moved dirs swept (the _gwt_archive_branch contract)
 "$CC/cc-state" task-set-state "$D32A" blocked          # the moved dir gets a sidecar row
@@ -3568,7 +3602,10 @@ in35close(){ sed -n '/^close)/,/^;;/p' "$CC/cc-dispatch.sh" | grep -c "$1" | awk
 eq "35 close resolves via tab-resolve"    "$(grep -c 'cc-state" tab-resolve' "$CC/cc-dispatch.sh")" "1"
 eq "35 close still probes liveness itself" "$(in35close '_cctabs_livemap')" "yes"
 eq "35 cmux session-store fallback untouched" "$(in35close 'CC_CMUX_SESSIONS')" "yes"
-eq "35 cc-board log call is gone"         "$(grep -c 'cc-board.sh" log' "$CC/cc-dispatch.sh")" "0"
+# (Task 9) the "cc-board log call is gone" eq that lived here was DELETED, not kept:
+# cc-board.sh log itself is retired, so a grep for calls to it can never go red again —
+# an always-green assertion that reads like coverage while testing nothing (round-2 pit 1).
+# The write path's contract now lives in §32 (frozen oracle + the migrated §2 groups).
 # NB: there is deliberately NO "no tabs-file awk left" structural assertion here. The old
 # offenders were MULTILINE awk invocations (the awk -F'\t' and the "$_tf" argument sit on
 # different physical lines), so every line-based grep counts 0 against the old code too — an
@@ -3596,8 +3633,11 @@ env PATH="$S35:$OP35" TMPDIR="$TMPDIR" CC_TASKS_FILE="$TF35" CC_TABS_FILE="$TB35
   bash "$CC/cc-dispatch.sh" surface "$DD35" "window probe brief" >/dev/null 2>&1
 eq "35 board row exists while the tab is still settling" "$(cat "${CC_35_LOG}.saw" 2>/dev/null)" "row"
 eq "35 dispatch opened exactly one tab"  "$(grep -c 'NEWSURF' "$CC_35_LOG")" "1"
-eq "35 completed row has its launch args" "$(awk -F'\t' -v d="$DD35" '$4==d{print ($8 ~ /uuid=/)?"y":"n"}' "$TF35")" "y"
-eq "35 completed row has its caller ref"  "$(awk -F'\t' -v d="$DD35" '$4==d{print $5}' "$TF35")" "surface:9"
+# (Task 8) the dispatch row's assertions read through the facade — task-get picks the dir's
+# newest row (what the old '$4==d' awk selected); TF35 is a section-local file, so the read
+# is env-scoped to it. Expected values unchanged.
+eq "35 completed row has its launch args" "$(CC_TASKS_FILE="$TF35" "$CC/cc-state" task-get "$DD35" | awk -F'\t' '{print ($8 ~ /uuid=/)?"y":"n"}')" "y"
+eq "35 completed row has its caller ref"  "$(CC_TASKS_FILE="$TF35" "$CC/cc-state" task-get "$DD35" | awk -F'\t' '{print $5}')" "surface:9"
 M35="$TMPDIR/cc-cmux-tabs/$(printf '%s' "$DD35" | shasum -a 1 | cut -d' ' -f1)"
 eq "35 dispatch stamped the dedup marker" "$([ -e "$M35" ] && echo yes || echo no)" "yes"
 
@@ -3606,7 +3646,7 @@ n35b=$(grep -c 'NEWSURF' "$CC_35_LOG")
 env PATH="$S35:$OP35" TMPDIR="$TMPDIR" CC_TASKS_FILE="$TF35" CC_TABS_FILE="$TB35" \
   CC_SEND_FAILLOG="$S35/fail" CC_SEND_VERIFY_SEC=0.1 CC_WT_PRETRUST=0 \
   bash "$CC/cc-dispatch.sh" surface "$DD35" "retry brief" >/dev/null 2>&1
-eq "35 fresh marker eats the retry"  "$([ "$(grep -c 'NEWSURF' "$CC_35_LOG")" = "$n35b" ] && [ "$(wc -l < "$TF35" | tr -d ' ')" = 1 ] && echo yes || echo no)" "yes"
+eq "35 fresh marker eats the retry"  "$([ "$(grep -c 'NEWSURF' "$CC_35_LOG")" = "$n35b" ] && [ "$(CC_TASKS_FILE="$TF35" "$CC/cc-state" dump tasks | wc -l | tr -d ' ')" = 1 ] && echo yes || echo no)" "yes"
 touch -t "$(date -v-121S '+%Y%m%d%H%M.%S')" "$M35"
 : > "$CC_35_LOG"; rm -f "${CC_35_LOG}.nscnt"
 CC_35_SCREEN="$S35/scr-tui" \
@@ -3682,19 +3722,20 @@ env HOME="$FH35" PATH="$S35:$OP35" TMPDIR="$TMPDIR" CC_TASKS_FILE="$TF35R" CC_ST
   CC_SEND_VERIFY_SEC=0.1 CC_WT_PRETRUST=0 CC_SEND_FAILLOG="$S35/fail" \
   bash -c 'printf "y\n" | "$0" resume --all' "$FH35/.config/cc-stack/cc-dispatch.sh" >/dev/null 2>&1
 # spec §3.5 #1 — _ccres_dropstatus split on whitespace; a dir WITH A SPACE never lost its row
-eq "35 resume clears a space-dir sidecar row" "$(grep -cF "$DSP35" "$SF35R")" "0"
-eq "35 resume clears the reopened dir's sidecar row" "$(grep -cF "$LOGD35" "$SF35R")" "0"
-eq "35 resume keeps unrelated sidecar rows"  "$(grep -cF "$RD35/elsewhere" "$SF35R")" "1"
+# (Task 8) sidecar reads via `dump status`, env-scoped to the section-local file
+eq "35 resume clears a space-dir sidecar row" "$(CC_STATUS_FILE="$SF35R" "$CC/cc-state" dump status | grep -cF "$DSP35")" "0"
+eq "35 resume clears the reopened dir's sidecar row" "$(CC_STATUS_FILE="$SF35R" "$CC/cc-state" dump status | grep -cF "$LOGD35")" "0"
+eq "35 resume keeps unrelated sidecar rows"  "$(CC_STATUS_FILE="$SF35R" "$CC/cc-state" dump status | grep -cF "$RD35/elsewhere")" "1"
 # spec §3.5 #6 — the old $3=r OFS rebuild widened legacy rows; the facade rewrite must not
 eq "35 resume keeps a 7-field row 7 fields" \
-  "$(awk -F'\t' -v d="$D735" '$4==d{print NF}' "$TF35R")" "7"
+  "$(CC_TASKS_FILE="$TF35R" "$CC/cc-state" task-get "$D735" | awk -F'\t' '{print NF}')" "7"
 eq "35 7-field row still got its ref refreshed" \
-  "$(awk -F'\t' -v d="$D735" '$4==d{print $3}' "$TF35R")" "surface:42"
+  "$(CC_TASKS_FILE="$TF35R" "$CC/cc-state" task-get "$D735" | awk -F'\t' '{print $3}')" "surface:42"
 # H3 — the recorded dir string survives the refresh as the row's own field (the facade matches it
 # through the canonical form; what it writes back is the RECORDED string), and the reopened tab
 # went to that dir (surface canonicalizes for cmux, as it always has)
 eq "35 refreshed row keeps its logical dir string" \
-  "$(awk -F'\t' -v d="$LOGD35" '$4==d{print $4}' "$TF35R")" "$LOGD35"
+  "$(CC_TASKS_FILE="$TF35R" "$CC/cc-state" task-get "$LOGD35" | awk -F'\t' '{print $4}')" "$LOGD35"
 eq "35 logical row's tab reopened in its dir" \
   "$(grep 'NEWSURF' "$CC_35_LOG" | grep -cF -- "--working-directory $PHYD35")" "1"
 
