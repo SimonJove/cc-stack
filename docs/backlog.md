@@ -124,3 +124,24 @@ audit-0821 定界,每项单独立项:
 - `~/.claude/hooks/block-worktree-commit.sh` 这个文件仍需人手删(已不再被注册)。
 - **campaign 总览 `docs/plans/audit-0821.md` 是 gitignored(只在主 checkout)**:其结论已由
   rules-docs 线转写进本文件与 known-issues(2026-08-21);该文件本身不进仓库。
+
+## Task 8b — the census Task 8 could not see (2026-08-23, A 期收尾时发现)
+
+Task 8 把测试的**取值**从存储格式上摘下来，验收达成（`1156 passed, 0 failed`，断言数不增不减）。
+但它的 census 只匹配了 `CC_TASKS_FILE` 一类**环境变量名**，漏掉了走局部别名的直读
+（`$TF17` / `$TB26` / `$SF` / `$AF` …）——约 52 行，分布在 §2c 归档块、§17 resume、§18、§20、§26、§34、§36。
+
+**它把这批判成「多数是格式形状钉」，这个分类不成立。** 父会话抽样复核：形状钉约 10 行
+（`NF`、`merged-at`、8/9 字段布局），**其余约 42 行是取值断言**——
+`awk '$4==d{print $3}' "$TF17"` 之类，字段顺序一变就红，正是这一期要摘掉的耦合。
+
+**但不能整批转，要逐条判**，判据是 Task 8 自己挖出来的那条（本期第五次恒绿伪装）：
+
+> 测「行**没有**被剪掉 / sweep 有没有真的写盘」的断言**必须读原始文件**（`dump`），
+> 不能换成 `task-list` 一类过滤动词——过滤动词读时就隐藏死目录行，
+> 断言在 sweep 根本没跑时也是绿的。实测：sweep 前 `task-list --all` 看到 0 条死行、`dump` 看到 1 条。
+
+所以 §26 那几条（`cross-workspace row NOT pruned`、`partial probe keeps the dead row`）**必须留原始读**，
+而 §17 的 ref/suuid 刷新那类可以转成 `task-get`。逐条分类是这个任务的主要工作量，不是机械替换。
+
+优先级：低。它不阻塞 C 期，也不影响正确性——只是"改存储格式时会有一批不相干的节变红"这个成本还没消掉。
