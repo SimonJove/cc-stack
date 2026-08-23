@@ -88,134 +88,58 @@ _gwt_bootstrap_wt() {
   return 0   # seeding is best-effort: its rc must not leak out and fail a finished bootstrap
 }
 
-# ── TSV access discipline (2026-08-16 audit, F1) ─────────────────────────────
-# NEVER `while IFS=$'\t' read -r a b c …` over worktree-tasks.tsv / worktree-status.tsv. TAB is
-# IFS *whitespace*, so zsh (like bash) collapses RUNS of it: one empty field — parent on a
-# detached HEAD, caller on a hand-written row — shifts every later field left. Reading a shifted
-# row is cosmetic; a rewriter that re-printf's the shifted VARIABLES writes the shift back and
-# fossilizes it (launch-args lands in the PARENT column ⇒ gwt-resume finds no uuid= and degrades
-# the tab to idle, `cc-dispatch.sh close` finds no csuuid/suuid and fail-closed refuses to close
-# it). So: field access via awk -F'\t' (cc-board.sh's header block documents this in full), and
-# every rewrite selects rows by LINE NUMBER and re-emits $0 verbatim — which is also what keeps
-# 7-field legacy, 8-field live and 9-field archive rows byte-identical across a rewrite.
-_gwt_dead_lines() {   # <file> <keep-fn> [dir-field-no=4] → line numbers to DROP (space separated)
-  emulate -L zsh
-  local f="$1" keep_fn="$2" col="${3:-4}" ln="" dir="" out=""
-  while IFS=$'\t' read -r ln dir; do
-    "$keep_fn" "$dir" || out="$out $ln"
-  done < <(awk -F'\t' -v c="$col" '{print NR "\t" $(c)}' "$f")
-  print -r -- "$out"
-}
-_gwt_drop_lines() {   # <file> <line numbers> → rewrite without them; kept rows byte-identical
-  emulate -L zsh
-  local f="$1" tmp="$1.tmp.$$"
-  awk -v drop="$2" 'BEGIN{n=split(drop,a," "); for(i=1;i<=n;i++) D[a[i]]=1} !(FNR in D)' "$f" > "$tmp" || return 1
-  mv "$tmp" "$f"
-  [[ -s "$f" ]] || rm -f "$f"
-  return 0
+# ── State access (state-model Phase A, 2026-08-22) ───────────────────────────
+# Every read/write of the four state stores (tasks / status sidecar / archive /
+# opened-tabs) goes through the cc-state facade — one lock, one access path
+# (docs/state-model.md). worktree.zsh keeps only the zsh interaction layer: the
+# gwt-* commands call the verbs, and the two shims below keep the function names
+# older callers (and test.sh) invoke directly. The ONE raw read left in this file
+# is gwt-tree's branch/ref scan — still awk -F'\t', never `IFS=$'\t' read`: TAB is
+# IFS *whitespace*, one empty field shifts every later field (2026-08-16 audit, F1).
+# cc-state sits next to this file when a worktree tests itself, else in the install dir.
+_gwt_state() {
+  local d="${_gwt_src_dir:-}"
+  [[ -n "$d" && -x "$d/cc-state" ]] && { echo "$d/cc-state"; return 0 }
+  echo "$HOME/.config/cc-stack/cc-state"
 }
 
 # ── Task list (worktree-tasks.tsv) maintenance ───────────────────────────────
 _gwt_tasks_file() { echo "${CC_TASKS_FILE:-$HOME/.config/cc-stack/worktree-tasks.tsv}" }
 
-# Rewrite the list by a "keep predicate": keep the line if keep_fn returns 0; delete the file if it ends up empty. The filter receives $dir.
-_gwt_tasks_rewrite() {
-  emulate -L zsh
-  local f; f="$(_gwt_tasks_file)"; [[ -f "$f" ]] || return 0
-  local keep_fn="$1" lock="$f.lock" got= i
-  # Share one mkdir lock with cc-board.sh log's append, to avoid losing a concurrent append during read→mv
-  for i in {1..60}; do mkdir "$lock" 2>/dev/null && { got=1; break }; sleep 0.05; done
-  _gwt_drop_lines "$f" "$(_gwt_dead_lines "$f" "$keep_fn" 4)"
-  [[ -n "$got" ]] && rmdir "$lock" 2>/dev/null
-  return 0
-}
-
-# Drop all records for a given dir (used by gwt-rm): keep lines where dir != target
+# Drop all records for a given dir (used by gwt-rm): task-drop's dir rule (raw or
+# canonical match). Kept as a named shim — gwt-rm and the regression suite call it.
 _gwt_tasks_drop_dir() {
   emulate -L zsh
   local target="$1"; [[ -n "$target" ]] || return 0
-  _gwt_drop_target="$target"
-  _gwt_tasks_rewrite '_gwt_keep_not_target'
-  unset _gwt_drop_target
+  "$(_gwt_state)" task-drop "$target"
 }
-_gwt_keep_not_target() { [[ "$1" != "$_gwt_drop_target" ]] }
-
-# Drop records whose dir no longer exists (used by gwt-status): keep lines whose dir still exists (even if the tab is closed)
-_gwt_tasks_prune_dead() { _gwt_tasks_rewrite '_gwt_keep_dir_exists' }
-_gwt_keep_dir_exists() { [[ -n "$1" && -d "$1" ]] }
 
 # ── Merged-task archive (worktree-tasks-archive.tsv) ───────────────────────────
-# Rows move here when their branch merges: same 7 fields plus an appended 8th merged-at unix
-# ts. Rendered by gwt-log (cc-board.sh --archive) with the board's columns and repo filter.
-_gwt_archive_file() { echo "${CC_ARCHIVE_FILE:-$HOME/.config/cc-stack/worktree-tasks-archive.tsv}" }
+# Rows move here when their branch merges: the row verbatim plus an appended merged-at
+# unix ts. Rendered by gwt-log (cc-board.sh --archive) with the board's columns and repo filter.
 
-# _gwt_archive_branch <branch> — under the tasks lock, move ALL rows whose branch matches
-# into the archive (appending merged-at) and drop their status sidecar rows. Called by
-# gwt-merge after a successful merge (or a benign skipped-already-merged), so the board stops
-# showing merged work while gwt-log keeps the history.
+# _gwt_archive_branch <branch> [<repo-root>] — move ALL rows whose branch matches into the
+# archive (merged-at appended: 8→9 fields, 7→8) and sweep their status sidecar rows, printing
+# the moved dirs on stdout for this summary. With <repo-root> the archive is repo-scoped
+# (spec §3.5 defect 2's fix): only rows whose dir lives under that root move, so the same
+# branch name in another repo keeps its rows; without it the semantics are today's global
+# match. Called by gwt-merge after a successful merge (or a benign skipped-already-merged),
+# so the board stops showing merged work while gwt-log keeps the history. Failure is LOUD
+# (spec §3.5 defects 4/5, fixed by the facade): rc 1 + stderr, task list left untouched —
+# this shim propagates that rc, never eats it. <merged-into> is Phase A's placeholder: the
+# facade's API takes it, the archive format doesn't store it yet.
 _gwt_archive_branch() {
   emulate -L zsh
-  local branch="$1"; [[ -n "$branch" ]] || return 0
-  local f; f="$(_gwt_tasks_file)"; [[ -f "$f" ]] || return 0
-  local arch; arch="$(_gwt_archive_file)"
-  local lock="$f.lock" got= i tmp="$f.tmp.$$" now="" out=""
-  local -a moved=()
-  for i in {1..60}; do mkdir "$lock" 2>/dev/null && { got=1; break }; sleep 0.05; done
-  now="$(date +%s)"
-  : > "$tmp"
-  # One awk pass (see the TSV access discipline above): a matching row is archived AS IT STANDS
-  # with merged-at appended — a live 8-field row becomes 9, a legacy 7-field row becomes 8 — and
-  # every other row is copied verbatim. The moved dirs come back on stdout for the sidecar sweep.
-  local rc=0
-  out="$(awk -F'\t' -v b="$branch" -v now="$now" -v arch="$arch" -v tmp="$tmp" '
-    $2 == b { printf "%s\t%s\n", $0, now >> arch; if ($4 != "") print $4; next }
-    { print $0 >> tmp }
-  ' "$f")" || rc=$?
-  if (( rc )); then   # never mv a half-written rewrite over the task list — rows would vanish
-    rm -f "$tmp"
-    [[ -n "$got" ]] && rmdir "$lock" 2>/dev/null
-    echo "✗ archive rewrite failed (awk rc $rc) — task list left untouched (the archive may have gained duplicates)" >&2
-    return 1
-  fi
-  [[ -n "$out" ]] && moved=("${(@f)out}")
-  mv "$tmp" "$f"
-  [[ -s "$f" ]] || rm -f "$f"
-  [[ -n "$got" ]] && rmdir "$lock" 2>/dev/null
-  local d
-  for d in $moved; do _gwt_status_drop_dir "$d"; done
+  local branch="$1" root="${2:-}"
+  [[ -n "$branch" ]] || return 0
+  local -a ra=()
+  [[ -n "$root" ]] && ra=(--repo "$root")
+  local out rc
+  out="$("$(_gwt_state)" task-archive "$branch" "" "${ra[@]}")"; rc=$?
+  local -a moved=(${(f)out})
   (( ${#moved} )) && echo "  ↳ archived ${#moved} record(s) for $branch (see gwt-log)"
-  return 0
+  return $rc
 }
-
-# ── Agent-state sidecar (worktree-status.tsv, written by cc-hooks.sh status) ───
-# dir \t state \t unix-ts, one row per dir. States: working / idle / blocked — never "ready":
-# readiness stays owned by gwt-done + a clean tree, so the sidecar only describes liveness of the agent.
-_gwt_status_file() { echo "${CC_STATUS_FILE:-$HOME/.config/cc-stack/worktree-status.tsv}" }
-
-# Rewrite the sidecar by a "keep predicate" (same contract and lock discipline as _gwt_tasks_rewrite;
-# cc-hooks.sh status appends under the same $f.lock, so a rewrite here can't lose its row updates)
-_gwt_status_rewrite() {
-  emulate -L zsh
-  local f; f="$(_gwt_status_file)"; [[ -f "$f" ]] || return 0
-  local keep_fn="$1" lock="$f.lock" got= i
-  for i in {1..60}; do mkdir "$lock" 2>/dev/null && { got=1; break }; sleep 0.05; done
-  _gwt_drop_lines "$f" "$(_gwt_dead_lines "$f" "$keep_fn" 1)"   # dir is the sidecar's FIRST field
-  [[ -n "$got" ]] && rmdir "$lock" 2>/dev/null
-  return 0
-}
-
-# Drop the state row for a removed dir (gwt-rm) — keep rows whose dir differs
-_gwt_status_drop_dir() {
-  emulate -L zsh
-  local target="$1"; [[ -n "$target" ]] || return 0
-  _gwt_status_drop_target="$target"
-  _gwt_status_rewrite '_gwt_status_keep_not_target'
-  unset _gwt_status_drop_target
-}
-_gwt_status_keep_not_target() { [[ "$1" != "$_gwt_status_drop_target" ]] }
-
-# Drop state rows whose dir no longer exists (gwt-prune) — reuses the board-side predicate
-_gwt_status_prune_dead() { _gwt_status_rewrite '_gwt_keep_dir_exists' }
 
 # gwt-new <name> [branch-prefix=feat] [base=HEAD] — create/reuse a worktree and cd into it
 gwt-new() {
@@ -345,26 +269,18 @@ gwt-tabs() {
   return $?
 }
 
-# gwt-prune — compact the task list: drop dead-dir records + keep only the newest per dir
+# gwt-prune — compact the task list: drop dead-dir records + keep only the newest per dir.
+#   One facade call sweeps the pair (tasks dir field + sidecar col 0) and compacts newest-per-dir;
+#   the messages below stay byte-identical to the hand-rolled era.
 gwt-prune() {
   emulate -L zsh
-  _gwt_status_prune_dead          # sweep the agent-state sidecar too (rows whose dir vanished)
-  local f; f="$(_gwt_tasks_file)"; [[ -f "$f" ]] || { echo "list is empty"; return 0 }
-  _gwt_tasks_prune_dead
-  [[ -f "$f" ]] || { echo "✔ emptied (no live records)"; return 0 }
-  # Newest-per-dir dedup, again by re-emitting $0 verbatim under the shared lock (a read/printf
-  # loop here rewrote every empty field shifted — see the TSV access discipline above).
-  local tmp="$f.tmp.$$" lock="$f.lock" got= i
-  for i in {1..60}; do mkdir "$lock" 2>/dev/null && { got=1; break }; sleep 0.05; done
-  tail -r "$f" | awk -F'\t' '$4 != "" && !seen[$4]++' | tail -r > "$tmp"
-  if (( ${pipestatus[1]} + ${pipestatus[2]} + ${pipestatus[3]} )); then
-    rm -f "$tmp"                                  # partial rewrite ⇒ keep the list as it was
-    [[ -n "$got" ]] && rmdir "$lock" 2>/dev/null
-    echo "✗ compaction failed — task list left untouched" >&2
-    return 1
-  fi
-  mv "$tmp" "$f"; [[ -s "$f" ]] || rm -f "$f"
-  [[ -n "$got" ]] && rmdir "$lock" 2>/dev/null
+  local f; f="$(_gwt_tasks_file)"
+  local had=0; [[ -f "$f" ]] && had=1
+  local rc=0
+  "$(_gwt_state)" task-prune --compact || rc=$?
+  if (( rc )); then return $rc; fi   # the facade already said "compaction failed — task list left untouched"
+  (( had )) || { echo "list is empty"; return 0 }
+  [[ -s "$f" ]] || { rm -f "$f"; echo "✔ emptied (no live records)"; return 0 }
   echo "✔ task list compacted"
 }
 
@@ -575,7 +491,7 @@ gwt-merge() {
   fi
   local mrc=$?
   if (( mrc == 0 )); then
-    _gwt_archive_branch "$child"     # merged (or skipped-already-merged) → off the live board, into gwt-log
+    _gwt_archive_branch "$child" "$root"   # repo-scoped: another repo's same-name branch keeps its rows (defect 2)
     echo "  (cleanup when ready: gwt-rm ${child#feat/} --branch)"
   fi
   return $mrc
@@ -737,7 +653,7 @@ gwt-rm() {
   # Runs BEFORE the task row is dropped — that row IS the ledger the primitive reads.
   [[ -n "$want_close" ]] && ~/.config/cc-stack/cc-dispatch.sh close "${wtabs:-$wtpath}"
   _gwt_tasks_drop_dir "${wtabs:-$wtpath}" && echo "  ↳ removed from task list"
-  _gwt_status_drop_dir "${wtabs:-$wtpath}"   # drop the agent-state row for the same canonical dir
+  "$(_gwt_state)" task-clear-state "${wtabs:-$wtpath}"   # drop the agent-state row for the same dir — clear-state, not prune: the dir may still exist here
   ~/.config/cc-stack/cc-trust.sh --remove "${wtabs:-$wtpath}" >/dev/null 2>&1   # clear the pre-trust entry (only pure-trust-signature ones)
   if [[ -n "$want_branch" ]]; then
     local br="${wtbranch:-feat/$name}"   # real branch when readable; default prefix as fallback (dir without HEAD)
