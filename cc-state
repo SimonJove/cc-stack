@@ -245,6 +245,17 @@ def dir_match(row_dir, given, given_canon):
     other — the /var-vs-/private/var row that used to be unmatched forever."""
     return row_dir == given or canon_or_raw(row_dir) == given_canon
 
+def under_root(row_dir, root_canon):
+    """Is this row's dir inside <root>? Uses canon() (realpath), NOT canon_or_raw:
+    an archived row's worktree is usually already GONE, and realpath still resolves
+    a dead /var/... path to its /private/var/... form because the symlink component
+    is what moves. Component-boundary test, never a bare prefix — a bare startswith
+    would put /a/repo-other inside /a/repo."""
+    if not row_dir:
+        return False                       # an empty dir belongs to no repo: never touch it
+    c = canon(row_dir)
+    return c == root_canon or c.startswith(root_canon + os.sep)
+
 def fields(line):
     return line.split("\t")
 
@@ -499,30 +510,74 @@ def cmd_task_prune(args):
     """Sweep rows whose dir is gone, from the task list AND the sidecar — both real
     callers (the board's prune-on-read and gwt-prune) always sweep the pair. Keep
     rule is today's: dir field non-empty and still a directory."""
-    if args:
-        return _usage("task-prune")
-    for store, col in (("tasks", 3), ("status", 0)):
-        def fn(rows, col=col):
-            return [l for l in rows
-                    if len(fields(l)) > col and fields(l)[col]
-                    and os.path.isdir(fields(l)[col])]
-        rewrite(store, fn)
+    compact = False
+    for a in args:
+        if a == "--compact":
+            compact = True
+        else:
+            return _usage("task-prune [--compact]")
+
+    def live(rows, col):
+        return [l for l in rows
+                if len(fields(l)) > col and fields(l)[col]
+                and os.path.isdir(fields(l)[col])]
+
+    def newest_per_dir(rows):
+        """gwt-prune's `tail -r | awk -F'\t' '$4 != "" && !seen[$4]++' | tail -r`,
+        verbatim. Two things are load-bearing and deliberately NOT "improved":
+        the key is the RAW dir string (today does not canonicalize here, so two
+        forms of one dir are two rows — changing that is a behaviour change, not a
+        cleanup), and the surviving rows keep their ORIGINAL file order."""
+        seen, out = set(), []
+        for l in reversed(rows):
+            f = fields(l)
+            d = f[3] if len(f) > 3 else ""
+            if not d or d in seen:
+                continue
+            seen.add(d)
+            out.append(l)
+        out.reverse()
+        return out
+
+    ok = rewrite("tasks", lambda rows: newest_per_dir(live(rows, 3)) if compact
+                 else live(rows, 3))
+    if not ok:
+        # today's gwt-prune on a failed compaction: the list is left as it was, loudly
+        print("cc-state: compaction failed — task list left untouched", file=sys.stderr)
+        return 1
+    rewrite("status", lambda rows: live(rows, 0))
     return 0
 
 def cmd_task_archive(args):
     """Move every row of a branch into the archive (verbatim + merged-at appended,
     8→9 fields), sweep the sidecar rows of the moved dirs, print the moved dirs.
+    With --repo <root> only rows whose dir lives under that root are moved, which
+    is spec 3.5 defect 2 dying: _gwt_archive_branch matched on branch NAME alone,
+    so merging feat/x in one repo archived another repo's feat/x rows too. Without
+    the flag the semantics are today's, global — every existing caller and fixture
+    keeps working unchanged.
     <merged-into> is accepted for the target API but not persisted in Phase A: the
     archive format is frozen at `row + merged-at` until the engine swap. Under the
     tasks lock like today (the archive write borrows it), plus the archive's own
     lock — ordering is always tasks→archive, so no deadlock. A failed tasks rewrite
     is LOUD (stderr + rc 1), matching _gwt_archive_branch: the task list stays
     untouched and the archive may have gained the rows — visible, never silent."""
-    if len(args) != 2:
-        return _usage("task-archive <branch> <merged-into>")
-    branch = args[0]
+    root = None
+    rest = []
+    i = 0
+    while i < len(args):
+        if args[i] == "--repo":
+            if i + 1 >= len(args):
+                return _usage("task-archive <branch> <merged-into> [--repo <root>]")
+            root = args[i + 1]; i += 2
+        else:
+            rest.append(args[i]); i += 1
+    if len(rest) != 2:
+        return _usage("task-archive <branch> <merged-into> [--repo <root>]")
+    branch = rest[0]
     if not branch:
         return 0
+    root_canon = canon(root) if root else None
     ts = str(int(time.time()))
     tp, ap = PATHS["tasks"](), PATHS["archive"]()
     with lock(tp), lock(ap):
@@ -530,7 +585,10 @@ def cmd_task_archive(args):
         kept, moved_rows, moved_dirs = [], [], []
         for line in lines:
             f = fields(line)
-            if len(f) >= 2 and f[1] == branch:
+            hit = len(f) >= 2 and f[1] == branch
+            if hit and root_canon is not None:
+                hit = under_root(f[3] if len(f) > 3 else "", root_canon)
+            if hit:
                 moved_rows.append(line + "\t" + ts)
                 if len(f) >= 4 and f[3]:
                     moved_dirs.append(f[3])

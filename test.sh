@@ -2370,6 +2370,58 @@ eq "32 clear-state emptying the store removes the file" \
   "$([ -e "$CC_STATUS_FILE" ] && echo yes || echo no)" "no"
 rm -rf "$S32CL"
 
+# ── task-archive --repo / task-prune --compact ───────────────────────────────────
+# Both exist because worktree.zsh cannot express them without a hand-rolled locked
+# rewrite, which is the thing this phase deletes. Defaults are today's semantics,
+# so every existing caller and fixture is untouched — the flags are opt-in.
+S32F=$(mktemp -d); A32="$S32F/repoA"; B32="$S32F/repoB"; O32="$S32F/repoA-other"
+mkdir -p "$A32/wt" "$A32/wt2" "$B32/wt" "$O32/wt"
+export CC_TASKS_FILE="$S32F/t.tsv" CC_ARCHIVE_FILE="$S32F/a.tsv" CC_STATUS_FILE="$S32F/s.tsv"
+# spec 3.5 defect 2: _gwt_archive_branch matched on branch NAME alone, so merging
+# feat/x in repo A archived repo B's feat/x rows too.
+mk32f(){
+  : > "$CC_ARCHIVE_FILE"
+  printf '2026-01-01 00:00:01\tfeat/x\ts:1\t%s\tc\tA row\tp\tu\n'      "$A32/wt" >  "$CC_TASKS_FILE"
+  printf '2026-01-01 00:00:02\tfeat/x\ts:2\t%s\tc\tB row\tp\tu\n'      "$B32/wt" >> "$CC_TASKS_FILE"
+  printf '2026-01-01 00:00:03\tfeat/x\ts:3\t\tc\tno-dir row\tp\tu\n'             >> "$CC_TASKS_FILE"
+}
+mk32f; "$CC/cc-state" task-archive feat/x feature/camp --repo "$A32" >/dev/null
+eq "32 --repo archives only this repo's rows"  "$(grep -c 'A row' "$CC_TASKS_FILE")" "0"
+eq "32 --repo leaves the other repo alone"     "$(grep -c 'B row' "$CC_TASKS_FILE")" "1"
+# an empty dir belongs to no repo — never swept by a repo-scoped archive
+eq "32 --repo leaves an empty-dir row alone"   "$(grep -c 'no-dir row' "$CC_TASKS_FILE")" "1"
+eq "32 --repo archive row still 9 fields"      "$(awk -F'\t' 'END{print NF}' "$CC_ARCHIVE_FILE")" "9"
+# component-boundary containment: /a/repoA must not swallow /a/repoA-other
+: > "$CC_ARCHIVE_FILE"
+printf '2026-01-01 00:00:04\tfeat/y\ts:1\t%s\tc\tsibling row\tp\tu\n' "$O32/wt" > "$CC_TASKS_FILE"
+"$CC/cc-state" task-archive feat/y feature/camp --repo "$A32" >/dev/null
+eq "32 --repo does not swallow a sibling-named repo" "$(grep -c 'sibling row' "$CC_TASKS_FILE")" "1"
+# no flag = today's global semantics: branch name alone, so ALL THREE rows go —
+# both repos AND the empty-dir row. That the empty-dir row survives above is a
+# property of --repo (a dir-less row is in no repo), not of archiving in general.
+mk32f; "$CC/cc-state" task-archive feat/x feature/camp >/dev/null
+eq "32 archive without --repo stays global" \
+  "$(grep -c 'row' "$CC_TASKS_FILE" 2>/dev/null || echo 0)" "0"
+eq "32 global archive moved all three rows" "$(wc -l < "$CC_ARCHIVE_FILE" | tr -d ' ')" "3"
+# --compact: gwt-prune's `tail -r | awk '$4!="" && !seen[$4]++' | tail -r`, verbatim
+mk32c(){
+  printf '2026-01-01 00:00:01\tfeat/a\ts:1\t%s\tc\tOLD dup\tp\tu\n' "$A32/wt"  >  "$CC_TASKS_FILE"
+  printf '2026-01-01 00:00:02\tfeat/b\ts:2\t%s\tc\tw2 row\tp\tu\n'  "$A32/wt2" >> "$CC_TASKS_FILE"
+  printf '2026-01-01 00:00:03\tfeat/a\ts:3\t%s\tc\tNEW dup\tp\tu\n' "$A32/wt"  >> "$CC_TASKS_FILE"
+  printf '2026-01-01 00:00:04\tfeat/c\ts:4\t\tc\tempty dir\tp\tu\n'            >> "$CC_TASKS_FILE"
+}
+# the default must NOT compact — the board's prune-on-read calls it on every render
+mk32c; "$CC/cc-state" task-prune
+eq "32 task-prune alone does not compact"  "$(grep -c 'OLD dup' "$CC_TASKS_FILE")" "1"
+mk32c; "$CC/cc-state" task-prune --compact
+eq "32 --compact drops the older dup"      "$(grep -c 'OLD dup' "$CC_TASKS_FILE")" "0"
+eq "32 --compact keeps the newest"         "$(grep -c 'NEW dup' "$CC_TASKS_FILE")" "1"
+eq "32 --compact drops an empty-dir row"   "$(grep -c 'empty dir' "$CC_TASKS_FILE")" "0"
+# ORIGINAL file order survives (tail -r … | tail -r), it is not newest-first
+eq "32 --compact preserves file order"     "$(cut -f6 "$CC_TASKS_FILE" | tr '\n' ',')" "w2 row,NEW dup,"
+rm -rf "$S32F"
+
+
 rm -rf "$S32" "$S32B" "$S32R" "$S32RO" "$D32A" "$D32B" "$LIVE32" "$R32A" "$R32B" "$V32"
 rm -f "$S32/live.empty" "$S32/live.missing" "$S32/live.part" "$S32/live.one" "$S32/live.none" 2>/dev/null
 cc_sandbox_ledgers   # back to the sandbox before the next section
