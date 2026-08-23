@@ -211,6 +211,8 @@ if __name__ == "__main__":
   - `task-set-state <dir> <state>` — dir 不在 tasks 里则**静默 no-op、rc 0**
   - `task-set-ref <dir> <ref> [<suuid>]`
   - `task-drop <dir>` / `task-prune` / `task-archive <branch> <merged-into>`
+  - `task-mark-opened <dir>` — 盖"tab 真的开成了"的时戳。**`task-add` 不得顺手盖**：
+    失败的派发必须不留阻塞标记（`cc-dispatch.sh:711`）。见 spec §4 的拆分说明。
   - `task-opened-recently <dir> <seconds>` — rc 0 = 窗口内开过
 
 > **A 期的映射约定**（因为后端还是今天的文件）：`state`/`state_ts` 落在 `worktree-status.tsv`；
@@ -263,7 +265,9 @@ eq "32 rewrite keeps field count" "$("$CC/cc-state" task-get /d/z | awk -F'\t' '
 - Produces：
   - `tab-add <suuid> <owner> <dir> <session-id>` — 空 owner/session 写 `-`（今天的约定，防 TAB 塌缩）
   - `tab-list [--all]`（`--all` 关闭"只列本会话开的"过滤，会话身份由 `CC_CALLER_SURFACE_UUID`/`CMUX_SURFACE_ID` 决定）
-  - `tab-resolve <dir>` — 一行 `suuid \t owner \t branch`：**board 行优先、opened-tabs 兜底**，把 `cc-dispatch.sh close` 今天的三次查询合成一次
+  - `tab-resolve <dir>` — **每个台账候选一行**，按优先级 `board` → `tabs`，每行 `source \t suuid \t owner \t branch`。
+    门面只给证据，**不做选择**：`close` 的选择依据是探活，探活按 spec §3.2 留在门面之外。详见 spec §4 修正段（2026-08-22）。
+    没有任何候选 → 零行输出、rc 1。
   - `tab-owner <suuid>`
   - `tab-prune <live-uuid-file>` — 只在证据完整时剪；传入文件为空 → **一行不剪**
 
@@ -272,7 +276,9 @@ eq "32 rewrite keeps field count" "$("$CC/cc-state" task-get /d/z | awk -F'\t' '
 ```bash
 "$CC/cc-state" tab-add AAAA-1 BBBB-2 /d/y sid-1
 eq "32 tab-add writes - for empty" "$("$CC/cc-state" tab-add CCCC-3 '' /d/z '' && cut -f2,4 "$CC_TABS_FILE" | tail -1)" "$(printf -- '-\t-')"
-eq "32 tab-resolve prefers the board row" "$("$CC/cc-state" tab-resolve /d/y | cut -f1)" "AAAA-1"
+eq "32 tab-resolve lists board first" "$("$CC/cc-state" tab-resolve /d/y | head -1 | cut -f1,2)" "$(printf 'board\tAAAA-1')"
+eq "32 tab-resolve emits every candidate, never picks" "$("$CC/cc-state" tab-resolve /d/y | cut -f1 | tr '\n' ',')" "board,tabs,"
+eq "32 tab-resolve with no candidate is empty + rc1" "$("$CC/cc-state" tab-resolve /d/none; echo rc=$?)" "rc=1"
 # the invariant that must never weaken: no evidence => no pruning
 : > "$S32/live.empty"
 "$CC/cc-state" tab-prune "$S32/live.empty"
@@ -372,7 +378,10 @@ eq "34 board has no dead-line pruner" "$(grep -c 'ccb_dead_lines' "$CC/cc-board.
 
 **Interfaces**
 - Consumes：`task-add` / `task-set-launch` / `task-set-ref` / `task-list` / `task-opened-recently` /
-  `tab-add` / `tab-resolve` / `tab-list` / `tab-prune`
+  `task-mark-opened` / `tab-add` / `tab-resolve` / `tab-owner` / `tab-list` / `tab-prune`
+- **`close` 的四段级联编排不下沉**（2026-08-22 实读修正）：`tab-resolve` 一次把台账候选全给出来，
+  但「挨个探活、取第一个活的、最后按选定 uuid 反查 owner」仍写在 `cc-dispatch.sh` 里；
+  第三段的 cmux 会话存储回退一个字节都不动。省掉的是三次文件读和三处 TSV 解析，不是那个判断。
 - 删除：`_cctabs_*` 整族的文件读写与锁、`$TMPDIR` 标记的直接读写、resume 的 `_ccres_setref`/`_ccres_dropstatus`/`_ccres_keys`。
 - **保留**：`_cctabs_livemap` / `_cctabs_partial` / `_cctabs_where`（那是 cmux 探测，不是状态）。
 
@@ -383,6 +392,18 @@ echo ""
 echo "== 35. dispatch state goes through cc-state =="
 # close 的三问合成一次
 eq "35 close resolves via tab-resolve" "$(grep -c 'cc-state" tab-resolve' "$CC/cc-dispatch.sh")" "1"
+# the facade gives evidence, close still decides: the liveness probe stays in the shell.
+# present/absent, never a count — these helpers legitimately appear many times and a count drifts.
+_in_close(){ sed -n '/^close)/,/^;;/p' "$CC/cc-dispatch.sh" | grep -c "$1" \
+  | awk '{print ($1>0)?"yes":"no"}'; }
+eq "35 close still probes liveness itself"      "$(_in_close '_cctabs_livemap')"  "yes"
+eq "35 cmux session-store fallback untouched"   "$(_in_close 'CC_CMUX_SESSIONS')" "yes"
+# and the facade must never SHELL OUT to cmux. (It may NAME cmux: $TMPDIR/cc-cmux-tabs is
+# Phase A's tab_opened_ts backend and CMUX_SURFACE_ID is tab-list's session identity —
+# both are spec'd. The line is forking a probe, not mentioning the word.)
+eq "35 git is the only command cc-state runs" \
+  "$(grep -oE 'subprocess\.run\(\["[a-z-]+"' "$CC/cc-state" | sort -u | tr '\n' ',')" \
+  "subprocess.run([\"git\","
 eq "35 no tabs-file awk left" "$(grep -cE 'awk -F.\\\\t. .*(_tf|tabs_f)' "$CC/cc-dispatch.sh")" "0"
 eq "35 no mkdir lock left" "$(grep -c '_cctabs_lock' "$CC/cc-dispatch.sh")" "0"
 # 派发窗口：tab 一开就有板行（spec §3.1 的 bug）
@@ -491,4 +512,4 @@ Task 4 → sidecar join 键的原样匹配 vs 读侧再规范化（规范化要�
 - **占位符扫描**：Task 5 的表头期望值和 Task 6 的一条断言标了"执行时用真实输出填"，并说明了理由
   （`column -t` 宽度依赖内容）——这是**必须在执行时测量**的值，不是待办。
 - **类型一致性**：`task-add` 的参数在 Task 2 定义、Task 6 消费，签名一致；`tab-resolve` 在 Task 3 定义
-  （返回 `suuid \t owner \t branch`）、Task 6 消费，一致；`task-set-launch` 在 spec §4 与 Task 2/6 同名。
+  （每候选一行 `source \t suuid \t owner \t branch`）、Task 6 消费，一致；`task-set-launch` 在 spec §4 与 Task 2/6 同名。

@@ -147,7 +147,7 @@ merged_into TEXT       -- 落地时真正合进了哪里
 
 ## 3.5 门面顺带修掉的既有缺陷
 
-调研（survey-tsv / survey-other，2026-08-22）在这 46 处解析点里找到六个缺陷。它们**不是本设计的目标**，
+调研（survey-tsv / survey-other，2026-08-22）在这 46 处解析点里找到六个缺陷；第一轮的 gate 又实测出两个（7、8）。它们**不是本设计的目标**，
 但只要访问收敛到一份实现就自动消失——所以每一条都要在对应任务里写一条断言钉住：
 
 1. **`_ccres_dropstatus`（`cc-dispatch.sh:1524`）的 awk 漏了 `-F'\t'`**，按空白切分 → 路径含空格的 dir
@@ -165,6 +165,13 @@ merged_into TEXT       -- 落地时真正合进了哪里
 6. **`_ccres_setref` 是全仓库唯一会改变行字段数的重写路径**：它用 `$3=r` 赋值触发 awk 以 `OFS` 重建 `$0`，
    于是把 7 字段遗留行**扩成 8 字段**。因为有 `-F'\t'` 所以空字段不会塌缩（安全），但这是既有纪律
    （"按行号选行 + `print $0` 逐字重发"）的唯一破例，门面里不应该保留这个例外。
+7. **unborn 分支上 `cc-board.sh log` 会写出一条两行的坏行**（2026-08-22 gate 实测）：
+   `git rev-parse --abbrev-ref HEAD` 在没有任何提交的分支上 **exit 128 的同时把 `HEAD` 打到 stdout**，
+   于是 `cc-board.sh:67` 的 `$(… || echo '?')` 捕到的是 `HEAD\n?` —— 板文件里多出一行断裂记录。
+   门面自己判分支，返回干净的 `?`。这是**有意偏离"逐字节相同"**，方向是安全的。
+8. **`LC_ALL=C` 下 `cut -c1-140` 是按字节切的**，会把中文摘要切在半个字符中间，往盘上写非法 UTF-8。
+   hook 环境不保证 UTF-8 locale，而本项目的工作语言是中文，所以这条是活的。门面按**字符**切。
+   同样是有意偏离，同样记在这里而不是悄悄改掉。
 
 另外两条**边界**，写进约束而不是改掉：
 
@@ -188,16 +195,38 @@ task-set-ref <dir> <ref> [<suuid>]                   resume 的刷新（含 laun
 task-drop    <dir>                                   gwt-rm
 task-prune                                           目录已消失的行
 task-archive <branch> <merged-into>                  移进 archive 表，返回被移动的 dir
-task-opened-recently <dir> <seconds>                 rc 0 = 窗口内开过（原 120s 标记）
+task-mark-opened <dir>                               盖上"tab 真的开成了"的时戳（原 120s 标记）
+task-opened-recently <dir> <seconds>                 rc 0 = 窗口内开过
 tab-add      <suuid> <owner> <dir> <session-id>
 tab-list     [--all]
-tab-resolve  <dir>                                   suuid + owner + branch，close 的三问一次答完
+tab-resolve  <dir>                                   候选行按优先级全出（board 行 → tabs 台账），一行一个候选
+tab-owner    <suuid>                                 最终选定的 uuid 的 owner
 tab-prune    <live-uuid-list>                        证据完整才剪（今天的 !partial 不变量）
-dump         tasks|archive|tabs                      打出今天格式的 TSV，供人 cat/grep 排查
+dump         tasks|archive|tabs|status               打出今天格式的 TSV，供人 cat/grep 排查
 ```
 
-`tab-resolve` 是 §2 结论 3 的样板：`cc-dispatch.sh close` 今天要查板行、查台账、查 owner 三次，
-合成一次调用。
+**为什么 `task-mark-opened` 和 `task-add` 是两个动词**（2026-08-22 gate 实测后拆开）：
+`cc-dispatch.sh:711` 的注释是硬约束——*Only CHECK here; write the marker after success
+(failures leave no blocking marker)*。板行要在 tab 一开就写（§3.1 那个 bug 的修复），
+而去重标记只能在 tab **确实开成**之后盖：把两者塞进一个动词，就等于让一次失败的派发
+留下标记、吃掉操作者 120 秒内的重试，而且是静默的（`cc-dispatch.sh:721` exit 0，无 tab 无提示）。
+一个动词一件事，调用方按自己知道的成败来决定盖不盖。
+
+`tab-resolve` 是 §2 结论 3 的样板，但它**不替调用方做选择**——这一点是 2026-08-22 实读 `close` 后修正的。
+
+`cc-dispatch.sh close` 今天不是「板行优先、台账兜底」这么简单，而是一条**探活穿插其间**的四段级联：
+板行取 `suuid`/`csuuid` → 拿 `_cctabs_livemap` 探活 → **不活**才查 opened-tabs 台账并再探一次 →
+仍不活才查 cmux 自己的会话存储（`~/.cmuxterm/claude-hook-sessions.json`，按 cwd）再探一次；
+owner 最后按**最终选定的那个 uuid** 反查。
+
+选择依据是探活，而探活按 §3.2 明确留在门面之外（那是 cmux 探测，不是状态）。所以门面**不能**返回单行结论：
+`tab-resolve <dir>` 按优先级输出**全部台账候选**，每行 `source \t suuid \t owner \t branch`
+（`source` = `board` | `tabs`），编排——挨个探活、取第一个活的——留在 `cc-dispatch.sh`。
+第三段的 cmux 会话存储**不进门面**：它不是 cc-stack 的状态，cc-stack 只读它。
+
+收益仍在：三次文件读变一次调用、TSV 解析和规范化下沉；变的只是「谁做决定」——门面给证据，调用方做判断。
+给 `tab-resolve` 加一个「顺便探活」的 flag 是错的方向：那会把 cmux 依赖拖进门面，
+让门面在没有 cmux 的环境里（测试、CI、远程 SSH）从可用变成不可用。
 
 ## 5. 存储引擎与并发
 
