@@ -333,6 +333,18 @@ eq "33 hook has no mkdir lock left" "$(grep -c 'mkdir "\$lock"' "$CC/cc-hooks.sh
 
 ---
 
+> **跨线裁定（2026-08-22）：`cc-board.sh log` 归谁，以及为什么谁都别动它。**
+> `log` 是今天写板行的唯一入口，它住在 **Task 5 的文件**里，调用方却在 **Task 6 的文件**里——
+> 两条线并行，任何一边先落地都会踩到另一边。更关键的是第三层：**§32 的 H1 oracle 就是拿真的
+> `cc-board.sh log` 当参照物**。Task 5 若把 `log` 改成转发给 `cc-state` 的薄壳，那条 oracle
+> 就变成拿 `cc-state` 和 `cc-state` 比——**它会一直绿，而且看不出来它在空转**，和这轮刚抓到的
+> `NR>1` 空断言是同一类失效。
+>
+> 裁定：**Task 5 一个字都不碰 `log`，只改渲染路径。** `log` 保持成今天那个独立写者，
+> oracle 才有意义；Task 6 自己换调用点，两条线互不阻塞；Task 6 落地后 `log` 自然成为死代码。
+> **删除 `log` 是一个独立的后续任务（Task 9）**，而那一步必须同时把 §32 的 oracle 换成
+> **冻结夹具**（把今天 `log` 的输出录下来当期望值），不能顺手删了了事。
+
 ## Task 5: `cc-board.sh` 切到门面
 
 **Files**
@@ -491,6 +503,8 @@ grep -cE '(awk|cut|grep)[^|]*(CC_TASKS_FILE|CC_STATUS_FILE|CC_ARCHIVE_FILE|CC_TA
   因为它们的文件所有权完全重叠——按本仓库"按文件所有权切线"的原则，硬拆反而制造冲突。
 - **Task 4 / 5 / 6 / 7 并行**（四个不同文件，各自独立节号），全部依赖 Task 1–3 已落地。
 - **Task 8 最后**（它要改的 19 行分散在各节，必须等前面所有线落地）。
+- **Task 9（新增，最后的最后）**：删掉 `cc-board.sh log`，并把 §32 的 H1 oracle 换成冻结夹具。
+  必须等 Task 6 落地（它是最后一个调用方）。见 Task 5 上方的跨线裁定。
 
 **不在范围内**（调研确认）：`cc-merge.sh` 和 `gwt-done` 完全不碰这四个 TSV，只操作 git config；
 `install.sh` 只在拷贝安装时排除这些文件、无迁移逻辑。三者本计划都不动。
