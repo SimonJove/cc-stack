@@ -305,17 +305,22 @@ cc-hooks.sh worktree            PostToolUse(Bash) hook: dispatch only when inten
   ▼
 cc-dispatch.sh surface  ◀────── single source of truth ──────  cc-dispatch.sh wt-claude (gwt-claude: builds worktree then exec-delegates)
   │  ① ping/new-surface short retry (rides out cmux hiccups)  ② copy .env  ③ pre-trust (cc-trust.sh)
-  │  ④ open tab  ⑤ probe shell-ready  ⑥ start ccteam --session-id <minted-uuid> --permission-mode auto (or CC_WT_PERMISSION_MODE) via temp file + send prompt
-  │  ⑦ screen-scrape trust fallback  ⑧ register (cc-board.sh log, incl. the launch-args record)   failure → cc-failures.log + cmux notify
+  │  ④ open tab → register immediately (cc-state task-add; the board shows the tab from the moment it exists)
+  │  ⑤ probe shell-ready  ⑥ start ccteam --session-id <minted-uuid> --permission-mode auto (or CC_WT_PERMISSION_MODE) via temp file + send prompt
+  │  ⑦ screen-scrape trust fallback  ⑧ complete the row (cc-state task-set-launch: caller-ref + launch-args)   failure → cc-failures.log + cmux notify
   ▼
-worktree-tasks.tsv  ──►  cc-board.sh (bash; gwt-status wraps it): joins the sidecar, judges tab liveness
-  │                       via cmux, applies the repo filter, auto-prunes deleted dirs
+worktree-tasks.tsv  ──►  cc-state (python3): the ONLY reader/writer of stack state — newest-per-dir,
+  │                       the repo filter, the dead-dir sweep and the sidecar join, one call each
+  ▼
+cc-board.sh (bash; gwt-status wraps it): renders, and judges tab liveness via cmux — nothing else
   ▼
 gwt-merge (on do-merge success) ──► worktree-tasks-archive.tsv (+merged-at) ──► gwt-log
 
 each sub-task claude's own lifecycle events ──►
 cc-hooks.sh status             UserPromptSubmit / Stop / permission-Notification hooks (registered globally,
-  │                           but only board dirs ever match): dir + state + ts under a mkdir lock
+  │                           but only board dirs ever match). Parses the event, canonicalizes cwd, and
+  │                           hands the write to cc-state — membership, locking and the rewrite are its job.
+  │                           A cheap board-file check runs BEFORE the parse: no board, no python at all.
   ▼
 worktree-status.tsv  ──►  the board's STATUS column: working(23m) / idle(2h) / blocked(5m) / -
 
