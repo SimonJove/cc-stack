@@ -445,6 +445,108 @@ SWA="$( ( cd "$BRD" && zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; gwt-st
 eq "wrapper forwards --all"          "$(echo "$SWA" | grep -c 'wrap other')" "1"
 rm -rf "$BRD" "$OTH" "$NORD"; rm -f "$CC_TASKS_FILE" "$CC_STATUS_FILE" "$CC_ARCHIVE_FILE" "$TF" "$SF" "$AF" "$DF"; cc_sandbox_ledgers
 
+echo ""
+echo "== 34. cc-board renders through cc-state (the render owns no state access) =="
+cn34(){ CDPATH= cd -- "$1" >/dev/null 2>&1 && pwd -P; }
+# fixture repo: two registered worktrees + a foreign dir (another repo's row). The header
+# literal below is MEASURED from the pre-change board's real output (brief §4: column -t's
+# spacing depends on cell widths, so the expected value is transcribed, never composed).
+B34="$(mktemp -d)"; ( cd "$B34"; git init -q; git config user.email t@t; git config user.name t
+  git commit -q --allow-empty -m i; git branch -M main
+  git worktree add -q .claude/worktrees/wA -b feat/34A >/dev/null
+  git worktree add -q .claude/worktrees/wB -b feat/34B >/dev/null )
+B34="$(cn34 "$B34")"; W34A="$B34/.claude/worktrees/wA"; W34B="$B34/.claude/worktrees/wB"
+OTH34="$(cn34 "$(mktemp -d)")"
+git -C "$B34" config branch.feat/34A.ccMergeInto main
+NOW34=$(date +%s); T34=$(mktemp -u); S34=$(mktemp -u); A34=$(mktemp -u)
+mk34(){  # the B row's 7th field is "camp": the PARENT fallback a branch without config takes
+  printf '2026-01-01 00:00:01\tfeat/34A\tsurface:61\t%s\tsurface:1\t34 task A (older)\tmain\n' "$W34A" >  "$T34"
+  printf '2026-01-01 00:00:02\tfeat/34A\tsurface:62\t%s\tsurface:1\t34 task A\tmain\n'     "$W34A" >> "$T34"
+  printf '2026-01-01 00:00:03\tfeat/34B\tsurface:63\t%s\tsurface:1\t34 task B\tcamp\n'     "$W34B" >> "$T34"
+  printf '2026-01-01 00:00:04\tfeat/34X\tsurface:64\t%s\tsurface:1\t34 foreign\tmain\n'    "$OTH34" >> "$T34"
+  printf '%s\tworking\t%s\n' "$W34A" $((NOW34-1230)) >  "$S34"       # 20m — far from a bucket edge
+  printf '%s\tidle\tabc\n'  "$W34B"             >> "$S34"            # malformed ts → idle(?)
+  printf '2026-01-01 00:00:09\tfeat/34AR\tsurface:65\t%s\tsurface:1\t34 archived\tmain\n' "$W34A" >  "$A34"
+  printf '2026-01-01 00:00:10\tfeat/34XR\tsurface:66\t%s\tsurface:1\t34 arch foreign\tmain\n' "$OTH34" >> "$A34"
+}
+# PATH without cmux → deterministic "?" TAB cells and no liveness notes; CC_SEND_FAILLOG silenced.
+# Flags forward one per argument (${2:-} ${3:-}): a quoted "--archive --all" would arrive as ONE
+# argument under zsh's no-split expansion and silently render a different board.
+brd34(){ ( cd "${1:-$B34}" && env PATH=/usr/bin:/bin CC_TASKS_FILE="$T34" CC_STATUS_FILE="$S34" \
+    CC_ARCHIVE_FILE="$A34" CC_SEND_FAILLOG=/dev/null bash "$CC/cc-board.sh" ${2:-} ${3:-} ) 2>/dev/null; }
+row34(){ echo "$1" | awk -v d="$2" '$5==d'; }                       # board row by DIR column
+cell34(){ row34 "$1" "$2" | awk -v c="$3" '{print $c}'; }           # one column of that row
+mk34; BO34="$(brd34 "$B34" --all)"
+# header: the fixed columns' spacing is byte-pinned up to DIR — the DIR column's own padding
+# tracks the widest dir (a mktemp path), so the literal stops at the column name
+eq "34 header contract" "$(printf '%s\n' "$BO34" | head -1 | sed 's/\(DIR\).*/\1/')" \
+  "TAB  BRANCH    PARENT  STATUS        DIR"
+eq "34 status cell shape"        "$(cell34 "$BO34" "$W34A" 4)" "working(20m)"
+eq "34 malformed ts renders ?"   "$(cell34 "$BO34" "$W34B" 4)" "idle(?)"
+eq "34 dash when no status row"  "$(cell34 "$BO34" "$OTH34" 4)" "-"
+eq "34 TAB cell is ? w/o cmux"   "$(cell34 "$BO34" "$W34A" 1)" "?"
+eq "34 newest row per dir wins"  "$(printf '%s\n' "$BO34" | grep -c '34 task A (older)')" "0"
+eq "34 PARENT from git config"   "$(cell34 "$BO34" "$W34A" 3)" "main"
+eq "34 PARENT falls to 7th field" "$(cell34 "$BO34" "$W34B" 3)" "camp"
+eq "34 --all shows foreign"      "$(printf '%s\n' "$BO34" | grep -c '34 foreign')" "1"
+# row order = task-list's newest-first (reversed file order): X, B, A
+eq "34 rows newest-first" "$(printf '%s\n' "$BO34" | sed -n '2p;3p;4p' | \
+  awk -v o="$OTH34" -v b="$W34B" -v a="$W34A" '{ if ($5==o) k=k"X"; else if ($5==b) k=k"B"; else if ($5==a) k=k"A" } END{print k}')" "XBA"
+# the gate round-2 pair: a LEGACY LOGICAL row (recorded as /var/…; mktemp hands back the
+# logical form while the hook's sidecar key is the canonical /private/var form)
+# · STATUS must still join — the join lives in task-list --with-state and keys on the facade's
+#   dir rule (both forms). A caller-side raw-string join shows "-" for exactly these rows.
+# · DIR showing the RECORDED string is an intentional deviation (gate-ruled): the old board
+#   silently re-canonicalized every dir on read — the read-side half of spec §3.5 defect 3 —
+#   hiding how the row was actually logged. Do NOT "fix" this back.
+LG34="$(mktemp -d)"; LGC34="$(cn34 "$LG34")"
+mk34; printf '2026-01-01 00:00:06\tfeat/34L\tsurface:68\t%s\tsurface:1\t34 legacy logical row\tmain\n' "$LG34" >> "$T34"
+printf '%s\tworking\t%s\n' "$LGC34" $((NOW34-1230)) >> "$S34"
+BO34L="$(brd34 "$B34" --all)"
+eq "34 legacy logical row: STATUS still joins" "$(cell34 "$BO34L" "$LG34" 4)" "working(20m)"
+eq "34 legacy logical row: DIR shows the recorded string (intentional)" "$(cell34 "$BO34L" "$LG34" 5)" "$LG34"
+BO34P="$(brd34 "$B34")"
+eq "34 repo filter hides foreign"   "$(printf '%s\n' "$BO34P" | grep -c '34 foreign')" "0"
+eq "34 repo filter keeps own rows"  "$(printf '%s\n' "$BO34P" | grep -c '34 task [AB]')" "2"
+# H2, the known-issue shape: run from a LINKED worktree, the root must still resolve to the MAIN
+# repo root (computed here, handed to the facade as --repo) so same-repo siblings stay visible
+BO34W="$(brd34 "$W34A")"
+eq "34 from a linked worktree: siblings visible" "$(printf '%s\n' "$BO34W" | grep -c '34 task [AB]')" "2"
+eq "34 from a linked worktree: foreign hidden"   "$(printf '%s\n' "$BO34W" | grep -c '34 foreign')" "0"
+# the archive: every row, file order, repo filter on (what gwt-log shows)
+eq "34 archive renders"              "$(brd34 "$B34" --archive | grep -c '34 archived')" "1"
+eq "34 archive repo filter"          "$(brd34 "$B34" --archive | grep -c '34 arch foreign')" "0"
+eq "34 archive --all shows foreign"  "$(brd34 "$B34" --archive --all | grep -c '34 arch foreign')" "1"
+# H1: prune-on-read is still a WRITE (a board read that silently stopped deleting rows would
+# strand dead rows on disk forever) — now one facade call sweeping the tasks+sidecar pair
+mk34
+printf '2026-01-01 00:00:05\tfeat/34G\tsurface:67\t%s\tsurface:1\t34 dead row\tmain\n' "$B34/gone" >> "$T34"
+DDEAD34="$(mktemp -u)"                                    # a dir string that never exists
+printf '%s\tidle\t%s\n' "$DDEAD34" "$NOW34" >> "$S34"
+brd34 "$B34" >/dev/null
+eq "34 render prunes dead task rows via facade"   "$(grep -c '34 dead row' "$T34")" "0"
+eq "34 render prunes dead sidecar rows via facade" "$(grep -cF "$DDEAD34" "$S34")" "0"
+eq "34 render keeps live task rows"                "$(wc -l < "$T34" | tr -d ' ')" "4"
+eq "34 render keeps live sidecar rows"             "$(wc -l < "$S34" | tr -d ' ')" "2"
+mk34
+printf '%s\tidle\t%s\n' "$DDEAD34" "$NOW34" >> "$S34"
+brd34 "$B34" --archive >/dev/null
+eq "34 archive render spares the sidecar" "$(grep -cF "$DDEAD34" "$S34")" "1"
+TONE34=$(mktemp -u)
+printf '2026-01-01 00:00:05\tfeat/34G\tsurface:67\t%s\tsurface:1\t34 dead row\tmain\n' "$(mktemp -u)" > "$TONE34"
+eq "34 all-dead message" "$(CC_TASKS_FILE="$TONE34" CC_STATUS_FILE=/dev/null \
+  bash "$CC/cc-board.sh" 2>/dev/null)" "no registered worktree tasks"
+eq "34 all-dead removes file" "$([ -f "$TONE34" ] && echo yes || echo no)" "no"
+# the structural swap: the board keeps rendering + the git joins; the lock, the line droppers,
+# the read-side canon map and the inline repo filter are gone from the file
+eq "34 no lock/dropper helpers left"   "$(grep -c 'ccb_lock\|ccb_dead_lines\|ccb_drop_lines' "$CC/cc-board.sh")" "0"
+eq "34 no read-side canon map left"    "$(grep -c 'CCB_CMAP' "$CC/cc-board.sh")" "0"
+eq "34 sidecar join is the facade's"   "$(grep -c 'dump status' "$CC/cc-board.sh")" "0"
+eq "34 board prunes through the facade" "$(grep -c '"$STATE" task-prune' "$CC/cc-board.sh")" "1"
+eq "34 board lists rows through the facade" \
+  "$([ "$(grep -c '"$STATE" task-list' "$CC/cc-board.sh")" -ge 1 ] && echo yes || echo no)" "yes"
+rm -rf "$B34" "$OTH34" "$LG34"; rm -f "$T34" "$S34" "$A34" "$TONE34"; cc_sandbox_ledgers
+
 echo "== 20. TSV empty-field integrity + worktree lifecycle guards =="
 # F1 (P0, 2026-08-16 audit): TAB is IFS *whitespace*, so `while IFS=$'\t' read -r a b c …`
 # collapses RUNS of it — one empty field shifts every later field left. A rewriter that then
