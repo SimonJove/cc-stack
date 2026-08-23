@@ -165,6 +165,99 @@ eq "old 7-field row kept"     "$(awk -F'\t' -v d="$CRT2" '$4==d{print NF}' "$CC_
 eq "old row still renders"    "$(CC_TASKS_FILE="$CC_TASKS_FILE" CC_STATUS_FILE=/dev/null bash "$CC/cc-board.sh" --all 2>/dev/null | grep -c 'old row task')" "1"
 rm -rf "$RT" "$RT2"; rm -f "$CC_TASKS_FILE"; cc_sandbox_ledgers   # back to the sandbox, NOT the live default
 
+echo ""
+echo "== 33. cc-hooks.sh status via cc-state =="
+# The status hook now delegates every state write to the facade (plan Task 4): parse the event,
+# classify it, canonicalize the cwd, ONE cc-state call. This section pins the hook's hard rules —
+# zero output, always exit 0, never ready — on the facade path, plus the two questions the brief
+# left to verification:
+#   H1 (canonicalization timing): the hook KEEPS its cd+pwd -P. Not for matching — cc-state's
+#     dir rule takes the raw string OR the canonical form, so a legacy LOGICAL-path row (/var
+#     vs /private/var, spec §3.5 defect 3) joins either way — but as the enterability gate:
+#     cd must succeed, while cc-state's best-effort realpath never fails, so a vanished cwd
+#     must be stopped HERE or it writes a sidecar row the board can never join.
+#   H2 (no python3): two spawns this round (parse + cc-state), deliberately unmerged (that is
+#     C-phase work); with no python3 on PATH the hook must still exit 0, silent, writing nothing.
+#   F8 (no-board fast path): the [ -f "$tasks" ] gate STAYS in front of everything — it is
+#     payload-independent, fires on the hottest path in the stack, and saves both python
+#     startups on no-board machines (the common case). Round-2 gate restored it after a
+#     10.5× slowdown (4.3→45.1 ms/event); the zero-start contract is pinned below.
+S33=$(mktemp -d)
+s33cn(){ CDPATH= cd -- "$1" >/dev/null 2>&1 && pwd -P; }
+B33="$(s33cn "$(mktemp -d)")"    # registered board dir — physical form, like a production row
+U33="$(s33cn "$(mktemp -d)")"    # a dir with no board row
+V33="$(mktemp -d)"               # mktemp hands back the LOGICAL $TMPDIR form (/var/...)
+P33="$(s33cn "$V33")"            # ...its physical twin (/private/var/...)
+export CC_TASKS_FILE="$S33/tasks.tsv" CC_STATUS_FILE="$S33/status.tsv"
+printf '2026-01-01 00:00:00\tfeat/33\tsurface:33\t%s\tsurface:1\ttask 33\n' "$B33" > "$CC_TASKS_FILE"
+printf '2026-01-01 00:00:00\tfeat/33L\tsurface:34\t%s\tsurface:1\tlegacy logical row\n' "$V33" >> "$CC_TASKS_FILE"
+s33pay(){ python3 -c 'import json,sys; print(json.dumps({"hook_event_name":sys.argv[1],"cwd":sys.argv[2],"message":sys.argv[3]}))' "$1" "$2" "$3"; }
+s33run(){ printf '%s' "$(s33pay "$1" "$2" "${3:-}")" | bash "$CC/cc-hooks.sh" status 2>&1; }
+# contract 1 + the write itself: silent, exit 0, and the state lands through the facade
+o33="$(s33run UserPromptSubmit "$B33")"; rc33=$?
+eq "33 hook writes nothing to stdout/stderr" "$o33" ""
+eq "33 hook always exits 0" "$rc33" "0"
+eq "33 working written through the facade" "$(cut -f2 "$CC_STATUS_FILE")" "working"
+# H2: a PATH without python3 (cat still on it — the payload must arrive) degrades to a silent
+# no-op: exit 0, not a byte out, not one new sidecar row
+NP33="$S33/nopy"; mkdir "$NP33"
+# env re-execs bash THROUGH the restricted PATH, so the interpreter itself must be on it
+ln -s /bin/bash "$NP33/bash"; ln -s /bin/cat "$NP33/cat"; ln -s /usr/bin/dirname "$NP33/dirname"
+n33=$(wc -l < "$CC_STATUS_FILE" | tr -d ' ')
+o33np="$(printf '%s' "$(s33pay UserPromptSubmit "$B33" '')" | env PATH="$NP33" bash "$CC/cc-hooks.sh" status 2>&1)"; rc33np=$?
+eq "33 no python3 degrades to exit 0" "$rc33np" "0"
+eq "33 no python3 writes nothing" "$o33np" ""
+# (red-proof note: no realistic mutation reaches this row assertion — both write legs need
+# python3, so a no-python hook cannot write; it is indirectly covered by the R2 sibling
+# "unregistered dir writes no row" and stays as a contract guard for any future python-free
+# write leg)
+eq "33 no python3 adds no sidecar row" "$(wc -l < "$CC_STATUS_FILE" | tr -d ' ')" "$n33"
+# F8 fast path, pinned by ASSERTION this time (round-2 gate): with NO board file the hook must
+# not start python3 even once — the prefilter predates the facade, is payload-independent,
+# sits on the hottest path in the stack, and task-set-state would be a silent no-op anyway,
+# so the gate only buys back cost: both python startups (4.3ms vs 45.1ms/event measured when
+# the gate was deleted). Count spawns with the §27 trick: a PATH-fronted python3 shim that
+# logs each start, then execs the real interpreter.
+S33F8=$(mktemp -d); S33RP="$(command -v python3)"
+cat > "$S33F8/python3" <<S33P
+#!/usr/bin/env bash
+echo x >> "\${CC_PY_LOG:-/dev/null}"
+exec "$S33RP" "\$@"
+S33P
+chmod +x "$S33F8/python3"
+: > "$S33F8/pylog"
+printf '%s' "$(s33pay UserPromptSubmit "$B33" '')" \
+  | env PATH="$S33F8:$PATH" CC_PY_LOG="$S33F8/pylog" CC_TASKS_FILE="$S33F8/absent.tsv" \
+    bash "$CC/cc-hooks.sh" status >/dev/null 2>&1
+eq "33 no board: zero python3 starts (F8)" "$(wc -l < "$S33F8/pylog" | tr -d ' ')" "0"
+# membership: an unregistered dir is a silent no-op (now the facade's rule, not the hook's awk)
+o33u="$(s33run UserPromptSubmit "$U33")"; rc33u=$?
+eq "33 unregistered dir is silent" "$o33u" ""
+eq "33 unregistered dir exits 0" "$rc33u" "0"
+eq "33 unregistered dir writes no row" "$(grep -cF "$U33" "$CC_STATUS_FILE")" "0"
+# H1: the legacy LOGICAL row gains a state — the old exact-match awk never joined it (defect 3)
+# — and the sidecar row is keyed PHYSICAL, the form the board render joins on
+eq "33 H1 fixture is a logical/physical pair" "$([ "$V33" != "$P33" ] && echo yes || echo no)" "yes"
+o33l="$(s33run UserPromptSubmit "$V33")"
+eq "33 logical-cwd event is silent" "$o33l" ""
+eq "33 legacy logical row gains state (H1/defect 3)" "$(awk -F'\t' -v d="$P33" '$1==d{print $2}' "$CC_STATUS_FILE")" "working"
+# contract 3: after every event this hook fires, the sidecar holds no ready (the facade refuses
+# the value outright — §32 pins that refusal; this pins the disk after the hook ran)
+eq "33 sidecar never holds ready" "$(grep -c ready "$CC_STATUS_FILE")" "0"
+# structure: the lock loop and the read-modify-write are gone from the hook; exactly one
+# facade call remains; and the no-board fast path is PRESENT (round-2 gate — the membership
+# awk it used to feed is gone, the [ -f ] gate itself stays)
+eq "33 hook has no mkdir lock left"          "$(grep -c 'mkdir "\$lock"' "$CC/cc-hooks.sh")" "0"
+eq "33 hook has no tmp+mv rewrite left"      "$(grep -c 'mv "\$tmp"' "$CC/cc-hooks.sh")" "0"
+eq "33 the no-board fast path is present"    "$(grep -cF 'tasks="${CC_TASKS_FILE:-' "$CC/cc-hooks.sh")" "1"
+eq "33 hook delegates via one facade call"   "$(grep -c 'cc-state" task-set-state' "$CC/cc-hooks.sh")" "1"
+# the worktree branch's python heredoc must have survived untouched: still the file's ONLY
+# heredoc, still apostrophe-free inside (bash 3.2 mis-parses one in a heredoc nested in $( ))
+eq "33 the PY heredoc is still the only one" "$(grep -c "<<'PY'" "$CC/cc-hooks.sh")" "1"
+S33H="$(awk "/<<'PY'/{f=1;next} /^PY\$/{f=0} f" "$CC/cc-hooks.sh" | grep -c "'")"
+eq "33 no apostrophe inside the heredoc body" "$S33H" "0"
+rm -rf "$S33" "$S33F8" "$V33" "$B33" "$U33"; cc_sandbox_ledgers   # back to the sandbox before §2b re-exports
+
 echo "== 2b. cc-hooks.sh status: agent-state sidecar =="
 # Board rows must hold pwd -P-canonical dirs — exactly what cc-board.sh log writes in production
 # (mktemp hands back /var/... which pwd -P resolves to /private/var/... on macOS).
@@ -769,19 +862,22 @@ eq "F8 cwd + git add -A: no python"    "$(h28 "$(pay "$R28/.claude/worktrees/x" 
 eq "F8 real add still parses"          "$(h28 "$(pay "$R28" "${P28}git worktree add wtF8 -b feat/F8 camp")" worktree)" "2"
 # the -C form carries the same literal, so the tightened prefilter must not drop it
 eq "F8 -C form add still parses"       "$(h28 "$(pay "$R28" "${P28}git -C $R28 worktree add wtF8 -b feat/F8 camp")" worktree)" "2"
-# status: registered on every prompt of every session — with no board file there is nothing to
-# write, so python must never start (the old order parsed the payload first)
+# status: the board-file prefilter STAYS (round-2 gate): payload-independent, hottest path in
+# the stack — with no board file task-set-state would be a silent no-op anyway, so the gate
+# buys back both python3 startups (measured 4.3ms vs 45.1ms/event when it was deleted).
+# No board → 0 python starts. With a board the event costs TWO python3 startups — parse +
+# facade, deliberately unmerged this round (the merge into one spawn is C-phase work)
 RR28="$(CDPATH= cd -- "$R28" && pwd -P)"   # the hook canonicalizes cwd before matching the board
 # NOTE: the payload is built in a variable FIRST — an inline JSON literal inside the nested
 # quotes of $(h28 "…" status) gets brace-expanded apart on bash 3.2, and $2 stops being "status"
 S28J="{\"hook_event_name\":\"UserPromptSubmit\",\"cwd\":\"$RR28\",\"message\":\"\"}"
 S28F=$(mktemp -u); S28=$(mktemp -u)
-eq "F8 status w/o board: no python"    "$(h28 "$S28J" status)" "0"
+eq "F8 status w/o board: no python"   "$(h28 "$S28J" status)" "0"
 printf '2026-01-01 00:00:00\tfeat/C\tsurface:1\t%s\tsurface:9\tt\tmain\n' "$RR28" > "$S28F"
 : > "$CNT28"; printf '%s' "$S28J" \
   | env HOME="$F8H" PATH="$F8B:$PATH" CC_PY_LOG="$CNT28" CC_TASKS_FILE="$S28F" CC_STATUS_FILE="$S28" \
     bash "$CC/cc-hooks.sh" status >/dev/null 2>&1
-eq "F8 status with board: one python"  "$(wc -l < "$CNT28" | tr -d ' ')" "1"
+eq "F8 status with board: parse+facade"  "$(wc -l < "$CNT28" | tr -d ' ')" "2"
 eq "F8 status sidecar still written"   "$(awk -F'\t' -v d="$RR28" '$1==d{print $2}' "$S28")" "working"
 rm -rf "$F8H" "$F8B"; rm -f "$S28" "$S28F" "$CNT28"
 
