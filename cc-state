@@ -12,8 +12,8 @@ Verb contract (spec §4): each subcommand answers ONE caller question; output is
 with no header, stdout only; errors go to stderr. rc: 0 = success (including the
 deliberate silent no-ops that mirror today's callers), 1 = a query that found
 nothing (task-get / tab-owner / tab-resolve / task-opened-recently / exists), 2 =
-usage error. Safe to call from sh: nothing reads stdin, no output on failure paths
-that today are silent.
+usage error. Safe to call from sh: no verb reads stdin unless explicitly pointed at
+it (`load <store> -`), no output on failure paths that today are silent.
 
 Stores and their overrides (same env names the sandbox uses):
   tasks   CC_TASKS_FILE    worktree-tasks.tsv           time\\tbranch\\tsurface\\tdir\\tcaller\\ttask\\tparent\\tlargs
@@ -862,6 +862,61 @@ def cmd_dump(args):
         return 1
     return 0
 
+def cmd_load(args):
+    """`dump`'s inverse: REPLACE a store's rows with the raw lines of <file> ('-' =
+    stdin). rc 0 = written, 1 = the source could not be read (or the write failed),
+    2 = usage.
+
+    Why this exists. Until the stores were files, "fix one corrupted row" was
+    `$EDITOR worktree-tasks.tsv` — the move this project actually made all through
+    audit-0821. `dump` alone gives that back only as far as READING; the pair
+    `dump > f && $EDITOR f && load f` gives back the whole move. The same property
+    is what the suite needs from a fixture: 7-field legacy rows, an empty middle
+    field, a lone non-UTF-8 byte are expressible as BYTES and in no other way, so
+    the fixtures that used to `printf` straight at the file come through here.
+
+    It deliberately bypasses every verb's semantics — no canonicalization, no
+    sanitization, no membership rule, no dedup — and replaces the whole store
+    rather than merging into it. That is a footgun, and it is exactly the footgun a
+    text editor pointed at the TSV always was, so it gets documentation (--help,
+    README) rather than a gate.
+
+    One normalization, the same one the row reader already applies: the source is
+    split on \\n and a missing final newline is supplied on write, so a hand-edited
+    file whose last line lacks one still round-trips as that many rows. Bytes are
+    read RAW and decoded with surrogateescape — a store holding a non-UTF-8 byte
+    must survive dump → load → dump unchanged, and a locale-dependent decode (the
+    text-mode default under LC_ALL=C) would corrupt it."""
+    if len(args) != 2 or args[0] not in PATHS:
+        return _usage("load tasks|status|archive|tabs <file>   "
+                      "(- = stdin; REPLACES the whole store)")
+    store, src = args
+    try:
+        if src == "-":
+            raw = sys.stdin.buffer.read()
+        else:
+            with open(src, "rb") as f:
+                raw = f.read()
+    except OSError as e:
+        print("cc-state: load %s: %s" % (store, e), file=sys.stderr)
+        return 1
+    lines = raw.decode("utf-8", "surrogateescape").split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    # lock + _write_unlocked rather than write_lines(): this verb's whole job IS the
+    # write, so it has to be able to say the write did not happen, and write_lines
+    # drops that answer (its every other caller is a shell original that ended in
+    # `|| true`). Deliberately NOT "improved" by giving write_lines a return value —
+    # the five storage functions stay byte-frozen for this task, and the engine swap
+    # folds this call back into the layer alongside task-archive's identical bypass.
+    with lock(PATHS[store]()):
+        ok = _write_unlocked(PATHS[store](), lines)
+    if not ok:
+        print("cc-state: load %s: write failed, store left as it was" % store,
+              file=sys.stderr)
+        return 1
+    return 0
+
 def cmd_exists(args):
     """rc 0 = this store holds at least one row, rc 1 = it does not. Zero output on
     both — the callers are `||` guards in shell, and a guard that prints is a guard
@@ -881,7 +936,7 @@ def cmd_exists(args):
     return 0 if read_lines(args[0]) else 1
 
 VERBS = {
-    "dump": cmd_dump, "exists": cmd_exists,
+    "dump": cmd_dump, "load": cmd_load, "exists": cmd_exists,
     "task-add": cmd_task_add, "task-set-launch": cmd_task_set_launch,
     "task-get": cmd_task_get, "task-list": cmd_task_list,
     "task-set-state": cmd_task_set_state, "task-clear-state": cmd_task_clear_state,
@@ -897,6 +952,9 @@ def main(argv):
     if not argv or argv[0] in ("-h", "--help"):
         print("usage: cc-state <verb> ... — the single reader/writer of cc-stack state")
         print("verbs: " + " ".join(sorted(VERBS)))
+        print("note: `load <store> <file|->` REPLACES that whole store, bypassing "
+              "every verb's semantics — it is the write half of the hand-edit path "
+              "in README's troubleshooting section.")
         return 2
     v = argv[0]
     if v not in VERBS:
