@@ -4,6 +4,12 @@ worktree-tasks-archive.tsv
 opened-tabs.tsv
 cc-failures.log
 launch
+# the state library (C 期起是四个 TSV 的后端) + WAL 边车 + 迁移时改名保留的旧台账。
+# install.sh 的拷贝排除清单里列的是同一组名字，两处必须一起改。
+cc-state.db
+cc-state.db-wal
+cc-state.db-shm
+*.migrated.*
 # python bytecode (cc-state is the repo's first python executable; importing it
 # for a test writes a __pycache__/ into whatever checkout it is imported from)
 __pycache__/
