@@ -182,6 +182,42 @@ merged_into TEXT       -- 落地时真正合进了哪里
    `test.sh` §36「a hand-truncated store reads as empty」同时断言消息**和**文件被保留，
    把这条偏离钉在明处而不是抹掉。
 
+10. **`dump` 的最后一行会被补上换行符**（C 期第二轮 `feat/c2-engine`，2026-08-23）。
+    换引擎前 `cmd_dump` 是**原始字节透传**（`open(p,"rb")`，注释写着 "Never reconstruct from
+    parsed fields"），所以一个末尾没有换行符的手工编辑行会**原样**打回去。库里没有文件可透传，
+    `dump` 只能从列重建，重建总是以 `\n` 收尾——于是「末尾无换行符」这个字节事实在**迁移那一刻**
+    被规范化掉，之后再也复现不出来。
+    **这条偏离的作用面比看上去小**：`read_lines` 一直把「最后一行没有换行符」当成一行
+    （不是当成半行丢掉），所以**行数、字段数、字段内容全都不变**，变的只有文件末尾那一个字节。
+    产生这种行的只有人手工编辑或 `cc-state load`；栈自己写出来的行永远带换行符。
+    `test.sh` §32「a newline-less final row is still a row」+「the rebuild supplies the newline」
+    和 §39「the newline-less legacy row gained a newline」把两半都钉住：**行还在**，
+    **换行符被补上**——断言的是它发生，不是容忍它发生。
+
+11. **迁移只导入与库同目录的 legacy TSV**（同上，事故后加的规则）。
+    四个 `CC_*_FILE` 与 `CC_STATE_DB` 是**互相独立**的 override，所以「只设库、不设四个路径」
+    的调用方会让迁移去读 `~/.config/cc-stack/` 里的**真台账**，把它们导进一个用完就扔的库、
+    并且**改名搬走**。这不是假想：本轮开发中一条只设了 `CC_STATE_DB` 的临时命令，
+    真的把活的 `opened-tabs.tsv` 与 `worktree-tasks-archive.tsv` 搬走了（已还原）。
+    危险之处在于**装机目录跑的还是换引擎前的 `cc-state`**，它改名之后会看到「四个台账都不存在」，
+    板直接空掉。
+    规则因此定成：**legacy 文件必须与库在同一个目录**才算这个 store set 的一员。
+    这在生产里零成本（四个 TSV 和库本来就并排住在 `~/.config/cc-stack/`），
+    但把这个洞在所有其它环境里堵死。`test.sh` §39「a library does not import a store from
+    another directory」钉住它，并配一条反面断言证明同目录的**确实**会导入。
+
+    **残余口子与它的处置**（gate 提出）：`README` 把 `CC_TASKS_FILE` 写成**面向用户的**旋钮
+    （另外三个明确标着 "override for tests"），所以「用户合法地把任务表挪走」是支持的动作——
+    而同目录规则会让那份台账**永远不被导入**，板静默变空。
+    处置是**说出来**，不是把规则改软：`_orphan_legacy()` 在每次打开时检查「**被显式挪走**、
+    存在、但不在库目录里」的 store，往 **stderr** 打一行点名文件与修法
+    （`cc-state load <store> <path>`），不影响 rc；hook 路径本来就 `>/dev/null 2>&1`，
+    天然静默（§39 用断言钉住，不靠这个巧合）。
+    **两处非直觉**：(a) 检查必须放在「库已存在」的路径上——写进迁移分支的话，
+    对受影响的机器**一次都不会触发**（库当场就从旁边那几个 store 建好了，之后再也不看 legacy 路径）；
+    (b) 只报**被显式覆盖**的 store，仍在默认位置的不算「被挪走」，否则每个只设了库路径的
+    调用方都会收到关于默认路径的噪音。
+
 另外两条**边界**，写进约束而不是改掉：
 
 - **`branch.<b>.ccDone` 是全栈唯一没有副本的关键事实**（四个 TSV 都不存 ready）。这是 `cc-hooks.sh:311`

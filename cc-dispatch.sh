@@ -364,7 +364,6 @@ _ccsend_calibrate() {  # $1 = ref, $2 = dir — self-calibration (hardening laye
 # map and its completeness) and the orchestration that decides on top of both. Writes: tab-add;
 # reads: tab-list / tab-resolve / tab-owner; the prune: tab-prune (it takes the RAW live map and
 # recognizes the !partial sentinel itself, so the invariant below travels with the evidence).
-_cctabs_file(){ printf '%s' "${CC_TABS_FILE:-$HOME/.config/cc-stack/opened-tabs.tsv}"; }
 _cctabs_uc(){ printf '%s' "${1:-}" | tr 'abcdefghijklmnopqrstuvwxyz' 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'; }
 # ── workspace scope (2026-08-16) ────────────────────────────────────────────────────────────
 # `cmux list-pane-surfaces` lists ONE workspace — the caller's ($CMUX_WORKSPACE_ID) — and the CLI
@@ -1342,9 +1341,11 @@ tabs_all=""
 if [ "${1:-}" = "--all" ]; then tabs_all=1; shift; fi
 [ $# -eq 0 ] || { echo "usage: cc-dispatch.sh tabs [--all]" >&2; exit 2; }
 
-tabs_f="$(_cctabs_file)"     # printed in the header below, on purpose — the human troubleshoots
-                             # this ledger by hand. The only remaining store PATH in this file.
-echo "── opened tabs ($tabs_f) ──"
+# The header names where to look, on purpose — the human troubleshoots this ledger by hand.
+# That used to be a file path; the ledger is a table in the state library now, so "where to
+# look" is a COMMAND. Keeping the old path here would not be conservative, it would be a lie
+# printed on every run: the file it named no longer holds anything.
+echo "── opened tabs (cc-state dump tabs) ──"
 # "no ledger at all" is a different sentence from "a ledger, but no row of yours", and it is the
 # one that must be said BEFORE the cmux warnings and the column header — a reader who has never
 # opened a tab should not be told their workspace enumeration was incomplete. So this stays a

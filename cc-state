@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """cc-stack · cc-state — the single reader/writer of the stack's state stores.
 
-Phase A (docs/state-model.md §7): the backend is still today's four TSV files, byte
-for byte. What changes is that there is now ONE implementation of the locking and of
-every field access, instead of nine mkdir-lock copies and 46 awk parse points spread
-over cc-hooks.sh / cc-board.sh / cc-dispatch.sh / worktree.zsh. Producers switch to
-this facade in later tasks; until then the old writers interoperate — same lock file
-path (<file>.lock, atomic mkdir; macOS has no flock), same append discipline.
+Phase C (docs/state-model.md §7): the backend is ONE sqlite library in WAL mode. The
+four TSVs are imported on first open and renamed aside, never deleted. What the facade
+already gave — one implementation of every field access, in place of 46 awk parse
+points spread over cc-hooks.sh / cc-board.sh / cc-dispatch.sh / worktree.zsh — the
+engine adds to: the nine mkdir-lock copies are gone entirely (WAL gives multi-reader /
+single-writer for free) and every write is a transaction instead of a write-tmp-then-
+rename, so the half-applied archive move cannot happen at all.
 
 Verb contract (spec §4): each subcommand answers ONE caller question; output is TSV
 with no header, stdout only; errors go to stderr. rc: 0 = success (including the
@@ -55,10 +56,9 @@ Intentional deviations from today's byte stream, both gate-ruled (spec §3.5 #7/
     "HEAD", which today's `$(… || echo '?')` captures as a two-line "HEAD\\n?"
     branch field, corrupting the row; _git_branch returns a clean '?'.
 """
-import contextlib
-import errno
 import hashlib
 import os
+import sqlite3
 import subprocess
 import sys
 import time
@@ -87,141 +87,376 @@ PATHS = {
     "tabs":    lambda: _p("CC_TABS_FILE",    "opened-tabs.tsv"),
 }
 
-def _stale_seconds():
-    # CC_STATE_LOCK_STALE, seconds before a lock dir is considered abandoned.
-    # Unparseable values fall back to the default rather than crashing every verb.
-    try:
-        return float(os.environ.get("CC_STATE_LOCK_STALE") or 60)
-    except ValueError:
-        return 60.0
+# Which override names a store's legacy path — needed to tell "the user MOVED this one"
+# apart from "this one is still where it has always been" (see _orphan_legacy).
+ENVS = {"tasks": "CC_TASKS_FILE", "status": "CC_STATUS_FILE",
+        "archive": "CC_ARCHIVE_FILE", "tabs": "CC_TABS_FILE"}
 
-# ── the one lock ────────────────────────────────────────────────────────────────
-# Atomic mkdir lock, same <file>.lock path today's shell writers already use, so
-# old-code writers and this facade serialize against each other during the
-# transition. Two deliberate properties, both lifted from today's callers:
-#   · a writer never blocks forever: it waits up to 3s — the same 60×0.05s ceiling
-#     every shell lock loop has — and then proceeds UNLOCKED, exactly what
-#     cc-board.sh log (retired, Task 9) / cc-hooks.sh status / _cctabs_log did when
-#     the loop ran out;
-#   · a lock dir older than CC_STATE_LOCK_STALE (default 60s) is reclaimed — the
-#     holder died (today a stale lock dir taxes every later writer the full 3s
-#     wait, forever). No legitimate holder keeps the lock for 60s; the longest
-#     critical section in the stack is a few-file awk rewrite.
-# Readers take NO lock at all, like today's readers: a reading loop that held the
-# lock would make every concurrent writer burn its 3s deadline and then write
-# unlocked, and a reader that reclaimed could drop a slow-but-live holder's lock
-# and admit two writers into the critical section (round-2 gate B12).
-@contextlib.contextmanager
-def lock(path):
-    d, held = path + ".lock", False
-    deadline = time.time() + 3.0
-    while True:
-        try:
-            os.mkdir(d)
-            held = True
-            break
-        except OSError as e:
-            if e.errno != errno.EEXIST:
-                break                      # unusable path: proceed unlocked (today: same)
-            reclaimed = False
-            try:
-                if time.time() - os.stat(d).st_mtime > _stale_seconds():
-                    os.rmdir(d)            # reclaim: the holder died
-                    reclaimed = True
-            except OSError:
-                pass                        # raced or junk-carrying lock dir — not fatal
-            if reclaimed:
-                continue                    # retry mkdir immediately (may lose the race: fine)
-            if time.time() > deadline:
-                break                       # give up waiting, write anyway (today's behaviour)
-            time.sleep(0.05)
-    try:
-        yield held
-    finally:
-        if held:
-            try:
-                os.rmdir(d)
-            except OSError:
-                pass
-
-# ── raw line IO (the discipline: whole lines, lossless reassembly) ─────────────
-# newline="" disables universal-newline translation (a stray \r\n row must not be
-# silently rewritten to \n); surrogateescape makes non-UTF-8 bytes round-trip the
-# way awk passes them through instead of crashing the verb.
 def _open_rd(p):
+    """A caller-supplied file, NOT a store: tab-prune takes the raw cmux live map as an
+    argument and has to read it the same lossless way the stores used to be read."""
     return open(p, encoding="utf-8", errors="surrogateescape", newline="")
 
-def read_lines(store):
-    """Raw lines without the trailing newline. Missing/unreadable file → [] (today:
-    awk on a missing file prints nothing). A final line WITHOUT its newline is
-    still a line — dropping it would make a rewrite eat the row."""
-    try:
-        with _open_rd(PATHS[store]()) as f:
-            lines = f.read().split("\n")
-    except OSError:
-        return []
-    if lines and lines[-1] == "":
-        lines.pop()
-    return lines
+# ── the library ─────────────────────────────────────────────────────────────────
+# One sqlite file in WAL mode replaces the four TSVs and, with them, the mkdir lock:
+# WAL gives multi-reader/single-writer for free, and a write is a transaction instead
+# of a write-tmp-then-rename. CC_STATE_DB is its own override and is NOT derived from
+# one of the four legacy paths — deriving it would put the library wherever whichever
+# variable happened to be set (spec 8 invariant 9). The legacy vars stay meaningful:
+# they are where the MIGRATION looks for data to import.
+#
+# python 3.9 is the floor (the hook resolves to /usr/bin/python3 = 3.9.6 under a
+# stripped PATH), so: no connect(autocommit=) — isolation_level=None plus an explicit
+# BEGIN IMMEDIATE — no match statement, no runtime-evaluated X | Y annotation.
+def _db_path():
+    return os.environ.get("CC_STATE_DB") or os.path.join(
+        os.path.expanduser("~"), ".config", "cc-stack", "cc-state.db")
 
-def _write_unlocked(p, lines):
-    """Returns success. An empty row set removes the file — the behaviour of every
-    one of today's rewriters (`[ -s ] || rm -f`)."""
-    if not lines:
+# store → how many dedicated columns. Sized to today's widest row: a tasks row is 8
+# fields, an archive row is that plus merged-at, the sidecar 3, the tabs ledger 5.
+# Columns are f1..fN, not dir/branch/state: naming them means the verbs stop taking
+# fields by POSITION, and that is the model convergence of phase D — doing it here
+# would put this task's diff on top of that one's and make a regression unattributable.
+COLS = {"tasks": 8, "status": 3, "archive": 9, "tabs": 5}
+
+# Three things the row↔column round trip needs, none of them optional:
+#   · BLOB, not TEXT. read_lines has always used errors="surrogateescape" so a non-UTF-8
+#     byte rides through the way awk passes it; a TEXT column cannot hold the lone
+#     surrogate that produces — sqlite3 raises UnicodeEncodeError on the INSERT. BLOB +
+#     encode/decode("utf-8","surrogateescape") round-trips it losslessly. Measured, not
+#     assumed: the TEXT path fails on the first row that carries one.
+#   · nf. tasks holds 7-field legacy rows next to 8-field live ones (archive 8 and 9).
+#     Rendering from fixed columns would pad a 7-field row to 8 and change dump's bytes,
+#     so the row's ORIGINAL field count is stored and the render truncates to it.
+#   · fx. A row wider than its table's columns can only come from a hand edit or `load`,
+#     but silently dropping its tail would be data loss in the one direction the human
+#     cannot undo — the overflow rides in fx so dump gives back exactly what went in.
+# Row ORDER is the fourth: a TSV is insertion-ordered and sqlite has no implicit order,
+# so every table carries a monotonic seq and every read is ORDER BY seq. task-prune
+# --compact's newest-per-dir depends on it; this is not an optimization.
+def _cols(store):
+    return ", ".join("f%d" % (i + 1) for i in range(COLS[store]))
+
+def _schema(conn):
+    for store in sorted(COLS):
+        conn.execute("CREATE TABLE IF NOT EXISTS %s (seq INTEGER PRIMARY KEY, "
+                     "nf INTEGER NOT NULL, %s, fx BLOB)"
+                     % (store, ", ".join("f%d BLOB" % (i + 1)
+                                         for i in range(COLS[store]))))
+    conn.execute("PRAGMA user_version=1")
+
+def _enc(s):
+    return s.encode("utf-8", "surrogateescape")
+
+def _dec(b):
+    return b.decode("utf-8", "surrogateescape")
+
+def _to_row(line, n):
+    f = line.split("\t")
+    head = [_enc(x) for x in f[:n]]
+    head += [None] * (n - len(head))
+    tail = _enc("\t".join(f[n:])) if len(f) > n else None
+    return [len(f)] + head + [tail]
+
+def _to_line(row, n):
+    nf, vals, fx = row[0], row[1:1 + n], row[1 + n]
+    out = [("" if v is None else _dec(v)) for v in vals[:min(nf, n)]]
+    if fx is not None:
+        out.extend(_dec(fx).split("\t"))
+    return "\t".join(out)
+
+_CONN = None
+_LAST_ERR = None          # why the last _connect gave up; dump is the only loud reader
+
+def _open(p):
+    conn = sqlite3.connect(p, timeout=3.0, isolation_level=None)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=3000")
+    return conn
+
+def _connect(create):
+    """The library, or None when there is none and none is wanted.
+
+    `create` is load-bearing for COST, not for correctness: a read must not bring the
+    file into existence, because cc-hooks.sh's hot path is `[ -f <db> ] || [ -f <tsv> ]`
+    and an empty library created by some passing read would arm it forever — two python
+    startups on every prompt of every session on a machine that has no state at all
+    (0.1: 15 ms each, and the check itself is 0.019 ms). A read still migrates when
+    legacy TSVs are there, because that is where the data IS.
+
+    Every failure path returns None instead of raising: the hook contract is a silent
+    no-op on a missing python3, a corrupt library, a full disk."""
+    global _CONN, _LAST_ERR
+    _LAST_ERR = None
+    if _CONN is not None:
+        return _CONN
+    p = _db_path()
+    # Before any branch: a read that finds neither library nor importable legacy returns
+    # None below, and that early return is exactly the case the orphan warning is FOR.
+    _warn_orphans(p)
+    try:
+        if os.path.exists(p):
+            conn = _open(p)
+            _schema(conn)
+        else:
+            legacy = [s for s in sorted(COLS) if _migratable(p, PATHS[s]())]
+            if not legacy and not create:
+                return None
+            d = os.path.dirname(p)
+            if d and not os.path.isdir(d):
+                os.makedirs(d, exist_ok=True)
+            conn = _open(p)
+            try:
+                _schema(conn)
+                if legacy:
+                    _migrate(conn, legacy)
+            except BaseException:
+                # spec 6: a failed migration creates NO library and renames NOTHING —
+                # the machine keeps running the way it did, and the next invocation
+                # retries. Half a library would be worse than none: the legacy rows
+                # would be both imported and still on disk.
+                try:
+                    conn.close()
+                except sqlite3.Error:
+                    pass
+                for suffix in ("", "-wal", "-shm"):
+                    try:
+                        os.unlink(p + suffix)
+                    except OSError:
+                        pass
+                raise
+        _CONN = conn
+        return conn
+    except (sqlite3.Error, OSError, ValueError) as e:
+        _LAST_ERR = e
+        return None
+
+def _migratable(db, legacy):
+    """Is this legacy TSV part of THIS library's store set?
+
+    Only if it sits in the same directory. The four store paths and the library have
+    independent overrides, so without this rule a caller that points CC_STATE_DB at a
+    scratch library while leaving the CC_*_FILE overrides unset would import — and
+    RENAME AWAY — the real ledgers in ~/.config/cc-stack, into a library it is about to
+    throw away. That is not a hypothetical: it happened once during this task, from a
+    one-off shell command that set CC_STATE_DB and nothing else, and it took the live
+    opened-tabs and archive ledgers with it. Same-directory is also just what the store
+    set IS — the four TSVs and the library have always lived side by side — so the rule
+    costs nothing in production and closes the hole everywhere else."""
+    try:
+        return (os.path.exists(legacy)
+                and os.path.dirname(os.path.abspath(legacy))
+                    == os.path.dirname(os.path.abspath(db)))
+    except OSError:
+        return False
+
+_WARNED = False
+
+def _orphan_legacy(db):
+    """Legacy stores that EXIST but sit outside the library's directory, so _migratable
+    refused them and their rows are invisible.
+
+    Checked on every open, not only while migrating, and that is the whole point: once
+    the library exists _connect never looks at a legacy path again, so a notice wired
+    into the migration path would fire exactly ZERO times on the machine that needs it
+    — the library is created from whatever IS beside it and the orphan is never seen
+    again. Four os.path.exists calls (measured well under 0.1 ms against a 13.7 ms
+    python start) buy the difference between "the board went blank" and a sentence
+    saying which file, and how to put it back.
+    Only stores whose path was EXPLICITLY overridden count. A store still sitting at its
+    default is not one anybody MOVED, and warning about those would fire on every caller
+    that points the library somewhere without touching the four ledger paths — noise, and
+    aimed at the wrong thing. The case this exists for is the documented one: README calls
+    CC_TASKS_FILE a user-facing knob (the other three say "override for tests"), so a user
+    may legitimately move it, and before this that made the board silently empty forever.
+    """
+    out = []
+    for store in sorted(COLS):
         try:
-            os.unlink(p)
+            if not os.environ.get(ENVS[store]):
+                continue
+            p = PATHS[store]()
+            if os.path.exists(p) and not _migratable(db, p):
+                out.append((store, p))
         except OSError:
             pass
-        # an emptied store whose file could not be removed is a FAILED rewrite:
-        # the caller may already have archived these rows (task-archive's shape),
-        # so pretending success would leave the rows in both places, silently
-        return not os.path.exists(p)
-    tmp = "%s.tmp.%d" % (p, os.getpid())
+    return out
+
+def _warn_orphans(db):
+    """stderr only, never the rc. The hook path is silent by construction — cc-hooks.sh
+    calls the facade with >/dev/null 2>&1 — and §39 pins that rather than trusting it.
+    README documents CC_TASKS_FILE as a user-facing knob (the other three say "for
+    tests"), so moving just that one is a supported thing to do, and before this it made
+    the board silently empty forever."""
+    global _WARNED
+    if _WARNED:
+        return
+    _WARNED = True
+    d = os.path.dirname(os.path.abspath(db)) or "."
+    for store, p in _orphan_legacy(db):
+        print("cc-state: %s is not in the state library's directory (%s), so its rows "
+              "were never imported and are invisible. Fix: cc-state load %s %s"
+              % (p, d, store, p), file=sys.stderr)
+
+def _read_legacy(path):
+    """A legacy TSV exactly as read_lines used to read it: no universal-newline
+    translation (a stray \\r\\n row must not be rewritten), surrogateescape for the
+    non-UTF-8 bytes, and a final line WITHOUT its newline is still a line."""
+    with open(path, encoding="utf-8", errors="surrogateescape", newline="") as f:
+        rows = f.read().split("\n")
+    if rows and rows[-1] == "":
+        rows.pop()
+    return rows
+
+def _migrate(conn, legacy):
+    """Import the legacy TSVs and rename them aside, in ONE transaction.
+
+    The rename happens INSIDE the transaction on purpose: if it fails the import rolls
+    back with it, so the rows can never end up both in the library and on disk. Old
+    files are renamed, never deleted (spec 9's risk row: a migration that loses the
+    board is unrecoverable; a renamed file is not).
+
+    Two processes racing is safe because BEGIN IMMEDIATE serializes them AND the file
+    existence is re-checked inside the transaction: the loser finds the winner already
+    renamed the TSVs away and imports nothing, instead of importing them twice."""
+    renamed = []
+    conn.execute("BEGIN IMMEDIATE")
     try:
-        with open(tmp, "w", encoding="utf-8", errors="surrogateescape", newline="") as f:
-            f.write("\n".join(lines) + "\n")
-        os.replace(tmp, p)
-        return True
-    except OSError:
+        ts = str(int(time.time()))
+        for store in legacy:
+            src = PATHS[store]()
+            if not os.path.exists(src):
+                continue                     # the other process won the race
+            rows = _read_legacy(src)
+            _put(conn, store, rows)
+            dst = "%s.migrated.%s" % (src, ts)
+            k = 0
+            while os.path.exists(dst):
+                k += 1
+                dst = "%s.migrated.%s.%d" % (src, ts, k)
+            os.rename(src, dst)
+            renamed.append((src, dst))
+        conn.execute("COMMIT")
+    except BaseException:
         try:
-            os.unlink(tmp)
-        except OSError:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        for src, dst in reversed(renamed):
+            try:
+                os.rename(dst, src)
+            except OSError:
+                pass
+        raise
+
+def _put(conn, store, lines):
+    """Replace a table's rows. seq restarts at 1, so insertion order is file order."""
+    n = COLS[store]
+    conn.execute("DELETE FROM %s" % store)
+    if lines:
+        conn.executemany(
+            "INSERT INTO %s (nf, %s, fx) VALUES (%s)"
+            % (store, _cols(store), ", ".join("?" * (n + 2))),
+            [_to_row(l, n) for l in lines])
+
+def _get(conn, store):
+    n = COLS[store]
+    return [_to_line(r, n) for r in conn.execute(
+        "SELECT nf, %s, fx FROM %s ORDER BY seq" % (_cols(store), store))]
+
+# ── the storage layer (the verbs above it still only ever see whole lines) ──────
+def read_lines(store):
+    """Rows in insertion order. No library and no legacy file → [] (today: awk on a
+    missing file prints nothing). Readers take nothing: WAL readers never block a
+    writer and are never blocked by one, which is what the mkdir lock was imitating."""
+    conn = _connect(False)
+    if conn is None:
+        return []
+    try:
+        return _get(conn, store)
+    except sqlite3.Error as e:
+        globals()["_LAST_ERR"] = e
+        return []
+
+def write_lines(store, lines):
+    """Replace the store in one transaction. Returns success. An empty row set leaves
+    the store with zero rows — the observable end of what used to be `[ -s ] || rm -f`,
+    and the reason `exists` was defined on ROWS in Task 1 (there is no per-store file
+    left to stat). Writing nothing to a store that does not exist yet does NOT create
+    the library: see _connect's note on the hook's hot path."""
+    conn = _connect(bool(lines))
+    if conn is None:
+        return not lines
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        _put(conn, store, lines)
+        conn.execute("COMMIT")
+        return True
+    except sqlite3.Error:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
             pass
         return False
 
-def write_lines(store, lines):
-    with lock(PATHS[store]()):
-        _write_unlocked(PATHS[store](), lines)
-
 def rewrite(store, fn):
-    """Read → transform → write inside ONE lock hold — the shape every shell
-    rewriter already uses (ccb_lock BEFORE ccb_dead_lines; _gwt_tasks_rewrite's
-    comment: "avoid losing a concurrent append during read→mv"). Reading the rows
-    into write_lines' argument instead would re-introduce the race that lost 18 of
-    41 dispatch records under plain campaign concurrency (round-2 gate B1). Skips
-    the write when fn returns the rows unchanged. fn receives a COPY: an in-place
-    fn then shows up as out != rows and the write still fires — without the copy,
-    a mutating fn would return the very object it mutated and the skip check
-    would compare an object against itself (round-3 gate C1)."""
-    p = PATHS[store]()
-    with lock(p):
-        rows = read_lines(store)
+    """Read → transform → write inside ONE transaction. Reading the rows into
+    write_lines' argument instead would re-introduce the race that lost 18 of 41
+    dispatch records under plain campaign concurrency (round-2 gate B1) — the lock
+    is gone, the requirement is not. Skips the write when fn returns the rows
+    unchanged. fn receives a COPY: an in-place fn then shows up as out != rows and the
+    write still fires — without the copy, a mutating fn would return the very object it
+    mutated and the skip check would compare an object against itself (round-3 C1)."""
+    conn = _connect(False)
+    if conn is None:
+        out = fn([])                    # an empty store: only an fn that ADDS rows
+        if not out:                     # is worth creating the library for
+            return True
+        conn = _connect(True)
+        if conn is None:
+            return False
+        return write_lines(store, out)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        rows = _get(conn, store)
         out = fn(list(rows))
         if out != rows:
-            return _write_unlocked(p, out)
+            _put(conn, store, out)
+        conn.execute("COMMIT")
         return True
+    except sqlite3.Error:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        return False
+    except BaseException:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        raise
 
 def append_line(store, line):
-    """Locked append. Failure is silent (rc stays 0): today's appends all end in
-    `>> "$f" 2>/dev/null || true`, and a hook crashing on a full disk would violate
+    """One-row transaction. Failure is silent (rc stays 0): today's appends all ended
+    in `>> "$f" 2>/dev/null || true`, and a hook crashing on a full disk would violate
     its always-exit-0 contract."""
-    with lock(PATHS[store]()):
+    conn = _connect(True)
+    if conn is None:
+        return
+    n = COLS[store]
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("INSERT INTO %s (nf, %s, fx) VALUES (%s)"
+                     % (store, _cols(store), ", ".join("?" * (n + 2))),
+                     _to_row(line, n))
+        conn.execute("COMMIT")
+    except sqlite3.Error:
         try:
-            with open(PATHS[store](), "a", encoding="utf-8",
-                      errors="surrogateescape", newline="") as f:
-                f.write(line + "\n")
-        except OSError:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
             pass
+
 
 def now_stamp():
     return time.strftime("%Y-%m-%d %H:%M:%S")   # `date '+%Y-%m-%d %H:%M:%S'`
@@ -606,10 +841,23 @@ def cmd_task_archive(args):
         return 0
     root_canon = canon(root) if root else None
     ts = str(int(time.time()))
-    tp, ap = PATHS["tasks"](), PATHS["archive"]()
-    with lock(tp), lock(ap):
-        lines = read_lines("tasks")          # inside the lock (B1's rule)
-        kept, moved_rows, moved_dirs = [], [], []
+    conn = _connect(False)
+    ok, moved_dirs = True, []
+    if conn is None:
+        # Two very different Nones. No store at all means there is nothing of this branch to
+        # move — rc 0, today's behaviour. A store that EXISTS but cannot be opened (unwritable
+        # library, corrupt file) is the failure the old unwritable-store-dir path used to
+        # produce, and it has to stay LOUD: swallowing it would report "archived nothing" for
+        # a branch whose rows are still sitting there.
+        if _LAST_ERR is None:
+            return 0
+        ok = False
+    try:
+        if conn is None:
+            raise sqlite3.Error("state library unavailable")
+        conn.execute("BEGIN IMMEDIATE")
+        lines = _get(conn, "tasks")          # inside the transaction (B1's rule)
+        kept, moved_rows = [], []
         for line in lines:
             f = fields(line)
             hit = len(f) >= 2 and f[1] == branch
@@ -621,15 +869,29 @@ def cmd_task_archive(args):
                     moved_dirs.append(f[3])
             else:
                 kept.append(line)
+        # The whole move is ONE transaction, which is what retires spec 3.5 defect 5: the
+        # archive append and the task-list rewrite used to be two separate writes, so a
+        # failure between them left rows in both places and the error message had to admit
+        # it. The message below is kept verbatim anyway — it is user-visible text, its
+        # defensive wording costs nothing, and the C2b report carries the reachability
+        # analysis rather than a silent edit.
+        # ONE exit, one COMMIT: "nothing matched" still has a transaction open and has to
+        # close it, and writing that as a second COMMIT would make "this function opens
+        # exactly one transaction" unassertable — the property §39 pins is structural, so
+        # the structure has to stay legible.
+        if moved_rows:
+            _put(conn, "archive", _get(conn, "archive") + moved_rows)
+            _put(conn, "tasks", kept)
+        conn.execute("COMMIT")
         if not moved_rows:
             return 0
-        try:
-            with open(ap, "a", encoding="utf-8",
-                      errors="surrogateescape", newline="") as f:
-                f.write("".join(r + "\n" for r in moved_rows))
-        except OSError:
-            pass
-        ok = _write_unlocked(tp, kept)
+    except sqlite3.Error:
+        if conn is not None:                  # may never have opened at all
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+        ok = False
     if not ok:
         print("cc-state: archive rewrite failed — task list left untouched "
               "(the archive may have gained rows)", file=sys.stderr)
@@ -843,19 +1105,29 @@ def cmd_dump(args):
     if len(args) != 1 or args[0] not in PATHS:
         print("usage: cc-state dump tasks|status|archive|tabs", file=sys.stderr)
         return 2
-    # raw byte passthrough — byte-identical to `cat`, including a missing trailing
-    # newline. Never reconstruct from parsed fields, and never touch the lock:
-    # today's readers take no lock at all (see the lock block's note). A missing
-    # store is an empty store (silent rc 0, today's behaviour) and a vanished
-    # downstream reader is not an error either — but a genuine read failure is
-    # LOUD, like cat's non-zero exit: swallowing it with a blanket `except
-    # OSError` (BrokenPipeError is an OSError!) would report partial output as
-    # success (round-3 gate C3).
-    p = PATHS[args[0]]()
+    # This used to be a raw byte passthrough of the store FILE, with a comment saying
+    # "never reconstruct from parsed fields". There is no file any more, so dump can
+    # ONLY reconstruct — byte equivalence stops being a passthrough guarantee and
+    # becomes a REBUILD guarantee, paid for by nf (a 7-field legacy row renders as 7
+    # fields) and seq (rows come back in insertion order). §32's frozen oracle is what
+    # keeps that honest: F32OR1/F32OR2 are literals recorded from the writer this
+    # facade replaced, so they compare the rebuild against something independent of it.
+    # ONE deliberate deviation lands here, written up in state-model §3.5: a hand-edited
+    # final line with no trailing newline gets one on the way through.
+    #
+    # An empty store is silent rc 0 (today's behaviour for a missing file) and a
+    # vanished downstream reader is not an error either — but a library that cannot be
+    # opened or read IS loud, like cat's non-zero exit. Swallowing that with a blanket
+    # `except OSError` (BrokenPipeError is an OSError!) would report partial output as
+    # success (round-3 gate C3), so the two are separated by hand.
+    lines = read_lines(args[0])
+    if _LAST_ERR is not None:
+        print("cc-state: dump %s: %s" % (args[0], _LAST_ERR), file=sys.stderr)
+        return 1
     try:
-        with open(p, "rb") as f:
-            sys.stdout.buffer.write(f.read())
-    except (FileNotFoundError, BrokenPipeError):
+        if lines:
+            sys.stdout.buffer.write(_enc("\n".join(lines) + "\n"))
+    except BrokenPipeError:
         pass
     except OSError as e:
         print("cc-state: dump %s: %s" % (args[0], e), file=sys.stderr)
@@ -903,15 +1175,11 @@ def cmd_load(args):
     lines = raw.decode("utf-8", "surrogateescape").split("\n")
     if lines and lines[-1] == "":
         lines.pop()
-    # lock + _write_unlocked rather than write_lines(): this verb's whole job IS the
-    # write, so it has to be able to say the write did not happen, and write_lines
-    # drops that answer (its every other caller is a shell original that ended in
-    # `|| true`). Deliberately NOT "improved" by giving write_lines a return value —
-    # the five storage functions stay byte-frozen for this task, and the engine swap
-    # folds this call back into the layer alongside task-archive's identical bypass.
-    with lock(PATHS[store]()):
-        ok = _write_unlocked(PATHS[store](), lines)
-    if not ok:
+    # C2a had to reach past the storage layer here (lock + _write_unlocked) to keep the
+    # five storage functions byte-frozen for that task's gate. The engine swap folds it
+    # back in, alongside task-archive's identical bypass: write_lines now returns success,
+    # so the one verb whose whole job IS the write can say the write did not happen.
+    if not write_lines(store, lines):
         print("cc-state: load %s: write failed, store left as it was" % store,
               file=sys.stderr)
         return 1
@@ -925,12 +1193,11 @@ def cmd_exists(args):
     The callers this replaces all asked `[ -f <store> ]`, and they asked it for one
     reason: to tell "there is no store" apart from "the store is there and nothing
     in it matched", which are two different sentences to a human. Those two
-    questions are the same question only because _write_unlocked DELETES a store it
-    empties, so a file that exists always has a row in it. Defining the verb on ROWS
-    rather than on the file keeps the sentence the caller prints correct after the
-    four TSVs become one library, where there is no per-store file left to stat.
-    That is the whole point of the verb, and it is why this contract does not move
-    in Task 2 — only its implementation does."""
+    questions were the same question only because the old rewriter DELETED a store it
+    emptied, so a file that existed always had a row in it. Defining the verb on ROWS
+    is what keeps the sentence the caller prints correct now that the four TSVs ARE
+    one library and there is no per-store file left to stat. The contract did not move
+    for the engine swap — only its implementation did, exactly as Task 1 predicted."""
     if len(args) != 1 or args[0] not in PATHS:
         return _usage("exists tasks|status|archive|tabs")
     return 0 if read_lines(args[0]) else 1
