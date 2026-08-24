@@ -321,8 +321,11 @@ test.sh  _cc_live_files          同上；存在性是断言，sha/mtime 只是�
 > 「raw file IS the object under test」的豁免注释出现**三次**（§32、§20、§36），不止 §32。
 > `docs/state-model.md` §7 那句「C 期测试不动」同样是错的，已一并更正。
 >
-> 因此 C 期必须交付一个**夹具机制**：`cc-state load <store> <file>`（`dump` 的逆运算，
-> 整表替换，`-` 读 stdin）。裁定与契约见 `docs/plans/briefs/c2-load-ruling.md`：
+> 因此 C 期必须交付一个**夹具机制**：`cc-state load <store> <file|->`（`dump` 的逆运算，
+> 整表替换，`-` 读 stdin）。**rc 契约（2026-08-23 更正）**：0 = 写成了；
+> **1 = 没写成——源读不到 *或* 写失败**；2 = 用法错。我最初只写了「1 = 读不到源」，
+> 那是漏的：一个职责就是写的动词必须能说出没写成，返 0 是撒谎，
+> 加 rc 3 会破坏全项目 0/1/2 的约定。裁定与契约见 `docs/plans/briefs/c2-load-ruling.md`：
 > `dump | load` 逐字节往返要有断言 + 变异；整表替换语义写进 `--help` 与 README；
 > 专门测字节级文件怪癖（如末尾无换行符）的那几个夹具**继续写 legacy TSV 走迁移**，
 > 因为 `load` 表达不了它们；**迁移必须有自己的专门测试**，不靠夹具顺带覆盖。
