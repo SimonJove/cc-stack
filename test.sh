@@ -2564,10 +2564,24 @@ eq "32 7-field row still renders" "$(CC_STATUS_FILE=/dev/null bash "$CC/cc-board
 moved="$("$CC/cc-state" task-archive feat/new trunk)"
 eq "32 archive returns moved dirs" "$moved" "$D32A"
 eq "32 archive row keeps fields verbatim" "$("$CC/cc-state" dump archive | grep 'feat/new' | tail -1 | cut -f6)" "second gen"
-eq "32 archive appends merged-at (9 fields)" "$("$CC/cc-state" dump archive | awk -F'\t' '$2=="feat/new"{print NF}' | tail -1)" "9"
+eq "32 archive appends merged-at + merged-into (10 fields)" "$("$CC/cc-state" dump archive | awk -F'\t' '$2=="feat/new"{print NF}' | tail -1)" "10"
+eq "32 archive merged-at stays the 9th field" "$("$CC/cc-state" dump archive | awk -F'\t' '$2=="feat/new"{print ($9 ~ /^[0-9]+$/)?"ok":"no"}' | tail -1)" "ok"
+eq "32 archive records where it merged into"  "$("$CC/cc-state" dump archive | awk -F'\t' '$2=="feat/new"{print $10}' | tail -1)" "trunk"
 eq "32 archive moves rows out of tasks" "$("$CC/cc-state" dump tasks | grep -c 'feat/new')" "0"
 eq "32 archive sweeps the sidecar for moved dirs" "$("$CC/cc-state" dump status | grep -c "$D32A")" "0"
 eq "32 archive keeps other sidecar rows" "$("$CC/cc-state" dump status | grep -c "$LIVE32")" "1"
+# an EMPTY <merged-into> must leave the row exactly as it always was: 9 fields, merged-at
+# last. The field is appended ONLY when there is something to record — which is what keeps
+# every frozen archive fixture (and the shim's own no-target callers) byte-identical.
+printf '2026-01-01 00:00:09\tfeat/mi0\ts:9\t%s\tc\tno target\tmain\tu\n' "$D32A" | st_append tasks
+"$CC/cc-state" task-archive feat/mi0 "" >/dev/null
+eq "32 empty merged-into appends nothing"       "$("$CC/cc-state" dump archive | awk -F'\t' '$2=="feat/mi0"{print NF}')" "9"
+eq "32 empty merged-into leaves merged-at last" "$("$CC/cc-state" dump archive | awk -F'\t' '$2=="feat/mi0"{print ($NF ~ /^[0-9]+$/)?"ok":"no"}')" "ok"
+# and a <merged-into> carrying a TAB must not forge a 11th field — same _sanitize_field rule
+# every other caller-supplied string goes through
+printf '2026-01-01 00:00:10\tfeat/mi1\ts:9\t%s\tc\ttabby target\tmain\tu\n' "$D32A" | st_append tasks
+"$CC/cc-state" task-archive feat/mi1 "$(printf 'a\tb')" >/dev/null
+eq "32 merged-into cannot forge a field"        "$("$CC/cc-state" dump archive | awk -F'\t' '$2=="feat/mi1"{print NF":"$10}')" "10:a b"
 mo32(){ python3 -c 'import sqlite3,sys
 c=sqlite3.connect(sys.argv[1])
 r=[x for (x,) in c.execute("SELECT tab_opened_ts FROM tasks") if x is not None]
@@ -2909,7 +2923,7 @@ eq "32 --repo archives only this repo's rows"  "$("$CC/cc-state" dump tasks | gr
 eq "32 --repo leaves the other repo alone"     "$("$CC/cc-state" dump tasks | grep -c 'B row')" "1"
 # an empty dir belongs to no repo — never swept by a repo-scoped archive
 eq "32 --repo leaves an empty-dir row alone"   "$("$CC/cc-state" dump tasks | grep -c 'no-dir row')" "1"
-eq "32 --repo archive row still 9 fields"      "$("$CC/cc-state" dump archive | awk -F'\t' 'END{print NF}')" "9"
+eq "32 --repo archive row is verbatim + 2"     "$("$CC/cc-state" dump archive | awk -F'\t' 'END{print NF":"$10}')" "10:feature/camp"
 # component-boundary containment: /a/repoA must not swallow /a/repoA-other
 : | st_seed archive
 printf '2026-01-01 00:00:04\tfeat/y\ts:1\t%s\tc\tsibling row\tp\tu\n' "$O32/wt" | st_seed tasks
@@ -4759,7 +4773,11 @@ printf '\ny\n' | zw36 "cd '$R36A'; gwt-merge feat/S" >/dev/null 2>&1
 eq "36 archiving in repo A leaves repo B's row alone" "$("$CC/cc-state" dump tasks | grep -c 'repo B same-branch')" "1"
 eq "36 repo A's own row did move"                     "$("$CC/cc-state" dump tasks | grep -c 'repo A same-branch')" "0"
 eq "36 only repo A's row reached the archive"         "$("$CC/cc-state" dump archive | grep -c 'same-branch')" "1"
-eq "36 gwt-merge scopes its archive call"             "$(grep -c '_gwt_archive_branch "$child" "$root"' "$CC/worktree.zsh")" "1"
+# item 3 of the D plan, end to end: the archive row records the branch the merge actually
+# LANDED ON, not the parent recorded at dispatch — gwt-merge's --into override and a target
+# that fast-forwarded make those two different, and only this one is history.
+eq "36 gwt-merge records the target it merged into"   "$("$CC/cc-state" dump archive | awk -F'\t' '/same-branch/{print $NF}')" "main"
+eq "36 gwt-merge scopes its archive call"             "$(grep -c '_gwt_archive_branch "$child" "$root" "$target"' "$CC/worktree.zsh")" "1"
 rm -rf "$S36" "$R36" "$D36A" "$D36B" "$R36A" "$R36B" "$WS36B"; cc_sandbox_ledgers
 
 echo "== 19b. fail-closed path guards (partial-shell incident 2026-08-16) =="

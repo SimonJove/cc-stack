@@ -19,18 +19,16 @@ it (`load <store> -`), no output on failure paths that today are silent.
 Stores and their overrides (same env names the sandbox uses):
   tasks   CC_TASKS_FILE    worktree-tasks.tsv           time\\tbranch\\tsurface\\tdir\\tcaller\\ttask\\tparent\\tlargs
   status  CC_STATUS_FILE   worktree-status.tsv          dir\\tstate\\tunix-ts
-  archive CC_ARCHIVE_FILE  worktree-tasks-archive.tsv   a tasks row verbatim + \\tmerged-at
+  archive CC_ARCHIVE_FILE  worktree-tasks-archive.tsv   a tasks row verbatim + \\tmerged-at[ + \\tmerged-into]
   tabs    CC_TABS_FILE     opened-tabs.tsv              suuid\\towner\\tdir\\tsession\\ttime
 
-Phase A mapping note (spec §3.1 / plan Task 2): the API is already the target shape
-but the backend is transitional — state/state_ts live in the status sidecar, the
-tab-opened dedup timestamp lives in the $TMPDIR marker (task-mark-opened stamps it,
-task-opened-recently reads it), and task-archive takes <merged-into> but cannot
-persist it yet (the archive format is frozen at "row + merged-at"; the column
-arrives with the engine swap). task-mark-opened is deliberately NOT part of
-task-add: the marker may only be stamped once the tab actually OPENED — a failed
-dispatch must leave no marker, or it silently eats the retry for 120s
-(cc-dispatch.sh's "Only CHECK here; write the marker after success").
+Phase D (model convergence) closed the last three gaps the Phase A API was written
+against: state/state_ts and the tab-opened dedup timestamp are columns on the task
+row (no status sidecar, no $TMPDIR marker), and task-archive now PERSISTS its
+<merged-into>. task-mark-opened is still deliberately NOT part of task-add: the
+stamp may only be set once the tab actually OPENED — a failed dispatch must leave no
+stamp, or it silently eats the retry for 120s (cc-dispatch.sh's "Only CHECK here;
+write the stamp after success").
 
 Row discipline (the TAB-collapse class, cc-board.sh's access note): rewrites select
 whole lines, modify only the fields they mean to touch, and re-emit the rest by
@@ -126,8 +124,12 @@ COLS = {"tasks": 8, "status": 3, "archive": 9, "tabs": 5}
 TABLES = ("tasks", "archive", "tabs")
 SCHEMA_VERSION = 2
 # tasks 上因收敛新增的列。前两列吃掉 worktree-status.tsv；tab_opened_ts 吃掉 $TMPDIR 去重
-# 标记（Task 2）；merged_* 吃掉归档行今天存不下的两个事实。全部可空 —— 一行没有状态、
-# 没开过 tab、没合并过，都是常态而不是缺省值。
+# 标记。全部可空 —— 一行没有状态、没开过 tab，都是常态而不是缺省值。
+# merged_at / merged_into 是 §3.1 列清单里的后两个，在 D-min 下**恒为 NULL**，这不是缺陷：
+# 同一条清单的取舍段写着「归档行在写入时移出到 archive 表」，所以一条 merged_at 非空的行
+# 定义上已经不在 tasks 里了。这两个事实今天落在归档行的第 9/10 个字段上（cmd_task_archive），
+# 因为 archive 在 D-min 仍是纯行存储 —— dump archive 的字节格式就是板与 gwt-log 读的东西。
+# 保留这两列而不是删掉：它们是 D-full 给 archive 表命名列时这两个事实的落点。
 STATE_COLS = (("state", "BLOB"), ("state_ts", "BLOB"), ("tab_opened_ts", "INTEGER"),
               ("merged_at", "INTEGER"), ("merged_into", "BLOB"))
 # 导入顺序：tasks 必须在 status 之前 —— 状态要落到任务行上，任务行还不存在就全丢了。
@@ -967,9 +969,15 @@ def cmd_task_archive(args):
     so merging feat/x in one repo archived another repo's feat/x rows too. Without
     the flag the semantics are today's, global — every existing caller and fixture
     keeps working unchanged.
-    <merged-into> is accepted for the target API but not persisted in Phase A: the
-    archive format is frozen at `row + merged-at` until the engine swap. Under the
-    tasks lock like today (the archive write borrows it), plus the archive's own
+    <merged-into> — "where this actually landed" — is appended after merged-at, and
+    ONLY when there is something to record. That condition is the whole design: every
+    caller before phase D passed "", so an empty one has to leave the row byte-identical
+    to what the frozen archive fixtures pin, while a real one grows the row the same way
+    merged-at already does (a 7-field legacy row archives to 8, then 9). It is the branch
+    the merge LANDED ON, which gwt-merge's --into override and a fast-forwarded target
+    both make different from the parent recorded at dispatch — and only this one is
+    history. Sanitized like every other caller-supplied string: a TAB in it would forge a
+    field. Under the tasks lock like today (the archive write borrows it), plus the archive's own
     lock — ordering is always tasks→archive, so no deadlock. A failed tasks rewrite
     is LOUD (stderr + rc 1), matching _gwt_archive_branch: the task list stays
     untouched and the archive may have gained the rows — visible, never silent."""
@@ -988,6 +996,7 @@ def cmd_task_archive(args):
     branch = rest[0]
     if not branch:
         return 0
+    into = _sanitize_field(rest[1])
     root_canon = canon(root) if root else None
     ts = str(int(time.time()))
     conn = _connect(False)
@@ -1013,7 +1022,7 @@ def cmd_task_archive(args):
             if hit and root_canon is not None:
                 hit = under_root(f[3] if len(f) > 3 else "", root_canon)
             if hit:
-                moved_rows.append(line + "\t" + ts)
+                moved_rows.append(line + "\t" + ts + ("\t" + into if into else ""))
                 if len(f) >= 4 and f[3]:
                     moved_dirs.append(f[3])
             else:

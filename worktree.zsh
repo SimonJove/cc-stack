@@ -121,24 +121,27 @@ _gwt_tasks_drop_dir() {
 # Rows move here when their branch merges: the row verbatim plus an appended merged-at
 # unix ts. Rendered by gwt-log (cc-board.sh --archive) with the board's columns and repo filter.
 
-# _gwt_archive_branch <branch> [<repo-root>] — move ALL rows whose branch matches into the
-# archive (merged-at appended: 8→9 fields, 7→8) and sweep their status sidecar rows, printing
-# the moved dirs on stdout for this summary. With <repo-root> the archive is repo-scoped
+# _gwt_archive_branch <branch> [<repo-root>] [<merged-into>] — move ALL rows whose branch
+# matches into the archive (merged-at appended: 8→9 fields, 7→8; then merged-into when given)
+# and sweep their status sidecar rows, printing the moved dirs on stdout for this summary.
+# With <repo-root> the archive is repo-scoped
 # (spec §3.5 defect 2's fix): only rows whose dir lives under that root move, so the same
 # branch name in another repo keeps its rows; without it the semantics are today's global
 # match. Called by gwt-merge after a successful merge (or a benign skipped-already-merged),
 # so the board stops showing merged work while gwt-log keeps the history. Failure is LOUD
 # (spec §3.5 defects 4/5, fixed by the facade): rc 1 + stderr, task list left untouched —
-# this shim propagates that rc, never eats it. <merged-into> is Phase A's placeholder: the
-# facade's API takes it, the archive format doesn't store it yet.
+# this shim propagates that rc, never eats it. <merged-into> is where the merge actually
+# LANDED — gwt-merge passes its resolved $target, which --into and a fast-forwarded sibling
+# both make different from the parent recorded at dispatch. Omitted, the archive row keeps
+# its pre-D shape (row + merged-at) exactly.
 _gwt_archive_branch() {
   emulate -L zsh
-  local branch="$1" root="${2:-}"
+  local branch="$1" root="${2:-}" into="${3:-}"
   [[ -n "$branch" ]] || return 0
   local -a ra=()
   [[ -n "$root" ]] && ra=(--repo "$root")
   local out rc
-  out="$("$(_gwt_state)" task-archive "$branch" "" "${ra[@]}")"; rc=$?
+  out="$("$(_gwt_state)" task-archive "$branch" "$into" "${ra[@]}")"; rc=$?
   local -a moved=(${(f)out})
   (( ${#moved} )) && echo "  ↳ archived ${#moved} record(s) for $branch (see gwt-log)"
   return $rc
@@ -505,7 +508,7 @@ gwt-merge() {
   fi
   local mrc=$?
   if (( mrc == 0 )); then
-    _gwt_archive_branch "$child" "$root"   # repo-scoped: another repo's same-name branch keeps its rows (defect 2)
+    _gwt_archive_branch "$child" "$root" "$target"   # repo-scoped (defect 2) + records where it landed
     echo "  (cleanup when ready: gwt-rm ${child#feat/} --branch)"
   fi
   return $mrc
