@@ -68,6 +68,13 @@ _st_db(){ [ -n "${1:-}" ] && export CC_STATE_DB="$1"; return 0; }
 st_seed(){ ( _st_db "${2:-}"; "$CC/cc-state" load "$1" - ); }
 st_append(){ ( _st_db "${2:-}"; { "$CC/cc-state" dump "$1"; cat; } | "$CC/cc-state" load "$1" - ); }
 st_dump(){ ( _st_db "${2:-}"; "$CC/cc-state" dump "$1" ); }
+# D 期：tab-open 去重时间戳是 tasks 上的一列,不再是 $TMPDIR 里以 dir 的 sha1 命名的标记文件。
+# 测试里「让同一 dir 在 120s 内还能再派一次」于是从「删掉标记」变成「清掉那一列」。
+unstamp(){ python3 -c 'import sqlite3, sys
+try:
+    c = sqlite3.connect(sys.argv[1]); c.execute("UPDATE tasks SET tab_opened_ts=NULL"); c.commit()
+except Exception:
+    pass' "$1" 2>/dev/null; return 0; }
 CC_LIVE_DIR="$HOME/.config/cc-stack"
 CC_LIVE_LEDGERS="worktree-tasks.tsv worktree-status.tsv worktree-tasks-archive.tsv opened-tabs.tsv cc-state.db"
 # WAL sidecars are DIAGNOSTICS, never an existence assertion. Any connection creates them and a
@@ -1008,8 +1015,7 @@ env HOME="$F5H" PATH="$F5B:$PATH" CC_STATE_DB="$DB_28" CC_TASKS_FILE="$F5L" CC_S
 eq "F5 no-base parent = caller branch" "$(CC_STATE_DB="$DB_28" CC_TASKS_FILE="$F5L" "$CC/cc-state" task-get "$D5B" | awk -F'\t' '{print $7}')" "main"
 eq "F5 no-base leaves a crumb"     "$(grep -c 'merge target for feat/x28 recorded as: main (source: cwd)' "$F5B/fail")" "1"
 rm -rf "$F5H" "$F5B" "$D5A" "$D5B"; rm -f "$F5L" "$CR28"
-rm -f "${TMPDIR:-/tmp}/cc-cmux-tabs/$(printf '%s' "$D5A" | shasum -a 1 | cut -d' ' -f1)" \
-      "${TMPDIR:-/tmp}/cc-cmux-tabs/$(printf '%s' "$D5B" | shasum -a 1 | cut -d' ' -f1)" 2>/dev/null
+unstamp "$DB_28"
 unset CC_FAKE_LOG CC_FAKE_SCREEN
 
 # ── F7: gwt-rm without --branch leaves exactly this shape — the branch must stay visible ──
@@ -1696,7 +1702,7 @@ eq "26 resume refreshed the ref to the other workspace" "$(CC_STATE_DB="$DB_26" 
 
 # insurance for a future regression: a resume that DOES reopen leaves a contentless dedup marker
 # in the real TMPDIR (hash-keyed, written by surface) — sweep ours either way
-rm -f "${TMPDIR:-/tmp}/cc-cmux-tabs/$(printf '%s' "$WB26" | shasum -a 1 | cut -d' ' -f1)" 2>/dev/null
+unstamp "$DB_26"
 rm -rf "$WS26" "$R26" "$PR26"; rm -f "$TB26" "$TF26" "$SF26" "$TFC26" "$TFR26"
 unset CC_FAKE_LOG26
 echo ""
@@ -2342,8 +2348,7 @@ eq "bad model never launched" "$(grep -c -- '--model' "$CC_FAKE_LOG")" "0"
 eq "bad model not recorded"   "$(CC_STATE_DB="$DB_17" CC_TASKS_FILE="$TF17D" "$CC/cc-state" task-get "$D0B" | awk -F'\t' '{print ($8 ~ /model=/)?"bad":"ok"}')" "ok"
 rm -rf "$RF" "$FH17" "$REPO17" "$OTH17" "$UNREL17" "$D0" "$D0B"; rm -f "$TF17" "$SF17" "$TF17C" "$TF17D"
 # fresh-mode surface leaves dedup markers in the real TMPDIR (hash-keyed, contentless) — sweep ours
-rm -f "${TMPDIR:-/tmp}/cc-cmux-tabs/$(printf '%s' "$D0"  | shasum -a 1 | cut -d' ' -f1)" \
-      "${TMPDIR:-/tmp}/cc-cmux-tabs/$(printf '%s' "$D0B" | shasum -a 1 | cut -d' ' -f1)" 2>/dev/null
+unstamp "$DB_17"
 unset CC_FAKE_LOG CC_FAKE_SCREEN
 
 echo ""
@@ -2563,20 +2568,29 @@ eq "32 archive appends merged-at (9 fields)" "$("$CC/cc-state" dump archive | aw
 eq "32 archive moves rows out of tasks" "$("$CC/cc-state" dump tasks | grep -c 'feat/new')" "0"
 eq "32 archive sweeps the sidecar for moved dirs" "$("$CC/cc-state" dump status | grep -c "$D32A")" "0"
 eq "32 archive keeps other sidecar rows" "$("$CC/cc-state" dump status | grep -c "$LIVE32")" "1"
-# the dedup marker (Phase A's tab_opened_ts) says "a tab actually opened", so
-# task-add must NOT stamp it (a failed dispatch must leave no blocking marker —
-# B5); task-mark-opened does, and the hash is today's: sha1 of the dir bytes, no
-# trailing newline. TMPDIR scoped per call.
-env TMPDIR="$S32B" "$CC/cc-state" task-add /d/m1 feat/m s:1 marker p
-M32="cc-cmux-tabs/$(printf '%s' /d/m1 | shasum -a 1 | cut -d' ' -f1)"
-eq "32 task-add does not stamp the marker" "$([ -e "$S32B/$M32" ] && echo yes || echo no)" "no"
-env TMPDIR="$S32B" "$CC/cc-state" task-opened-recently /d/m1 120; eq "32 opened-recently false before mark" "$?" "1"
-env TMPDIR="$S32B" "$CC/cc-state" task-mark-opened /d/m1; eq "32 mark-opened rc0" "$?" "0"
-eq "32 mark-opened writes the marker" "$([ -e "$S32B/$M32" ] && echo yes || echo no)" "yes"
-env TMPDIR="$S32B" "$CC/cc-state" task-opened-recently /d/m1 120; eq "32 opened-recently rc0 in window" "$?" "0"
-touch -t 202601010000 "$S32B/$M32"
-env TMPDIR="$S32B" "$CC/cc-state" task-opened-recently /d/m1 120; eq "32 opened-recently rc1 outside window" "$?" "1"
-env TMPDIR="$S32B" "$CC/cc-state" task-opened-recently /d/never 120; eq "32 opened-recently rc1 without marker" "$?" "1"
+mo32(){ python3 -c 'import sqlite3,sys
+c=sqlite3.connect(sys.argv[1])
+r=[x for (x,) in c.execute("SELECT tab_opened_ts FROM tasks") if x is not None]
+print("set" if r else "none")' "$CC_STATE_DB"; }
+# the dedup timestamp says "a tab actually opened", so task-add must NOT stamp it (a failed
+# dispatch must leave no blocking stamp — B5); task-mark-opened does. D 期起它是 tasks 上的
+# tab_opened_ts 列,不再是 $TMPDIR 里那个以 dir 的 sha1 命名的文件 —— 于是 TMPDIR 不再参与,
+# 而「shasum 不可用 → 哈希为空 → 标记指向目录本身 → 120 秒内吞掉所有派发」那条静默失败
+# 路径随之消失(整数列没有空键)。
+"$CC/cc-state" task-add /d/m1 feat/m s:1 marker p
+eq "32 task-add does not stamp the timestamp" "$(mo32)" "none"
+"$CC/cc-state" task-opened-recently /d/m1 120; eq "32 opened-recently false before mark" "$?" "1"
+"$CC/cc-state" task-mark-opened /d/m1; eq "32 mark-opened rc0" "$?" "0"
+eq "32 mark-opened writes the timestamp" "$(mo32)" "set"
+"$CC/cc-state" task-opened-recently /d/m1 120; eq "32 opened-recently rc0 in window" "$?" "0"
+# age it out by rewriting the column, the way `touch -t` aged the file
+python3 -c 'import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute("UPDATE tasks SET tab_opened_ts=1 WHERE tab_opened_ts IS NOT NULL"); c.commit()' "$CC_STATE_DB"
+"$CC/cc-state" task-opened-recently /d/m1 120; eq "32 opened-recently rc1 outside window" "$?" "1"
+"$CC/cc-state" task-opened-recently /d/never 120; eq "32 opened-recently rc1 without a row" "$?" "1"
+# the stamp is a CARRIED column: a line-based rewrite of tasks must not lose it
+"$CC/cc-state" task-mark-opened /d/m1
+"$CC/cc-state" task-set-ref /d/m1 s:9 >/dev/null 2>&1
+"$CC/cc-state" task-opened-recently /d/m1 120; eq "32 the stamp survives a rewrite" "$?" "0"
 
 # ── Task 3: the tabs-store verbs (byte contract of _cctabs_log / _cctabs_by_dir /
 # _cctabs_owner / _cctabs_prune) ─────────────────────────────────────────────────
@@ -2756,8 +2770,11 @@ eq "32 broken pipe is silent (list path)" "$([ -s "$S32B/bp-err" ] && echo noise
 # B14: a dir with a raw non-UTF-8 byte (from argv) must not crash the verbs that
 # hash it — fsencode, not str.encode
 BD32=$(printf '/d/bad\xff')
-env TMPDIR="$S32B" "$CC/cc-state" task-mark-opened "$BD32"; eq "32 non-UTF-8 dir: mark-opened rc0" "$?" "0"
-env TMPDIR="$S32B" "$CC/cc-state" task-opened-recently "$BD32" 120; eq "32 non-UTF-8 dir: marker round-trips" "$?" "0"
+# 戳记现在挂在任务行上,所以先要有一行 —— 而这正好把 B14 测得更全:那个裸字节要活着穿过
+# argv → 列存 → dir_match 三道,不只是穿过一次哈希。
+"$CC/cc-state" task-add "$BD32" feat/bad s:1 'non-utf8 dir' p
+"$CC/cc-state" task-mark-opened "$BD32"; eq "32 non-UTF-8 dir: mark-opened rc0" "$?" "0"
+"$CC/cc-state" task-opened-recently "$BD32" 120; eq "32 non-UTF-8 dir: stamp round-trips" "$?" "0"
 "$CC/cc-state" task-add "$BD32" feat/bd s:1 'bad bytes dir' p; eq "32 non-UTF-8 dir: task-add rc0" "$?" "0"
 eq "32 non-UTF-8 dir: row round-trips" "$("$CC/cc-state" task-get "$BD32" | wc -l | tr -d ' ')" "1"
 
@@ -3079,8 +3096,7 @@ mk21; prune21 "$L21" "$(printf 'surface:1\tCCCCCCCC-0000-0000-0000-00000000000C'
 eq "all-dead ledger removed" "$(rows21)" "gone"
 
 # surface leaves contentless dedup markers in the real TMPDIR (hash-keyed) — sweep ours
-rm -f "${TMPDIR:-/tmp}/cc-cmux-tabs/$(printf '%s' "$TR21" | shasum -a 1 | cut -d' ' -f1)" \
-      "${TMPDIR:-/tmp}/cc-cmux-tabs/$(printf '%s' "$KD21" | shasum -a 1 | cut -d' ' -f1)" 2>/dev/null
+unstamp "$DB_21"
 ( cd "$CR21" && git worktree remove --force "$CR21/.claude/worktrees/kid21" >/dev/null 2>&1 )
 rm -rf "$SF21" "$FH21" "$CR21" "$TR21" "$MR21" "$PR21"; rm -f "$TF21" "$TB21" "$TF21B" "$TB21B"
 unset CC_FAKE_LOG21 CF_SCREEN21
@@ -3343,14 +3359,14 @@ FH29=$(mktemp -d); mkdir -p "$FH29/.config"; cp -R "$CC" "$FH29/.config/cc-stack
 TSKV29=$(mktemp -u); TB29=$(mktemp -u); LF29=$(mktemp -u)
 mk29(){ : > "$CC_FAKE_LOG29"; rm -f "$CC_FAKE_LOG29.nscnt"; cp "$1" "$CC_FAKE_SCREEN29"
         unset CC_FAKE_ON_SEND CC_FAKE_TUI29 CC_FAKE_FLUSH_AT CC_FAKE_PINGDOWN CC_LAUNCH_FILE
-        rm -f "$S29/cc-cmux-tabs/$(printf '%s' "$2" | shasum -a 1 | cut -d' ' -f1)" 2>/dev/null; }
+        unstamp "$DB_29"; }
 srf29(){ # $1 dir, $2 prompt (screens are set by mk29); extra knobs come from the environment
   ( cd "$REPO29" && env HOME="$FH29" PATH="$S29:$OP29" TMPDIR="$S29" CC_STATE_DB="$DB_29" CC_TASKS_FILE="$TSKV29" CC_TABS_FILE="$TB29" \
       CC_CALLER_CWD="$REPO29" CC_WT_PRETRUST=0 CC_WT_SHARE="" CC_SEND_VERIFY_SEC=0.1 \
       CC_SEND_FAILLOG="$LF29" CC_CALLER_SURFACE_UUID="22222222-AAAA-AAAA-AAAA-222222222222" \
       CC_WT_SESSION_ID="55555555-5555-5555-5555-555555555555" CC_RESUME_SETTLE=0 \
       bash "$CC/cc-dispatch.sh" surface "$1" "$2" ) >/dev/null 2>&1; }
-# TMPDIR=$S29: dispatches write their pf temp files and cc-cmux-tabs dedup markers into the
+# TMPDIR=$S29: dispatches write their pf temp files into the
 # section-private dir — the shared /tmp is subject to outside traffic (a concurrent sweep of
 # cc-wt-prompt litter flipped the F3 counts run-to-run), and every reader below matches.
 pf29(){ grep -l 'PROMPT29' "$S29"/cc-wt-prompt.* 2>/dev/null | wc -l | tr -d ' '; }
@@ -3441,7 +3457,7 @@ grep -q '(6) Keep every edit inside THIS worktree' "$CC/cc-dispatch.sh" && ok "A
 # ── restore section-external state and sweep every scratch artefact
 PATH="$OP29"
 export CC_STATE_DB="$DB_29" CC_TASKS_FILE="$svT" CC_STATUS_FILE="$svS" CC_ARCHIVE_FILE="$svA"
-for _d in "$WTA" "$WTB" "$WTP"; do rm -f "$S29/cc-cmux-tabs/$(printf '%s' "$_d" | shasum -a 1 | cut -d' ' -f1)" 2>/dev/null; done
+unstamp "$DB_29"
 pfsweep29
 rm -rf "$S29" "$FH29" "$REPO29" "$OTH29" 2>/dev/null; rm -f "$TF29B" "$SF29B" "$AF29B" "$TSKV29" "$TB29" "$LF29" "$FL29"
 unset CC_FAKE_LOG29 CC_FAKE_SCREEN29 CC_FAKE_ON_SEND CC_FAKE_TUI29 CC_FAKE_FLUSH_AT CC_FAKE_PINGDOWN CC_LAUNCH_FILE
@@ -3737,7 +3753,22 @@ eq "ledger session matches the board" "$(CC_STATE_DB="$TB18D.db" CC_TABS_FILE="$
 # the newest, tab-owner to one owner), and "kept in BOTH ledgers, never deduped" is precisely
 # a statement about how many rows are on disk
 eq "board and ledger both kept (no dedupe)" "$(CC_STATE_DB="$TB18D.db" CC_TASKS_FILE="$TF18D" "$CC/cc-state" dump tasks | awk -F'\t' -v d="$DD" '$4==d{c++} END{print c+0}')+$(CC_STATE_DB="$TB18D.db" CC_TABS_FILE="$TB18D" "$CC/cc-state" dump tabs | awk -F'\t' -v d="$DD" '$3==d{c++} END{print c+0}')" "1+1"
-rm -f "${TMPDIR:-/tmp}/cc-cmux-tabs/$(printf '%s' "$DD" | shasum -a 1 | cut -d' ' -f1)" 2>/dev/null
+unstamp "$TB18D.db"
+# WINDOW B (spec §3.1): resume REOPENS a tab, so it must stamp the dedup timestamp too. The stamp
+# used to sit inside the `if [ -z "$rsmode" ]` branch, i.e. only on the fresh-dispatch path, so a
+# resumed tab left none and the very next dispatch for that dir sailed through the 120s gate and
+# opened a SECOND one. Behavioural, not a grep: dispatch in resume mode against a row that already
+# exists (which is exactly why resume skips task-add), then ask the gate itself.
+WB18="$(cn18 "$(mktemp -d)")"
+env CC_STATE_DB="$TB18D.db" CC_TASKS_FILE="$TF18D" "$CC/cc-state" task-add "$WB18" "" s:1 'resume row' main >/dev/null
+eq "window B: no stamp before the resume" "$(env CC_STATE_DB="$TB18D.db" CC_TASKS_FILE="$TF18D" "$CC/cc-state" task-opened-recently "$WB18" 120; echo $?)" "1"
+: > "$CC_FAKE_LOG"
+env HOME="$FH18" PATH="$CF:$OP18" CC_STATE_DB="$TB18D.db" CC_TASKS_FILE="$TF18D" CC_TABS_FILE="$TB18D" \
+  CC_CMUX_SESSIONS="$ST18" CC_SEND_FAILLOG="$CF/fail" CC_SEND_VERIFY_SEC=0.1 CC_LAUNCH_FILE="$CF/launch" \
+  CC_CALLER_SURFACE_UUID="$UP" CC_WT_LAUNCH_CMD='ccteam --resume probe' \
+  bash "$CC/cc-dispatch.sh" surface "$WB18" "resume brief" >/dev/null 2>&1
+eq "window B: resume really reopened a tab" "$(grep -c 'NEWSURF|' "$CC_FAKE_LOG")" "1"
+eq "window B: and it stamped the dedup timestamp" "$(env CC_STATE_DB="$TB18D.db" CC_TASKS_FILE="$TF18D" "$CC/cc-state" task-opened-recently "$WB18" 120; echo $?)" "0"
 # …and a workspace open (gwt-new / gwt-adopt path) lands in the same ledger
 WSD="$(cn18 "$(mktemp -d)")"
 : > "$CC_FAKE_LOG"
@@ -3929,22 +3960,28 @@ eq "35 dispatch opened exactly one tab"  "$(grep -c 'NEWSURF' "$CC_35_LOG")" "1"
 # is env-scoped to it. Expected values unchanged.
 eq "35 completed row has its launch args" "$(CC_STATE_DB="$DB_35" CC_TASKS_FILE="$TF35" "$CC/cc-state" task-get "$DD35" | awk -F'\t' '{print ($8 ~ /uuid=/)?"y":"n"}')" "y"
 eq "35 completed row has its caller ref"  "$(CC_STATE_DB="$DB_35" CC_TASKS_FILE="$TF35" "$CC/cc-state" task-get "$DD35" | awk -F'\t' '{print $5}')" "surface:9"
-M35="$TMPDIR/cc-cmux-tabs/$(printf '%s' "$DD35" | shasum -a 1 | cut -d' ' -f1)"
-eq "35 dispatch stamped the dedup marker" "$([ -e "$M35" ] && echo yes || echo no)" "yes"
+# D 期：戳记是 tasks 上的 tab_opened_ts 列,不再是 $TMPDIR 里的标记文件。问题没变 ——
+# 「这个 dir 最近开过 tab 吗」—— 所以这两条断言的主题一字未动,只是问法换了。
+eq "35 dispatch stamped the dedup timestamp" \
+  "$(env CC_STATE_DB="$DB_35" CC_TASKS_FILE="$TF35" "$CC/cc-state" task-opened-recently "$DD35" 120; echo $?)" "0"
 
 # H2 window: a fresh marker silently eats the retry; a 121s-stale one lets it through
 n35b=$(grep -c 'NEWSURF' "$CC_35_LOG")
 env PATH="$S35:$OP35" TMPDIR="$TMPDIR" CC_STATE_DB="$DB_35" CC_TASKS_FILE="$TF35" CC_TABS_FILE="$TB35" \
   CC_SEND_FAILLOG="$S35/fail" CC_SEND_VERIFY_SEC=0.1 CC_WT_PRETRUST=0 \
   bash "$CC/cc-dispatch.sh" surface "$DD35" "retry brief" >/dev/null 2>&1
-eq "35 fresh marker eats the retry"  "$([ "$(grep -c 'NEWSURF' "$CC_35_LOG")" = "$n35b" ] && [ "$(CC_STATE_DB="$DB_35" CC_TASKS_FILE="$TF35" "$CC/cc-state" dump tasks | wc -l | tr -d ' ')" = 1 ] && echo yes || echo no)" "yes"
-touch -t "$(date -v-121S '+%Y%m%d%H%M.%S')" "$M35"
+eq "35 fresh stamp eats the retry"  "$([ "$(grep -c 'NEWSURF' "$CC_35_LOG")" = "$n35b" ] && [ "$(CC_STATE_DB="$DB_35" CC_TASKS_FILE="$TF35" "$CC/cc-state" dump tasks | wc -l | tr -d ' ')" = 1 ] && echo yes || echo no)" "yes"
+# 把戳记做旧 121 秒（原来是 touch -t 那个标记文件）
+python3 -c 'import sqlite3, sys, time
+c = sqlite3.connect(sys.argv[1])
+c.execute("UPDATE tasks SET tab_opened_ts=? WHERE tab_opened_ts IS NOT NULL", (int(time.time()) - 121,))
+c.commit()' "$DB_35"
 : > "$CC_35_LOG"; rm -f "${CC_35_LOG}.nscnt"
 CC_35_SCREEN="$S35/scr-tui" \
 env PATH="$S35:$OP35" TMPDIR="$TMPDIR" CC_STATE_DB="$DB_35" CC_TASKS_FILE="$TF35" CC_TABS_FILE="$TB35" \
   CC_SEND_FAILLOG="$S35/fail" CC_SEND_VERIFY_SEC=0.1 CC_WT_PRETRUST=0 \
   bash "$CC/cc-dispatch.sh" surface "$DD35" "retry brief" >/dev/null 2>&1
-eq "35 stale (121s) marker lets the retry through" "$(grep -c 'NEWSURF' "$CC_35_LOG")" "1"
+eq "35 stale (121s) stamp lets the retry through" "$(grep -c 'NEWSURF' "$CC_35_LOG")" "1"
 
 # ── H1 shape: close's refusal and partial-evidence sentences, byte for byte ────────────────
 UA35="AAAAAAAA-1111-1111-1111-111111111111"; UB35="BBBBBBBB-2222-2222-2222-222222222222"
@@ -4294,8 +4331,7 @@ eq "--dry-run mounts nothing"            "$([ -e "$CGJD/.git/hooks/pre-commit" ]
 ( cd "$CGID" && git worktree remove --force .claude/worktrees/wi >/dev/null 2>&1 )
 
 # surface leaves a contentless dedup marker in the real TMPDIR (hash-keyed) — sweep ours
-rm -f "${TMPDIR:-/tmp}/cc-cmux-tabs/$(printf '%s' "$CGDW" | shasum -a 1 | cut -d' ' -f1)" \
-      "${TMPDIR:-/tmp}/cc-cmux-tabs/$(printf '%s' "$CGTR" | shasum -a 1 | cut -d' ' -f1)" 2>/dev/null
+unstamp "$DB_25"
 rm -rf "$CG" "$CGP" "$CGH" "$CGF" "$CGS" "$FH25" "$CGD" "$CGT" "$CGN" "$CGI" "$CGJ"
 unset CC_FAKE_LOG25 CF_SCREEN25
 
@@ -5133,6 +5169,11 @@ c.execute("CREATE TABLE IF NOT EXISTS status (seq INTEGER PRIMARY KEY, nf INTEGE
 c.execute("PRAGMA user_version=1")
 c.commit()
 PYDG
+# The $TMPDIR dedup marker is gone from the CODE, comments included: a grep for its directory
+# name is the only thing between "retired" and "quietly reintroduced". Confirmed RED before the
+# change (cc-state carried one hit) — the plan flags this exact assertion as the kind that is
+# born green and stays green for the wrong reason, so it was checked the other way first.
+eq "39 the dedup marker path is gone" "$(cat "$CC/cc-state" "$CC/cc-dispatch.sh" | grep -c 'cc-cmux-tabs')" "0"
 eq "39 a downgrade round trip keeps the state" "$(dg39 dump status | wc -l | tr -d ' ')" "1"
 eq "39 ...and it is the same state"            "$(dg39 dump status | cut -f2)" "working"
 eq "39 ...and the sidecar table is gone again" \

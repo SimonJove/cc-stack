@@ -848,8 +848,14 @@ if [ -z "$rsmode" ]; then
   _mtb="$(git -C "$abspath" symbolic-ref --short HEAD 2>/dev/null)"
   [ -n "$_mtb" ] && [ -n "${root:-}" ] && _mt="$(git -C "$root" config --get "branch.$_mtb.ccMergeInto" 2>/dev/null)"
   "$CC_SELF/cc-state" task-add "$abspath" "" "$ref" "$prompt" "${_mt:-}"
-  "$CC_SELF/cc-state" task-mark-opened "$abspath"
 fi
+# WINDOW B (spec §3.1): the stamp belongs to "a tab was opened for this dir", which is
+# true on BOTH paths — resume reopens a tab too. It used to live inside the branch above,
+# so a resumed tab left no stamp and the very next dispatch for that dir sailed through
+# the 120s dedup gate and opened a SECOND one. task-add stays branch-local (resume's row
+# already exists); the stamp does not. Still AFTER the tab really opened, never before:
+# a dispatch that failed by here must leave nothing that eats the retry.
+"$CC_SELF/cc-state" task-mark-opened "$abspath"
 
 # Wait for the shell to be ready (only counts once the marker command's OUTPUT appears, avoiding the shell-init race)
 # RDY stays a RAW send by decision (2026-08-15): the target is the fresh SHELL, not a claude TUI —

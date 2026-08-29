@@ -56,7 +56,6 @@ Intentional deviations from today's byte stream, both gate-ruled (spec §3.5 #7/
     "HEAD", which today's `$(… || echo '?')` captures as a two-line "HEAD\\n?"
     branch field, corrupting the row; _git_branch returns a clean '?'.
 """
-import hashlib
 import os
 import sqlite3
 import subprocess
@@ -677,21 +676,21 @@ def _git_branch(dir_):
         return "?"
     return r.stdout.strip()
 
-# Phase A's tab_opened_ts still lives in the $TMPDIR marker (plan Task 2 note); the
-# D-phase engine swap retires it. The hash is today's: sha1 of the dir bytes with
-# NO trailing newline (`printf '%s' | shasum -a 1`). fsencode, not str.encode: a
-# dir straight out of argv may carry lone surrogates, and .encode() would raise
-# where the shell pipeline never fails (round-2 gate B14).
-def _marker(dir_):
-    md = os.path.join(os.environ.get("TMPDIR") or "/tmp", "cc-cmux-tabs")
-    return os.path.join(md, hashlib.sha1(os.fsencode(dir_)).hexdigest())
-
-def _touch_marker(dir_):
-    try:
-        os.makedirs(os.path.dirname(_marker(dir_)), exist_ok=True)
-        open(_marker(dir_), "w").close()      # `: > marker`: truncate + stamp mtime
-    except OSError:
-        pass                                  # `|| true` today; never fail a dispatch
+# The tab-opened dedup timestamp is a COLUMN now (spec §3.1). It replaced a marker FILE
+# under $TMPDIR whose name was the sha1 of the dir, and that path carried a defect that
+# dies with it: when `shasum` was unavailable the hash came back EMPTY, so the marker
+# path resolved to the containing DIRECTORY — `[ -e ]` then answered true forever and
+# every dispatch, for every dir, was silently swallowed for 120s. An integer column
+# cannot have an empty key. (The literal path is deliberately NOT written here: a grep
+# for it is the assertion that the marker never comes back. Story: docs/known-issues.md.)
+def _task_seq(conn, dir_):
+    """seq of the NEWEST tasks row for <dir>, or None. dir_match, like every verb."""
+    c = canon(dir_)
+    hit = None
+    for seq, d in conn.execute("SELECT seq, f4 FROM tasks ORDER BY seq"):
+        if dir_match("" if d is None else _dec(d), dir_, c):
+            hit = seq
+    return hit
 
 def _usage(text):
     print("usage: cc-state " + text, file=sys.stderr)
@@ -1062,7 +1061,21 @@ def cmd_task_mark_opened(args):
     for 120s (cc-dispatch.sh: "failures leave no blocking marker")."""
     if len(args) != 1:
         return _usage("task-mark-opened <dir>")
-    _touch_marker(args[0])
+    conn = _connect(True)
+    if conn is None:
+        return 0                       # `|| true` today; never fail a dispatch
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        seq = _task_seq(conn, args[0])
+        if seq is not None:
+            conn.execute("UPDATE tasks SET tab_opened_ts=? WHERE seq=?",
+                         (int(time.time()), seq))
+        conn.execute("COMMIT")
+    except sqlite3.Error:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
     return 0
 
 def cmd_task_opened_recently(args):
@@ -1074,11 +1087,23 @@ def cmd_task_opened_recently(args):
         win = int(args[1])
     except ValueError:
         return _usage("task-opened-recently <dir> <seconds>")
-    try:
-        mt = os.stat(_marker(args[0])).st_mtime
-    except OSError:
+    conn = _connect(False)             # a read must not bring the library into existence
+    if conn is None:
         return 1
-    return 0 if (time.time() - mt) < win else 1
+    try:
+        seq = _task_seq(conn, args[0])
+        if seq is None:
+            return 1
+        row = conn.execute("SELECT tab_opened_ts FROM tasks WHERE seq=?",
+                           (seq,)).fetchone()
+    except sqlite3.Error:
+        return 1
+    # tab_opened_ts ONLY, never created_at (spec §3.1, window B): a row re-opened by
+    # resume keeps its original created_at, so reading that would let the dispatch right
+    # after a resume through the dedup gate and open a SECOND tab for the same dir.
+    if not row or row[0] is None:
+        return 1
+    return 0 if (time.time() - row[0]) < win else 1
 
 # ── tabs store ──────────────────────────────────────────────────────────────────
 # Row: suuid \t owner \t dir \t session \t time. Empty owner/dir/session are written
