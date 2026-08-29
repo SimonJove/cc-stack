@@ -109,7 +109,10 @@ _cc_live_keys_sorted(){ _cc_live_keys | LC_ALL=C sort -u; }
 # The library is binary, but a leaked fixture path is stored inside it as literal bytes, so
 # `grep -a` finds one without this watchdog having to know a single thing about the schema —
 # which is the point: §24 must stay independent of the facade it is watching.
-_cc_live_db_tmp(){ grep -ac '/var/folders/\|/tmp/' "$CC_LIVE_DIR/cc-state.db" 2>/dev/null || echo 0; }
+# `grep -c` prints its 0 AND exits 1, so a `|| echo 0` fallback leg answers TWICE ("0\n0") on the
+# healthy path and the caller's $(( )) below dies with a syntax error on every clean run. Substitute
+# once, default the EMPTY case (file missing / unreadable) instead of chaining on rc.
+_cc_live_db_tmp(){ _n="$(grep -ac '/var/folders/\|/tmp/' "$CC_LIVE_DIR/cc-state.db" 2>/dev/null)"; echo "${_n:-0}"; }
 _cc_live_tmp_rows(){ echo $(( $(_cc_live_keys | grep -cE ' (/private)?(/var/folders/|/tmp/)' || true) + $(_cc_live_db_tmp) )); }
 # Layer 1's own integrity: count overrides that no longer point into the sandbox. Defined as a
 # function on purpose — bash 3.2 mis-parses a `case` pattern's `)` inside a `$( )` substitution.
@@ -3588,9 +3591,8 @@ eq "third-session refusal says not a worktree" "$(echo "$CO" | grep -c 'not a wo
 eq "third-session refusal closes nothing"      "$(grep -c 'CLOSE|' "$CC_FAKE_LOG")" "0"
 
 # — item A: the board row has NO suuid (pre-ledger child) → resolution falls back to opened-tabs —
-TF18P=$(mktemp -u); PW18="$(cn18 "$(mktemp -d)")"; PWD18="$PW18/.claude/worktrees/wtP"; mkdir -p "$PWD18"
+TF18P=$(mktemp -u); TB18P=$(mktemp -u); PW18="$(cn18 "$(mktemp -d)")"; PWD18="$PW18/.claude/worktrees/wtP"; mkdir -p "$PWD18"
 printf '2026-01-01 00:00:01\tfeat/P\tsurface:101\t%s\tsurface:9\tpre-ledger child\tmain\tuuid=u9:provider=anthropic:pm=auto\n' "$PWD18" | st_seed tasks "$TB18P.db"
-TB18P=$(mktemp -u)
 printf '%s\t%s\t%s\tu9\t2026-01-01 00:00:00\n' "$UA" "$UP" "$PWD18" | st_seed tabs "$TB18P.db"
 plc18(){ ( cd "$R18" && env PATH="$CF:$OP18" CC_STATE_DB="$TB18P.db" CC_TASKS_FILE="${2:-$TF18P}" CC_TABS_FILE="$TB18P" \
     CC_CMUX_SESSIONS="$ST18" CC_CALLER_SURFACE_UUID="$UP" CLAUDECODE=1 \
