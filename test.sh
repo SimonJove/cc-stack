@@ -5160,7 +5160,20 @@ eq "39 ...and the write landed anyway"           "$(st39 dump tasks | grep -c 'l
 eq "39 the library is in WAL mode" \
   "$(python3 -c 'import sqlite3,sys; print(sqlite3.connect(sys.argv[1]).execute("PRAGMA journal_mode").fetchone()[0])' "$S39/cc-state.db")" "wal"
 eq "39 schema version is stamped" \
-  "$(python3 -c 'import sqlite3,sys; print(sqlite3.connect(sys.argv[1]).execute("PRAGMA user_version").fetchone()[0])' "$S39/cc-state.db")" "2"
+  "$(python3 -c 'import sqlite3,sys; print(sqlite3.connect(sys.argv[1]).execute("PRAGMA user_version").fetchone()[0])' "$S39/cc-state.db")" "3"
+# D2a: the row lives in NAMED columns, not f1..fN. Positional columns are the same shape as
+# the awk field indexing whose shift bugs started this campaign — a structural assertion is
+# what stops them coming back one convenient `fN` at a time.
+eq "39 the row columns are named" \
+  "$(python3 -c 'import sqlite3,sys
+c=sqlite3.connect(sys.argv[1])
+print(",".join(r[1] for r in c.execute("PRAGMA table_info(tasks)")))' "$S39/cc-state.db")" \
+  "seq,nf,created_at,branch,surface_ref,dir,caller_ref,task,parent,launch_args,fx,state,state_ts,tab_opened_ts"
+eq "39 ...and the archive carries merged_into as a column, not overflow" \
+  "$(python3 -c 'import sqlite3,sys
+c=sqlite3.connect(sys.argv[1])
+print(",".join(r[1] for r in c.execute("PRAGMA table_info(archive)")))' "$S39/cc-state.db")" \
+  "seq,nf,created_at,branch,surface_ref,dir,caller_ref,task,parent,launch_args,merged_at,merged_into,fx"
 # A DOWNGRADE must cost visibility, never data. Code from before the model convergence opens a v2
 # library happily — it reads f1..f8 and ignores the carried columns — but it also re-creates an
 # empty `status` table and stamps the version back to 1. Coming back UP must not then fold that
@@ -5251,8 +5264,8 @@ eq "39 the newline-less legacy row gained a newline (deviation 10)" \
 # must land on the current schema in one migration, not build a v1 library and then upgrade it:
 # the two-step would run the fold path over data that was never a sidecar table, and a new
 # machine would carry a transitional shape it never had any reason to have.
-eq "39 a v0 machine migrates straight to v2" \
-  "$(python3 -c 'import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); print("%d/%d" % (c.execute("PRAGMA user_version").fetchone()[0], c.execute("SELECT count(*) FROM sqlite_master WHERE type=\"table\" AND name=\"status\"").fetchone()[0]))' "$M39/cc-state.db")" "2/0"
+eq "39 a v0 machine migrates straight to the current schema" \
+  "$(python3 -c 'import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); print("%d/%d" % (c.execute("PRAGMA user_version").fetchone()[0], c.execute("SELECT count(*) FROM sqlite_master WHERE type=\"table\" AND name=\"status\"").fetchone()[0]))' "$M39/cc-state.db")" "3/0"
 # D plan Task 1 assertion 4 / §1.5 deviation A — a sidecar row belonging to NO task row cannot
 # be represented once state is two columns on the task row, so the import drops it. Today's
 # task-prune already sweeps such rows; this turns "will be swept" into "cannot be stored", and
@@ -5283,12 +5296,48 @@ c.execute("PRAGMA user_version=1")
 c.commit()
 PYU
 u39(){ env CC_STATE_DB="$U39/cc-state.db" "$CC/cc-state" "$@"; }
-eq "39 a v1 library upgrades to v2 in place" \
-  "$(u39 dump tasks >/dev/null; python3 -c 'import sqlite3,sys; print(sqlite3.connect(sys.argv[1]).execute("PRAGMA user_version").fetchone()[0])' "$U39/cc-state.db")" "2"
+eq "39 a v1 library upgrades in place" \
+  "$(u39 dump tasks >/dev/null; python3 -c 'import sqlite3,sys; print(sqlite3.connect(sys.argv[1]).execute("PRAGMA user_version").fetchone()[0])' "$U39/cc-state.db")" "3"
 eq "39 ...folding the sidecar onto its task row"   "$(u39 dump status)" "$(printf '/d/u\tidle\t300')"
 eq "39 ...and dropping the one with no task row"   "$(u39 dump status | grep -c ghost)" "0"
 eq "39 ...while the 7-field task row stays 7"      "$(u39 dump tasks | awk -F'\t' '{print NF}')" "7"
+eq "39 ...and the v1 positional columns are gone"  \
+  "$(python3 -c 'import sqlite3,sys
+c=sqlite3.connect(sys.argv[1])
+n=[r[1] for r in c.execute("PRAGMA table_info(tasks)")]
+print("f1" in n, "dir" in n)' "$U39/cc-state.db")" "False True"
 rm -rf "$U39"
+# A v2 library whose ARCHIVE holds a 10-field row: merged_into was appended to the LINE and
+# therefore rode in `fx` (the table was 9 columns wide). v3 widens the table, so the rebuild
+# has to promote that overflow into the new column — and the promotion is not hand-written
+# field shuffling, it falls out of reading at the old width and writing at the new one. If
+# that ever stops being true the row comes back ELEVEN fields wide, silently.
+W39=$(mktemp -d)
+python3 - "$W39/cc-state.db" <<'PYW'
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+for t, n in (("tasks", 8), ("archive", 9), ("tabs", 5)):
+    c.execute("CREATE TABLE %s (seq INTEGER PRIMARY KEY, nf INTEGER NOT NULL, %s, fx BLOB)"
+              % (t, ", ".join("f%d BLOB" % (i + 1) for i in range(n))))
+for col, typ in (("state","BLOB"),("state_ts","BLOB"),("tab_opened_ts","INTEGER"),
+                 ("merged_at","INTEGER"),("merged_into","BLOB")):
+    c.execute("ALTER TABLE tasks ADD COLUMN %s %s" % (col, typ))
+c.execute("INSERT INTO archive (nf,f1,f2,f3,f4,f5,f6,f7,f8,f9,fx) "
+          "VALUES (10,?,?,?,?,?,?,?,?,?,?)",
+          (b"2026-01-01 00:00:01", b"feat/w", b"s:1", b"/d/w", b"c", b"wide row",
+           b"main", b"uuid=u", b"1700000000", b"feature/camp"))
+c.execute("PRAGMA user_version=2")
+c.commit()
+PYW
+w39(){ env CC_STATE_DB="$W39/cc-state.db" "$CC/cc-state" "$@"; }
+eq "39 a v2 10-field archive row survives the widening" \
+  "$(w39 dump archive)" "$(printf '2026-01-01 00:00:01\tfeat/w\ts:1\t/d/w\tc\twide row\tmain\tuuid=u\t1700000000\tfeature/camp')"
+eq "39 ...and its overflow became the merged_into COLUMN" \
+  "$(python3 -c 'import sqlite3,sys
+c=sqlite3.connect(sys.argv[1])
+mi,fx = c.execute("SELECT merged_into, fx FROM archive").fetchone()
+print("%s/%s" % (mi.decode(), "null" if fx is None else "left-in-fx"))' "$W39/cc-state.db")" "feature/camp/null"
+rm -rf "$W39"
 
 # A migration that fails AFTER the library file was created must take it back down. The
 # fixture below (read-only DIRECTORY) cannot reach that path — sqlite never gets to create

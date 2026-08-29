@@ -119,12 +119,31 @@ def _db_path():
     return os.environ.get("CC_STATE_DB") or os.path.join(
         os.path.expanduser("~"), ".config", "cc-stack", "cc-state.db")
 
-# store → how many dedicated columns. Sized to today's widest row: a tasks row is 8
-# fields, an archive row is that plus merged-at, the sidecar 3, the tabs ledger 5.
-# Columns are f1..fN, not dir/branch/state: naming them means the verbs stop taking
-# fields by POSITION, and that is the model convergence of phase D — doing it here
-# would put this task's diff on top of that one's and make a regression unattributable.
-COLS = {"tasks": 8, "status": 3, "archive": 9, "tabs": 5}
+# The columns each store's row is spread over, BY NAME (§3.1). D2: they used to be
+# f1..fN, which made every verb take fields by POSITION — the same shape as the awk
+# parsing whose field-shift bugs started this whole campaign.
+#
+# What did NOT go away with the names: `nf` and `fx`. The D plan's §1 assumed naming
+# forces dropping them and priced two "costs" on that assumption; both were wrong. They
+# are round-trip MACHINERY, not semantics, and they are orthogonal to what the columns
+# are called — so `dump` stays byte-exact and the C-phase pins hold. See _to_row.
+#
+# `archive` is a tasks row plus two: merged_at, and merged_into which until D2 rode in
+# `fx` (it was appended to the LINE, which is what the board and gwt-log read). Naming
+# it promotes the same fact to a column without changing a byte of dump's output.
+# `tasks` deliberately does NOT carry merged_at/merged_into: §3.1's own trade-off moves
+# an archived row OUT to the archive table, so a live task row can never have them.
+NAMES = {
+    "tasks":   ("created_at", "branch", "surface_ref", "dir",
+                "caller_ref", "task", "parent", "launch_args"),
+    "archive": ("created_at", "branch", "surface_ref", "dir",
+                "caller_ref", "task", "parent", "launch_args", "merged_at", "merged_into"),
+    "tabs":    ("suuid", "owner", "dir", "session", "ts"),
+}
+COLS = dict((store, len(names)) for store, names in NAMES.items())
+COLS["status"] = 3          # a projection, not a table — see _get_status
+# The v1/v2 widths, needed only by the one-way rebuild in _upgrade.
+OLD_COLS = {"tasks": 8, "archive": 9, "tabs": 5}
 
 # D 期（模型收敛）：真正的表只剩三张。`status` 仍是一个 STORE —— 动词、dump / load、沙箱
 # 变量全部照旧 —— 但它不再有自己的表，而是 tasks 上两列的投影（§3.1「sidecar 只是任务行的
@@ -132,18 +151,15 @@ COLS = {"tasks": 8, "status": 3, "archive": 9, "tabs": 5}
 # 同一道缝。副作用是一条不变量被结构化了：状态行只能属于一个已存在的任务行，孤儿 sidecar
 # 从此无处可存（今天 task-prune 本来就会扫掉它们）。
 TABLES = ("tasks", "archive", "tabs")
-SCHEMA_VERSION = 2
-# tasks 上因收敛新增的列。前两列吃掉 worktree-status.tsv；tab_opened_ts 吃掉 $TMPDIR 去重
-# 标记。全部可空 —— 一行没有状态、没开过 tab，都是常态而不是缺省值。
-# merged_at / merged_into 是 §3.1 列清单里的后两个，在 D-min 下**恒为 NULL**，这不是缺陷：
-# 同一条清单的取舍段写着「归档行在写入时移出到 archive 表」，所以一条 merged_at 非空的行
-# 定义上已经不在 tasks 里了。这两个事实今天落在归档行的第 9/10 个字段上（cmd_task_archive），
-# 因为 archive 在 D-min 仍是纯行存储 —— dump archive 的字节格式就是板与 gwt-log 读的东西。
-# 保留这两列而不是删掉：它们是 D-full 给 archive 表命名列时这两个事实的落点。
-STATE_COLS = (("state", "BLOB"), ("state_ts", "BLOB"), ("tab_opened_ts", "INTEGER"),
-              ("merged_at", "INTEGER"), ("merged_into", "BLOB"))
+SCHEMA_VERSION = 3
+# tasks 上不属于 TSV 行的列。前两列吃掉 worktree-status.tsv；tab_opened_ts 吃掉 $TMPDIR
+# 去重标记。全部可空 —— 一行没有状态、没开过 tab，都是常态而不是缺省值。
+# （D 期一度还在这里放了 merged_at / merged_into。D2 把它们移到 archive 表上：§3.1 的取舍
+# 段说归档行写入时移出到 archive，所以一条活着的任务行永远不可能带这两个值。）
+STATE_COLS = (("state", "BLOB"), ("state_ts", "BLOB"), ("tab_opened_ts", "INTEGER"))
 # 导入顺序：tasks 必须在 status 之前 —— 状态要落到任务行上，任务行还不存在就全丢了。
-# sorted(COLS) 恰好把 status 排在 tasks 前面,所以这个顺序不能靠字典序。
+# 字典序恰好把 status 排在 tasks 前面,所以这个顺序不能靠排序得出（变异确认：换成字典序
+# 打红 3 条）。
 MIGRATE_ORDER = ("tasks", "archive", "tabs", "status")
 
 # Three things the row↔column round trip needs, none of them optional:
@@ -162,41 +178,77 @@ MIGRATE_ORDER = ("tasks", "archive", "tabs", "status")
 # so every table carries a monotonic seq and every read is ORDER BY seq. task-prune
 # --compact's newest-per-dir depends on it; this is not an optimization.
 def _cols(store):
-    return ", ".join("f%d" % (i + 1) for i in range(COLS[store]))
+    return ", ".join(NAMES[store])
 
-def _schema(conn):
+def _create(conn):
     for store in TABLES:
         conn.execute("CREATE TABLE IF NOT EXISTS %s (seq INTEGER PRIMARY KEY, "
-                     "nf INTEGER NOT NULL, %s, fx BLOB)"
-                     % (store, ", ".join("f%d BLOB" % (i + 1)
-                                         for i in range(COLS[store]))))
+                     "nf INTEGER NOT NULL, %s, fx BLOB%s)"
+                     % (store, ", ".join("%s BLOB" % c for c in NAMES[store]),
+                        "".join(", %s %s" % (c, t) for c, t in STATE_COLS)
+                        if store == "tasks" else ""))
+
+def _schema(conn):
+    _create(conn)
     _upgrade(conn)
 
-def _upgrade(conn):
-    """v1（四张表）→ v2（三张表 + tasks 上的五列）。库内迁移，不碰磁盘上的任何文件。
+def _rebuild_named(conn, have):
+    """v1/v2 的 `f1..fN` → v3 的具名列。
 
-    幂等：先看 user_version，再逐列检查 PRAGMA table_info —— 一个被打断的升级下次接着做，
-    而不是在已存在的列上 ALTER 失败。整个折叠在一个事务里，失败则库停在 v1、按 v1 路径
-    继续跑（沿用 C 期的降级契约）。"""
+    重建而不是 `RENAME COLUMN`，因为形状本身也变了：`archive` 多一列（`merged_into`，
+    此前作为第 10 个字段寄居在 `fx` 里），`tasks` 少两列（`merged_at`/`merged_into`，在
+    那张表上永远是 NULL）。整个搬运走 `_to_line` → `_to_row`，也就是说「第 10 个字段从
+    `fx` 升格成列」是宽度变化的**自然结果**，没有一处手写的字段搬移——手写的那种正是
+    这场战役一直在消灭的东西。"""
+    st = [c for c, _ in STATE_COLS if c in have]     # v2 有这些列，v1 没有
+    carried = []
+    if st:
+        for row in conn.execute("SELECT f4, %s FROM tasks ORDER BY seq" % ", ".join(st)):
+            vals = dict(zip(st, row[1:]))
+            if any(v is not None for v in vals.values()):
+                carried.append(("" if row[0] is None else _dec(row[0]),
+                                [vals.get(c) for c, _ in STATE_COLS]))
+    data = {}
+    for store in TABLES:
+        old_n = OLD_COLS[store]
+        data[store] = [_to_line(r, old_n) for r in conn.execute(
+            "SELECT nf, %s, fx FROM %s ORDER BY seq"
+            % (", ".join("f%d" % (i + 1) for i in range(old_n)), store))]
+    for store in TABLES:
+        conn.execute("DROP TABLE %s" % store)
+    _create(conn)
+    for store in TABLES:
+        n = COLS[store]
+        conn.executemany("INSERT INTO %s (nf, %s, fx) VALUES (%s)"
+                         % (store, _cols(store), ", ".join("?" * (n + 2))),
+                         [_to_row(l, n) for l in data[store]])
+    _restore(conn, carried)
+
+def _upgrade(conn):
+    """v1（四张表）/ v2（三张表 + 位置列）→ v3（具名列）。库内迁移，不碰磁盘上任何文件。
+
+    幂等靠两个独立的问题，不靠版本号一个：`tasks` 到底长什么样（有 `f1` 就是旧形状），
+    以及 `status` 表在不在。一个被打断的升级下次接着做，而不是在已经改过的表上重来。
+    整个过程一个事务，失败则库停在原版本、按原路径继续跑（沿用 C 期的降级契约）。"""
     if conn.execute("PRAGMA user_version").fetchone()[0] >= SCHEMA_VERSION:
         return
     have = set(r[1] for r in conn.execute("PRAGMA table_info(tasks)"))
-    todo = [(c, t) for c, t in STATE_COLS if c not in have]
+    legacy = "f1" in have
     sidecar = conn.execute("SELECT count(*) FROM sqlite_master "
                            "WHERE type='table' AND name='status'").fetchone()[0]
     conn.execute("BEGIN IMMEDIATE")
     try:
-        for col, typ in todo:
-            conn.execute("ALTER TABLE tasks ADD COLUMN %s %s" % (col, typ))
+        if legacy:
+            _rebuild_named(conn, have)
         if sidecar:
             rows = [_to_line(r, 3) for r in conn.execute(
                 "SELECT nf, f1, f2, f3, fx FROM status ORDER BY seq")]
             # ONLY when the table actually holds rows. _put_status clears every carried
             # state before re-applying, so folding an EMPTY sidecar would wipe state that
             # is already in the columns — which is exactly the new→old→new round trip: old
-            # code re-creates an empty `status` and stamps the version back to 1, leaving
-            # the real state sitting untouched in the columns it cannot see. Downgrading
-            # must cost visibility, never data.
+            # code re-creates an empty `status` and stamps the version back, leaving the
+            # real state sitting untouched in the columns it cannot see. Downgrading must
+            # cost visibility, never data.
             if rows:
                 _put_status(conn, rows)
             conn.execute("DROP TABLE status")
@@ -397,7 +449,7 @@ def _get_status(conn):
     return ["\t".join((canon_or_raw(_dec(d)) if d is not None else "",
                        "" if st is None else _dec(st),
                        "" if ts is None else _dec(ts)))
-            for d, st, ts in conn.execute("SELECT f4, state, state_ts FROM tasks "
+            for d, st, ts in conn.execute("SELECT dir, state, state_ts FROM tasks "
                                           "WHERE state IS NOT NULL ORDER BY seq")]
 
 def _put_status(conn, lines):
@@ -411,7 +463,7 @@ def _put_status(conn, lines):
     A row naming a dir with NO tasks row lands nowhere and is dropped — the orphan
     class task-prune already sweeps, now structurally unrepresentable (plan §1.5 A)."""
     rows = [(seq, "" if d is None else _dec(d))
-            for seq, d in conn.execute("SELECT seq, f4 FROM tasks ORDER BY seq")]
+            for seq, d in conn.execute("SELECT seq, dir FROM tasks ORDER BY seq")]
     conn.execute("UPDATE tasks SET state=NULL, state_ts=NULL")
     for line in lines:
         f = line.split("\t")
@@ -428,17 +480,17 @@ def _put_status(conn, lines):
                       _enc(f[2]) if len(f) > 2 else None, hit))
 
 # The columns that do NOT live in the TSV line. Every verb above the storage layer still
-# works on whole lines, so a rewrite of `tasks` is DELETE + re-INSERT of f1..f8 — which
+# works on whole lines, so a rewrite of `tasks` is DELETE + re-INSERT of the row columns —
 # silently took these with it until this pair existed. `task-set-ref <dir> s:9` wiped the
 # state of every worktree on the board, and the board just rendered "-". Anything keyed to
 # a task row rather than to its text has to be carried across the rewrite by hand.
-CARRIED = ("state", "state_ts", "tab_opened_ts", "merged_at", "merged_into")
+CARRIED = ("state", "state_ts", "tab_opened_ts")
 
 def _carry(conn):
     """Snapshot the carried columns, keyed by the row's dir. Rows carrying nothing are
     skipped so the common rewrite (no state anywhere) stays free."""
     out = []
-    for row in conn.execute("SELECT f4, %s FROM tasks ORDER BY seq" % ", ".join(CARRIED)):
+    for row in conn.execute("SELECT dir, %s FROM tasks ORDER BY seq" % ", ".join(CARRIED)):
         vals = list(row[1:])
         if any(v is not None for v in vals):
             out.append(("" if row[0] is None else _dec(row[0]), vals))
@@ -451,7 +503,7 @@ def _restore(conn, carried):
     if not carried:
         return
     rows = [(seq, "" if d is None else _dec(d))
-            for seq, d in conn.execute("SELECT seq, f4 FROM tasks ORDER BY seq")]
+            for seq, d in conn.execute("SELECT seq, dir FROM tasks ORDER BY seq")]
     sets = ", ".join("%s=?" % c for c in CARRIED)
     for raw, vals in carried:
         c = canon(raw)
@@ -661,7 +713,7 @@ def _task_seq(conn, dir_):
     """seq of the NEWEST tasks row for <dir>, or None. dir_match, like every verb."""
     c = canon(dir_)
     hit = None
-    for seq, d in conn.execute("SELECT seq, f4 FROM tasks ORDER BY seq"):
+    for seq, d in conn.execute("SELECT seq, dir FROM tasks ORDER BY seq"):
         if dir_match("" if d is None else _dec(d), dir_, c):
             hit = seq
     return hit
