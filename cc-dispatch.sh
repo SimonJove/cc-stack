@@ -338,7 +338,8 @@ _ccsend_calibrate() {  # $1 = ref, $2 = dir — self-calibration (hardening laye
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# opened-tabs ledger (2026-08-16) — ~/.config/cc-stack/opened-tabs.tsv, CC_TABS_FILE overrides.
+# opened-tabs ledger (2026-08-16) — a store in the state library (CC_STATE_DB); it was
+# ~/.config/cc-stack/opened-tabs.tsv, which the library imported on first open.
 # EVERY tab this stack opens is recorded here, keyed by the only stable identity a cmux tab has:
 # its surface UUID (short refs like surface:283 DRIFT as panes open and close — they are addresses,
 # never identities).
@@ -1127,7 +1128,7 @@ fi
 #     ④ close by the STABLE uuid
 #   No live tab for that dir = nothing to do (rc 0): gwt-rm --close must stay idempotent.
 # Usage: cc-dispatch.sh close <worktree-dir>
-# Related env: CC_TASKS_FILE (board), CC_TABS_FILE (opened-tabs ledger), CC_CMUX_SESSIONS
+# Related env: CC_STATE_DB (board + opened-tabs ledger), CC_CMUX_SESSIONS
 #   (session store), CC_CALLER_SURFACE_UUID (override for $CMUX_SURFACE_ID)
 close)
 shift
@@ -1340,7 +1341,7 @@ exit 1
 #   nothing is pruned and every unresolved row prints as "dead?" instead of "dead".
 # Usage: cc-dispatch.sh tabs [--all]
 #   (default) only rows this session opened;  --all  every row in the ledger
-# Related env: CC_TABS_FILE (ledger), CC_CALLER_SURFACE_UUID (override for $CMUX_SURFACE_ID)
+# Related env: CC_STATE_DB (ledger), CC_CALLER_SURFACE_UUID (override for $CMUX_SURFACE_ID)
 tabs)
 shift
 tabs_all=""

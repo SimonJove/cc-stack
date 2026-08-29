@@ -337,16 +337,18 @@ input="$(cat 2>/dev/null || true)"
 # 2026-08-22). Payload-independent on purpose: it decides on the store, never on the event.
 #
 # This is the ONE place outside cc-state that still knows where state lives, and it is a
-# deliberate exception, not a missed conversion: a facade call costs a python3 startup (~15 ms
+# deliberate exception, not a missed conversion. Since phase D it needs ONE variable to know
+# it: CC_TASKS_FILE and friends are retired, and the legacy TSV is by definition beside the
+# library (cc-state's _p) — so this duplicates a derivation rule, not a second knob. a facade call costs a python3 startup (~15 ms
 # measured) against a `[ -f ]` at 0.019 ms, on the hottest path in the stack. §39 pins the
 # zero-python-starts contract; a comment alone did not survive the last refactor.
 #
 # BOTH legs are required. Library only, and a machine that still has legacy TSVs never triggers
 # the migration that would import them — its state silently stops being recorded. TSVs only, and
 # the hook goes dark forever the moment the migration renames them away.
-tasks="${CC_TASKS_FILE:-$HOME/.config/cc-stack/worktree-tasks.tsv}"
 db="${CC_STATE_DB:-$HOME/.config/cc-stack/cc-state.db}"
-[ -f "$db" ] || [ -f "$tasks" ] || exit 0
+dbdir="${db%/*}"; [ "$dbdir" = "$db" ] && dbdir="."   # a bare filename has no dirname
+[ -f "$db" ] || [ -f "$dbdir/worktree-tasks.tsv" ] || exit 0
 
 # Parse the three fields we need from the hook payload: event \t cwd \t notification-message
 # (TAB-separated, message last). python reads real stdin via -c (no heredoc here); any parse

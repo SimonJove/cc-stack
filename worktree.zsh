@@ -215,10 +215,10 @@ gwt-ls() { git worktree list }
 #   cc-board.sh in bash so the SAME implementation works from any shell (Claude's non-interactive
 #   Bash included — the old zsh-only render silently printed nothing there). Args are forwarded
 #   (--all: rows from every repo, not just the current one).
-#   data source 1: $CC_TASKS_FILE, appended by cc-dispatch.sh surface whenever it opens a tab
+#   data source 1: the tasks store, appended by cc-dispatch.sh surface whenever it opens a tab
 #     fields: time \t branch \t surface \t dir \t caller-tab \t task-summary \t parent-branch \t
 #             launch-args (uuid/provider/pm/model — what gwt-resume replays; empty on old rows)
-#   data source 2: $CC_STATUS_FILE sidecar (dir \t state \t unix-ts), written by cc-hooks.sh status on
+#   data source 2: the agent-state columns (dir \t state \t unix-ts), written by cc-hooks.sh status on
 #     UserPromptSubmit/Stop/permission-Notification → STATUS column, joined on dir. idle = not-running,
 #     NOT done — "ready" still comes only from gwt-done + a clean tree (gwt-tree), never from here.
 #   Output contract (unchanged since the zsh original): header has TAB before STATUS; STATUS

@@ -15,10 +15,13 @@ eq(){ [ "$2" = "$3" ] && ok "$1" || no "$1" "$2" "$3"; }
 # The suite must never write the human's real ledgers or trust store. "Add an override at every
 # call site" has now failed twice (leaked cmux workspaces, then §19b's `gwt-rm wtguard --branch`
 # rewriting the live TSVs), so isolation is two layers instead of a habit:
-#   1. SANDBOX — the four ledger vars and the trust-store override are exported here, so a call
+#   1. SANDBOX — the library path and the trust-store override are exported here, so a call
 #      site that forgets an override lands in a temp dir instead of the live file. Sections that
 #      used to `unset` these now call cc_sandbox_ledgers to return to the sandbox, never to the
-#      live default path.
+#      live default path. Phase D collapsed this to ONE ledger variable (spec §8 invariant 9):
+#      the four CC_*_FILE overrides are retired and a legacy TSV is found beside CC_STATE_DB.
+#      That is the stronger form of layer 1 — "half the overrides set" was not a habit failure
+#      but a representable state, and it once migrated the live ledgers into a scratch library.
 #   2. TAIL ASSERTION (§24) — the live files are snapshotted now and re-checked at the end.
 #      What it can assert is constrained by churn: a board read prunes-on-read (rewriting
 #      worktree-tasks.tsv) and any live agent's status hook rewrites worktree-status.tsv, so
@@ -27,18 +30,13 @@ eq(){ [ "$2" = "$3" ] && ok "$1" || no "$1" "$2" "$3"; }
 #      appear, no lock may be left behind, and the overrides must still be sandboxed at the end.
 CC_TEST_SANDBOX="$(mktemp -d)"
 cc_sandbox_ledgers(){
-  export CC_TASKS_FILE="$CC_TEST_SANDBOX/worktree-tasks.tsv"
-  export CC_STATUS_FILE="$CC_TEST_SANDBOX/worktree-status.tsv"
-  export CC_ARCHIVE_FILE="$CC_TEST_SANDBOX/worktree-tasks-archive.tsv"
-  export CC_TABS_FILE="$CC_TEST_SANDBOX/opened-tabs.tsv"
   export CC_TRUST_CFG_OVERRIDE="$CC_TEST_SANDBOX/claude.json"
-  # The engine's library. It joins the four legacy vars rather than replacing them: after the
-  # swap the TSV paths are still load-bearing — they are where the MIGRATION looks for legacy
-  # data — so a section that points them somewhere must still be able to, and the library has
-  # to be pointed separately (deriving it from one of the four would put the library wherever
-  # that one variable happened to be set, spec 8 invariant 9).
+  # The engine's library — and, since phase D, the ONLY thing a caller points anywhere. The
+  # legacy TSVs are wherever the library is, so pointing the library moves the whole store set
+  # at once and a section can no longer set half of it.
   export CC_STATE_DB="$CC_TEST_SANDBOX/cc-state.db"
-  rm -f "$CC_TASKS_FILE" "$CC_STATUS_FILE" "$CC_ARCHIVE_FILE" "$CC_TABS_FILE" \
+  rm -f "$CC_TEST_SANDBOX/worktree-tasks.tsv" "$CC_TEST_SANDBOX/worktree-status.tsv" \
+        "$CC_TEST_SANDBOX/worktree-tasks-archive.tsv" "$CC_TEST_SANDBOX/opened-tabs.tsv" \
         "$CC_STATE_DB" "$CC_STATE_DB-wal" "$CC_STATE_DB-shm"
   printf '{"projects":{}}\n' > "$CC_TRUST_CFG_OVERRIDE"
 }
@@ -46,13 +44,13 @@ cc_sandbox_ledgers
 # ── Fixture seeding through the facade ────────────────────────────────────────────────────────
 # The fixtures in this suite are RAW BYTES on purpose, and that is not laziness: a 7-field legacy
 # row, an empty middle field, a lone non-UTF-8 byte, a row no verb would ever compose are
-# expressible as bytes and in no other way. They used to be `printf > "$CC_TASKS_FILE"`, which
+# expressible as bytes and in no other way. They used to be `printf > "$tasks_tsv"`, which
 # hardwired every one of them to "a store is a file I can redirect into". `cc-state load` is the
 # byte-level write half of the dump/load pair, so a fixture keeps exactly the control it had
 # while the suite stops naming the backend — the same move Task 1 made for the callers.
-#   st_seed   <store> [<db>]   stdin REPLACES the store   (the old `> "$CC_TASKS_FILE"`)
-#   st_append <store> [<db>]   stdin is appended to it    (the old `>> "$CC_TASKS_FILE"`)
-#   st_dump   <store> [<db>]   the store's raw bytes      (the old `cat "$CC_TASKS_FILE"`)
+#   st_seed   <store> [<db>]   stdin REPLACES the store   (the old `> "$tasks_tsv"`)
+#   st_append <store> [<db>]   stdin is appended to it    (the old `>> "$tasks_tsv"`)
+#   st_dump   <store> [<db>]   the store's raw bytes      (the old `cat "$tasks_tsv"`)
 # Reads go the other way: `"$CC/cc-state" dump <store>` in place of cat/awk/grep on the file.
 # dump is the RAW passthrough — a filtered verb (task-list) would hide dead/duplicate rows at
 # read time and make every "the sweep really happened" assertion vacuously green.
@@ -125,7 +123,7 @@ _cc_live_tmp_rows(){ echo $(( $(_cc_live_keys | grep -cE ' (/private)?(/var/fold
 # function on purpose — bash 3.2 mis-parses a `case` pattern's `)` inside a `$( )` substitution.
 _cc_overrides_escaped(){
   local v n=0
-  for v in "$CC_TASKS_FILE" "$CC_STATUS_FILE" "$CC_ARCHIVE_FILE" "$CC_TABS_FILE" "$CC_STATE_DB" "$CC_TRUST_CFG_OVERRIDE"; do
+  for v in "$CC_STATE_DB" "$CC_TRUST_CFG_OVERRIDE"; do
     case "$v" in "$CC_TEST_SANDBOX"/*) ;; *) n=$((n+1)) ;; esac
   done
   echo "$n"
@@ -225,8 +223,7 @@ B33="$(s33cn "$(mktemp -d)")"    # registered board dir — physical form, like 
 U33="$(s33cn "$(mktemp -d)")"    # a dir with no board row
 V33="$(mktemp -d)"               # mktemp hands back the LOGICAL $TMPDIR form (/var/...)
 P33="$(s33cn "$V33")"            # ...its physical twin (/private/var/...)
-export CC_TASKS_FILE="$S33/tasks.tsv" CC_STATUS_FILE="$S33/status.tsv" \
-       CC_STATE_DB="$S33/cc-state.db"
+export CC_STATE_DB="$S33/cc-state.db"
 printf '2026-01-01 00:00:00\tfeat/33\tsurface:33\t%s\tsurface:1\ttask 33\n' "$B33" | st_seed tasks
 printf '2026-01-01 00:00:00\tfeat/33L\tsurface:34\t%s\tsurface:1\tlegacy logical row\n' "$V33" | st_append tasks
 s33pay(){ python3 -c 'import json,sys; print(json.dumps({"hook_event_name":sys.argv[1],"cwd":sys.argv[2],"message":sys.argv[3]}))' "$1" "$2" "$3"; }
@@ -268,7 +265,7 @@ S33P
 chmod +x "$S33F8/python3"
 : > "$S33F8/pylog"
 printf '%s' "$(s33pay UserPromptSubmit "$B33" '')" \
-  | env PATH="$S33F8:$PATH" CC_PY_LOG="$S33F8/pylog" CC_TASKS_FILE="$S33F8/absent.tsv" \
+  | env PATH="$S33F8:$PATH" CC_PY_LOG="$S33F8/pylog" \
     CC_STATE_DB="$S33F8/absent.db" \
     bash "$CC/cc-hooks.sh" status >/dev/null 2>&1
 eq "33 no board: zero python3 starts (F8)" "$(wc -l < "$S33F8/pylog" | tr -d ' ')" "0"
@@ -291,7 +288,7 @@ eq "33 sidecar never holds ready" "$("$CC/cc-state" dump status | grep -c ready)
 # awk it used to feed is gone, the [ -f ] gate itself stays)
 eq "33 hook has no mkdir lock left"          "$(grep -c 'mkdir "\$lock"' "$CC/cc-hooks.sh")" "0"
 eq "33 hook has no tmp+mv rewrite left"      "$(grep -c 'mv "\$tmp"' "$CC/cc-hooks.sh")" "0"
-eq "33 the no-board fast path is present"    "$(grep -cF 'tasks="${CC_TASKS_FILE:-' "$CC/cc-hooks.sh")" "1"
+eq "33 the no-board fast path is present"    "$(grep -cF '[ -f "$db" ] || [ -f "$dbdir/worktree-tasks.tsv" ] || exit 0' "$CC/cc-hooks.sh")" "1"
 eq "33 hook delegates via one facade call"   "$(grep -c 'cc-state" task-set-state' "$CC/cc-hooks.sh")" "1"
 # the worktree branch's python heredoc must have survived untouched: still the file's ONLY
 # heredoc, still apostrophe-free inside (bash 3.2 mis-parses one in a heredoc nested in $( ))
@@ -307,7 +304,7 @@ echo "== 2b. cc-hooks.sh status: agent-state sidecar =="
 cn(){ CDPATH= cd -- "$1" >/dev/null 2>&1 && pwd -P; }
 SB="$(cn "$(mktemp -d)")"; NB="$(cn "$(mktemp -d)")"; RD="$(cn "$(mktemp -d)")"   # SB: board dir  NB: not on the board  RD: render-only
 S2B=$(mktemp -d)
-export CC_TASKS_FILE="$S2B/t.tsv" CC_STATUS_FILE="$S2B/s.tsv" CC_STATE_DB="$S2B/cc-state.db"
+export CC_STATE_DB="$S2B/cc-state.db"
 printf '2026-01-01 00:00:00\tfeat/B\tsurface:2\t%s\tsurface:1\tdo B\n' "$SB" | st_seed tasks
 hj(){ python3 -c 'import json,sys; print(json.dumps({"hook_event_name":sys.argv[1],"cwd":sys.argv[2],"message":sys.argv[3]}))' "$1" "$2" "$3"; }
 hr(){ printf '%s' "$1" | "$CC/cc-hooks.sh" status 2>&1; }               # hook runner: stdout+stderr together
@@ -338,7 +335,7 @@ printf '2026-01-01 00:00:00\tfeat/R\tsurface:5\t%s\tsurface:1\trender R\n' "$RD2
 printf '2026-01-01 00:00:00\tfeat/S\tsurface:6\t%s\tsurface:1\trender S\n' "$RD3" | st_append tasks
 now=$(date +%s)
 printf '%s\tworking\t%s\n%s\tidle\t%s\n%s\tblocked\t%s\n' "$RD" $((now-23*60)) "$RD2" $((now-2*3600)) "$RD3" $((now-5*60)) | st_seed status
-ROUT="$(CC_TASKS_FILE="$CC_TASKS_FILE" CC_STATUS_FILE="$CC_STATUS_FILE" zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; gwt-status --all" 2>/dev/null)"
+ROUT="$(zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; gwt-status --all" 2>/dev/null)"
 eq "render working(23m)"  "$(echo "$ROUT" | grep -c 'working(23m)')" "1"
 eq "render idle(2h)"      "$(echo "$ROUT" | grep -c 'idle(2h)')" "1"
 eq "render blocked(5m)"   "$(echo "$ROUT" | grep -c 'blocked(5m)')" "1"
@@ -346,7 +343,7 @@ eq "render dash w/o row"  "$(echo "$ROUT" | grep -F "$SB" | grep -c ' - ')" "1"
 eq "header has TAB+STATUS" "$(echo "$ROUT" | head -1 | grep -c 'TAB.*STATUS')" "1"
 # gwt-prune sweeps status rows whose dir no longer exists (sidecar stays consistent with the board)
 rm -rf "$RD3"
-CC_TASKS_FILE="$CC_TASKS_FILE" CC_STATUS_FILE="$CC_STATUS_FILE" zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; gwt-prune" >/dev/null 2>&1
+zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; gwt-prune" >/dev/null 2>&1
 # (Task 8, §4-trap cases) these two test the SWEEP's side effect on what is on disk, so the
 # read verb is `dump status` (raw passthrough) — a filtered verb like the board view would
 # hide dead rows at read time and make "swept" vacuously green
@@ -357,7 +354,7 @@ RR=$(mktemp -d); ( cd "$RR"; git init -q; git config user.email t@t; git config 
   mkdir .claude; git worktree add -q .claude/worktrees/wtS -b feat/S >/dev/null )
 SW="$(cd "$RR/.claude/worktrees/wtS" && pwd -P)"
 printf '%s\tidle\t%s\n' "$SW" "$(date +%s)" | st_append status
-CC_TASKS_FILE="$CC_TASKS_FILE" CC_STATUS_FILE="$CC_STATUS_FILE" zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; cd '$RR'; gwt-rm wtS" >/dev/null 2>&1
+zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; cd '$RR'; gwt-rm wtS" >/dev/null 2>&1
 # (Task 8 edge) the emptied sidecar may not even EXIST here: old form `grep -cF … 2>/dev/null`
 # printed 0 for a missing file; `dump status` of a missing file is silent rc 0 with no bytes,
 # and grep -c on empty input still prints 0 — same assertion, same value, no error path left
@@ -405,8 +402,7 @@ BRD=$(mktemp -d); ( cd "$BRD"; git init -q; git config user.email t@t; git confi
 "$CC/cc-merge.sh" set-parent "$BRD" feat/W1 feat/W
 BW="$(cn "$BRD/wtW")"; BW1="$(cn "$BRD/wtW1")"; OTH="$(cn "$(mktemp -d)")"; NORD="$(mktemp -d)"   # OTH: other repo row  NORD: not a repo
 S2C=$(mktemp -d)
-export CC_TASKS_FILE="$S2C/t.tsv" CC_STATUS_FILE="$S2C/s.tsv" CC_ARCHIVE_FILE="$S2C/a.tsv" \
-       CC_STATE_DB="$S2C/cc-state.db"
+export CC_STATE_DB="$S2C/cc-state.db"
 now=$(date +%s)
 printf '2026-01-01 00:00:01\tfeat/W\tsurface:31\t%s\tsurface:1\tboard task W (older)\tmain\n' "$BW"  | st_seed tasks
 printf '2026-01-01 00:00:02\tfeat/W\tsurface:32\t%s\tsurface:1\tboard task W\tmain\n' "$BW" | st_append tasks
@@ -451,18 +447,18 @@ brd "$BRD" >/dev/null
 eq "prune drops dead-dir row"      "$("$CC/cc-state" dump tasks | grep -c 'dead dir row')" "0"
 eq "prune keeps live rows"         "$("$CC/cc-state" dump tasks | wc -l | tr -d ' ')" "4"
 DF=$(mktemp -u); printf '2026-01-01 00:00:05\tfeat/G\tsurface:35\t%s\tsurface:1\tdead dir row\tmain\n' "/tmp/cc-board-gone-$$" | st_seed tasks "$DF.db"
-eq "all-dead message"              "$(CC_TASKS_FILE="$DF" CC_STATUS_FILE=/dev/null CC_STATE_DB="$DF.db" bash "$CC/cc-board.sh" 2>/dev/null)" "no registered worktree tasks"
+eq "all-dead message"              "$(CC_STATE_DB="$DF.db" bash "$CC/cc-board.sh" 2>/dev/null)" "no registered worktree tasks"
 eq "all-dead removes file"         "$([ -f "$DF" ] && echo yes || echo no)" "no"
 # _gwt_archive_branch: move ALL rows of a branch to the archive (+ drop their status rows), keep others
 TF=$(mktemp -u); SF=$(mktemp -u); AF=$(mktemp -u)
-export CC_TASKS_FILE="$TF" CC_STATUS_FILE="$SF" CC_ARCHIVE_FILE="$AF" CC_STATE_DB="$TF.db"
+export CC_STATE_DB="$TF.db"
 printf '2026-01-01 00:00:01\tfeat/W\tsurface:41\t%s\tsurface:1\tarch task W1\tmain\n' "$BW"  | st_seed tasks
 printf '2026-01-01 00:00:02\tfeat/W\tsurface:42\t%s\tsurface:1\tarch task W2\tmain\n' "$BRD" | st_append tasks
 printf '2026-01-01 00:00:03\tfeat/W1\tsurface:43\t%s\tsurface:1\tarch task W1b\tfeat/W\n' "$BW1" | st_append tasks
 # new-format row (8 live fields incl. launch-args) → archive must gain 9 fields, args intact
 printf '2026-01-01 00:00:04\tfeat/W\tsurface:47\t%s\tsurface:1\tarch task W3\tmain\tuuid=99999999-8888-7777-6666-555555555555:provider=glm:pm=auto:model=g1\n' "$BRD" | st_append tasks
 printf '%s\tidle\t%s\n%s\tidle\t%s\n%s\tidle\t%s\n' "$BW" "$now" "$BRD" "$now" "$BW1" "$now" | st_seed status
-zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; CC_TASKS_FILE='$TF' CC_STATUS_FILE='$SF' CC_ARCHIVE_FILE='$AF' _gwt_archive_branch feat/W" >/dev/null 2>&1
+zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; _gwt_archive_branch feat/W" >/dev/null 2>&1
 # (Task 8b) WHERE THE ROWS ENDED UP is a write side effect, so these read the raw store via
 # `dump` — the stores are exported to $TF/$SF/$AF above. A filtering verb must not appear here:
 # task-list skips dead dirs and dedups per dir AT READ TIME, so "moved" would report 0 with the
@@ -484,7 +480,7 @@ eq "other status row kept"           "$("$CC/cc-state" dump status | awk -F'\t' 
 "$CC/cc-merge.sh" set-parent "$BRD" feat/W1 feat/W
 "$CC/cc-merge.sh" done "$BRD" feat/W1 true
 ( cd "$BRD/wtW1" && git commit -q --allow-empty -m w1 )
-printf '\ny\n' | zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; cd '$BRD'; CC_TASKS_FILE='$TF' CC_STATUS_FILE='$SF' CC_ARCHIVE_FILE='$AF' gwt-merge feat/W1" >/dev/null 2>&1; gmrc=$?
+printf '\ny\n' | zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; cd '$BRD'; gwt-merge feat/W1" >/dev/null 2>&1; gmrc=$?
 eq "gwt-merge exit 0"                "$gmrc" "0"
 # (Task 8b edge, same as Task 8's sidecar one) the old awk carried `2>/dev/null` because the
 # tasks file may not EXIST here (every row moved out → the rewriter deletes it); `dump` of a
@@ -541,8 +537,8 @@ mk34(){  # the B row's 7th field is "camp": the PARENT fallback a branch without
 # PATH without cmux → deterministic "?" TAB cells and no liveness notes; CC_SEND_FAILLOG silenced.
 # Flags forward one per argument (${2:-} ${3:-}): a quoted "--archive --all" would arrive as ONE
 # argument under zsh's no-split expansion and silently render a different board.
-brd34(){ ( cd "${1:-$B34}" && env PATH=/usr/bin:/bin CC_STATE_DB="$DB_34" CC_TASKS_FILE="$T34" CC_STATUS_FILE="$S34" \
-    CC_STATE_DB="$DB_34" CC_ARCHIVE_FILE="$A34" CC_SEND_FAILLOG=/dev/null bash "$CC/cc-board.sh" ${2:-} ${3:-} ) 2>/dev/null; }
+brd34(){ ( cd "${1:-$B34}" && env PATH=/usr/bin:/bin CC_STATE_DB="$DB_34" \
+    CC_STATE_DB="$DB_34" CC_SEND_FAILLOG=/dev/null bash "$CC/cc-board.sh" ${2:-} ${3:-} ) 2>/dev/null; }
 row34(){ echo "$1" | awk -v d="$2" '$5==d'; }                       # board row by DIR column
 cell34(){ row34 "$1" "$2" | awk -v c="$3" '{print $c}'; }           # one column of that row
 mk34; BO34="$(brd34 "$B34" --all)"
@@ -598,19 +594,19 @@ brd34 "$B34" >/dev/null
 # (Task 8b, §4-trap cases) all four test the SWEEP's side effect on disk, so the read verb is
 # `dump` (raw passthrough), env-scoped to this section's stores. task-list would skip the dead
 # dir and dedup per dir at READ time and report "0"/"4" with the sweep never run: vacuously green
-eq "34 render prunes dead task rows via facade"   "$(CC_STATE_DB="$DB_34" CC_TASKS_FILE="$T34" "$CC/cc-state" dump tasks | grep -c '34 dead row')" "0"
-eq "34 render prunes dead sidecar rows via facade" "$(CC_STATE_DB="$DB_34" CC_STATUS_FILE="$S34" "$CC/cc-state" dump status | grep -cF "$DDEAD34")" "0"
-eq "34 render keeps live task rows"                "$(CC_STATE_DB="$DB_34" CC_TASKS_FILE="$T34" "$CC/cc-state" dump tasks | wc -l | tr -d ' ')" "4"
-eq "34 render keeps live sidecar rows"             "$(CC_STATE_DB="$DB_34" CC_STATUS_FILE="$S34" "$CC/cc-state" dump status | wc -l | tr -d ' ')" "2"
+eq "34 render prunes dead task rows via facade"   "$(CC_STATE_DB="$DB_34" "$CC/cc-state" dump tasks | grep -c '34 dead row')" "0"
+eq "34 render prunes dead sidecar rows via facade" "$(CC_STATE_DB="$DB_34" "$CC/cc-state" dump status | grep -cF "$DDEAD34")" "0"
+eq "34 render keeps live task rows"                "$(CC_STATE_DB="$DB_34" "$CC/cc-state" dump tasks | wc -l | tr -d ' ')" "4"
+eq "34 render keeps live sidecar rows"             "$(CC_STATE_DB="$DB_34" "$CC/cc-state" dump status | wc -l | tr -d ' ')" "2"
 mk34
 printf '2026-01-01 00:00:07\tfeat/34X\tsurface:69\t%s\tsurface:1\t34 dead sidecar row\tmain\n' "$DDEAD34" | st_append tasks "$DB_34"
 printf '%s\tidle\t%s\n' "$DDEAD34" "$NOW34" | st_append status "$DB_34"
 brd34 "$B34" --archive >/dev/null
 # the dead row is still THERE — "not swept" can only be read raw (a filtered view hides it)
-eq "34 archive render spares the sidecar" "$(CC_STATE_DB="$DB_34" CC_STATUS_FILE="$S34" "$CC/cc-state" dump status | grep -cF "$DDEAD34")" "1"
+eq "34 archive render spares the sidecar" "$(CC_STATE_DB="$DB_34" "$CC/cc-state" dump status | grep -cF "$DDEAD34")" "1"
 TONE34=$(mktemp -u)
 printf '2026-01-01 00:00:05\tfeat/34G\tsurface:67\t%s\tsurface:1\t34 dead row\tmain\n' "$(mktemp -u)" | st_seed tasks "$DB_34"
-eq "34 all-dead message" "$(CC_STATE_DB="$DB_34" CC_TASKS_FILE="$TONE34" CC_STATUS_FILE=/dev/null \
+eq "34 all-dead message" "$(CC_STATE_DB="$DB_34" \
   bash "$CC/cc-board.sh" 2>/dev/null)" "no registered worktree tasks"
 eq "34 all-dead removes file" "$([ -f "$TONE34" ] && echo yes || echo no)" "no"
 # the structural swap: the board keeps rendering + the git joins; the lock, the line droppers,
@@ -633,7 +629,7 @@ echo "== 20. TSV empty-field integrity + worktree lifecycle guards =="
 # TSVs goes through awk -F'\t' now, and every rewrite re-emits $0 verbatim.
 cn(){ CDPATH= cd -- "$1" >/dev/null 2>&1 && pwd -P; }
 TT=$(mktemp -u); TS=$(mktemp -u); TA=$(mktemp -u)
-export CC_TASKS_FILE="$TT" CC_STATUS_FILE="$TS" CC_ARCHIVE_FILE="$TA" CC_STATE_DB="$TT.db"
+export CC_STATE_DB="$TT.db"
 LA='uuid=11111111-2222-3333-4444-555555555555:provider=kimi:pm=plan:csuuid=AAAA-BBBB:suuid=CCCC-DDDD'
 E1="$(cn "$(mktemp -d)")"   # 7th field (parent) EMPTY — what a detached-HEAD dispatch writes
 E2="$(cn "$(mktemp -d)")"   # 5th field (caller) EMPTY
@@ -667,7 +663,7 @@ eq "render TASK with an empty caller"   "$(echo "$BE" | awk -v d="$E2" '$5==d{$1
 eq "render PARENT '-' when unresolvable" "$(echo "$BE" | awk -v d="$E1" '$5==d{print $3}')" "-"
 # (c) _gwt_tasks_rewrite (the gwt-rm / gwt-prune path)
 mkrows
-zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; CC_TASKS_FILE='$TT' _gwt_tasks_drop_dir '$E3'" >/dev/null 2>&1
+zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; _gwt_tasks_drop_dir '$E3'" >/dev/null 2>&1
 eq "rewrite drops the target row"       "$("$CC/cc-state" dump tasks | grep -c 'do E3')" "0"
 eq "rewrite keeps an empty PARENT row"  "$(shape tasks "$E1")" "$S_E1"
 eq "rewrite keeps an empty CALLER row"  "$(shape tasks "$E2")" "$S_E2"
@@ -675,14 +671,14 @@ eq "rewrite keeps a 7-field legacy row" "$(shape tasks "$E4")" "$S_E4"
 # (d) gwt-prune: dead-dir sweep + newest-per-dir dedup, still verbatim
 mkrows
 { printf '2026-01-01 00:00:00\tfeat/E2\tsurface:50\t%s\t\tolder E2 row\tfeat/par\t%s\n' "$E2" "$LA"; st_dump tasks; } | st_seed tasks
-zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; cd '$E1'; CC_TASKS_FILE='$TT' CC_STATUS_FILE='$TS' gwt-prune" >/dev/null 2>&1
+zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; cd '$E1'; gwt-prune" >/dev/null 2>&1
 eq "gwt-prune drops the older dup"      "$("$CC/cc-state" dump tasks | grep -c 'older E2 row')" "0"
 eq "gwt-prune keeps an empty CALLER row" "$(shape tasks "$E2")" "$S_E2"
 eq "gwt-prune keeps a 7-field legacy row" "$(shape tasks "$E4")" "$S_E4"
 # (e) _gwt_archive_branch: merged-at is APPENDED, so 8-field rows → 9, 7-field rows → 8
 mkrows; : | st_seed archive
-zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; CC_TASKS_FILE='$TT' CC_STATUS_FILE='$TS' CC_ARCHIVE_FILE='$TA' _gwt_archive_branch feat/E2" >/dev/null 2>&1
-zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; CC_TASKS_FILE='$TT' CC_STATUS_FILE='$TS' CC_ARCHIVE_FILE='$TA' _gwt_archive_branch feat/E4" >/dev/null 2>&1
+zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; _gwt_archive_branch feat/E2" >/dev/null 2>&1
+zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; _gwt_archive_branch feat/E4" >/dev/null 2>&1
 # FORMAT PINS again (same reason as shape()): merged-at is APPENDED, so which POSITION it lands
 # in is the contract — 9th on an 8-field row, 8th on a legacy 7-field one. Direct read stays.
 eq "archive keeps the empty CALLER"     "$(shape archive "$E2")" "9||do E2|feat/par|$LA"
@@ -720,13 +716,13 @@ STALEDIR="$RMR/.claude/worktrees/stale"
 rm -rf "$STALEDIR"                       # external rm -rf: the dir is gone, the registration is not
 printf '2026-01-01 00:00:06\tfeat/stale\tsurface:56\t%s\tsurface:1\tstale ghost row\tmain\t%s\n' "$STALEDIR" "$LA" | st_seed tasks
 printf '%s\tidle\t%s\n' "$STALEDIR" "$now20" | st_seed status
-RMO="$(zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; cd '$RMR'; CC_TASKS_FILE='$TT' CC_STATUS_FILE='$TS' gwt-rm stale --branch" 2>&1)"; rmrc=$?
+RMO="$(zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; cd '$RMR'; gwt-rm stale --branch" 2>&1)"; rmrc=$?
 eq "gwt-rm reclaims a gone dir (rc 0)"  "$rmrc" "0"
 eq "gwt-rm prunes the registration"     "$(git -C "$RMR" worktree list --porcelain | grep -c 'worktrees/stale')" "0"
 eq "gwt-rm deletes the stale branch"    "$(git -C "$RMR" branch --list 'feat/stale' | wc -l | tr -d ' ')" "0"
 eq "gwt-rm drops the ghost board row"   "$("$CC/cc-state" dump tasks | grep -c 'stale ghost row')" "0"
 eq "gwt-rm drops the ghost sidecar row" "$("$CC/cc-state" dump status | grep -c 'worktrees/stale')" "0"
-NEV="$(zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; cd '$RMR'; CC_TASKS_FILE='$TT' CC_STATUS_FILE='$TS' gwt-rm neverwas" 2>&1)"; nevrc=$?
+NEV="$(zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; cd '$RMR'; gwt-rm neverwas" 2>&1)"; nevrc=$?
 eq "gwt-rm unknown name exit!=0"        "$([ "$nevrc" -ne 0 ] && echo y || echo n)" "y"
 eq "gwt-rm unknown name says which"     "$(echo "$NEV" | grep -c 'no worktree named')" "1"
 # F4: gwt-tree renders DOWN from the trunk, so a node whose merge target no longer exists (the
@@ -736,7 +732,7 @@ TR=$(mktemp -d); TR="$(cn "$TR")"
 ( cd "$TR"; git init -q; git config user.email t@t; git config user.name t; git commit -q --allow-empty -m i; git branch -M main
   mkdir -p .claude; git worktree add -q .claude/worktrees/o1 -b feat/o1 >/dev/null
   git worktree add -q .claude/worktrees/o2 -b feat/o2 >/dev/null )
-gtree(){ ( cd "$TR" && CC_TASKS_FILE=/dev/null zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; gwt-tree" ) 2>/dev/null; }
+gtree(){ ( cd "$TR" && zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; gwt-tree" ) 2>/dev/null; }
 git -C "$TR" config branch.feat/o1.ccMergeInto feat/ghost      # parent deleted after its merge
 git -C "$TR" config branch.feat/o2.ccMergeInto main
 TO="$(gtree)"
@@ -762,7 +758,7 @@ eq "_gwt_wt_path outside a repo blames cwd" "$(wtp "$NOREPO")" "✗ not inside a
 eq "_gwt_wt_path outside a repo prints no path" "$( ( cd "$NOREPO" && zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; _gwt_wt_path foo" ) 2>/dev/null )" ""
 eq "_gwt_wt_path partial shell blames shell" "$(wtp "$TR" 'unfunction _gwt_dir 2>/dev/null; ')" "✗ worktree helpers unavailable — source ~/.config/cc-stack/worktree.zsh first"
 eq "_gwt_wt_path partial (_gwt_root gone) blames shell" "$(wtp "$TR" 'unfunction _gwt_root 2>/dev/null; ')" "✗ worktree helpers unavailable — source ~/.config/cc-stack/worktree.zsh first"
-NRO="$( ( cd "$NOREPO" && zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; CC_TASKS_FILE='$TT' CC_STATUS_FILE='$TS' gwt-rm foo" ) 2>&1 )"; nrorc=$?
+NRO="$( ( cd "$NOREPO" && zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; gwt-rm foo" ) 2>&1 )"; nrorc=$?
 eq "gwt-rm outside a repo exit!=0"      "$([ "$nrorc" -ne 0 ] && echo y || echo n)" "y"
 eq "gwt-rm outside a repo blames cwd"   "$(echo "$NRO" | grep -c 'not inside a git repo')" "1"
 eq "gwt-rm outside a repo touches nothing" "$(echo "$NRO" | grep -c 'removed\|deleted')" "0"
@@ -994,25 +990,25 @@ mkd28(){ _d=$(mktemp -d); _d="$(cn28 "$_d")"; ( cd "$_d"; git init -q; git confi
   git config user.name t; git commit -q --allow-empty -m i; git branch -M main
   git branch camp; git checkout -q -b feat/x28 ); echo "$_d"; }
 D5A="$(mkd28)"
-env HOME="$F5H" PATH="$F5B:$PATH" CC_STATE_DB="$DB_28" CC_TASKS_FILE="$F5L" CC_SEND_FAILLOG="$F5B/fail" \
+env HOME="$F5H" PATH="$F5B:$PATH" CC_STATE_DB="$DB_28" CC_SEND_FAILLOG="$F5B/fail" \
   CC_SEND_VERIFY_SEC=0.1 CC_WT_SHARE="" CC_WT_PRETRUST=0 CC_CALLER_CWD="$R28" CC_WT_BASE=camp \
   bash "$CC/cc-dispatch.sh" surface "$D5A" "F5 brief" >/dev/null 2>&1
 # (Task 8b) the parent recorded on ONE dir's dispatch row → task-get, the verb for that question
-eq "F5 board parent = capture target" "$(CC_STATE_DB="$DB_28" CC_TASKS_FILE="$F5L" "$CC/cc-state" task-get "$D5A" | awk -F'\t' '{print $7}')" "camp"
+eq "F5 board parent = capture target" "$(CC_STATE_DB="$DB_28" "$CC/cc-state" task-get "$D5A" | awk -F'\t' '{print $7}')" "camp"
 eq "F5 capture really recorded it"   "$(git -C "$D5A" config branch.feat/x28.ccMergeInto)" "camp"
 eq "F5 explicit base: no capture crumb" "$([ -f "$F5B/fail" ] && { grep -c 'merge target' "$F5B/fail" || true; } || echo 0)" "0"
 # …and the wt-claude path ECHOES the target to the human dispatching it (F4)
-WTOUT28="$( cd "$D5A" && env HOME="$F5H" PATH="$F5B:$PATH" CC_STATE_DB="$DB_28" CC_TASKS_FILE="$F5L" \
+WTOUT28="$( cd "$D5A" && env HOME="$F5H" PATH="$F5B:$PATH" CC_STATE_DB="$DB_28" \
   CC_SEND_FAILLOG="$F5B/fail" CC_SEND_VERIFY_SEC=0.1 CC_WT_SHARE="" CC_WT_PRETRUST=0 \
   bash "$CC/cc-dispatch.sh" wt-claude t28 "wt-claude brief" --base camp 2>&1 )"
 eq "F4 wt-claude echoes the target"  "$(echo "$WTOUT28" | grep -c 'merge target: camp (explicit --base)')" "1"
 # same drive WITHOUT a base: target falls back to the caller branch + a breadcrumb is left
 D5B="$(mkd28)"
 : > "$F5B/fail"
-env HOME="$F5H" PATH="$F5B:$PATH" CC_STATE_DB="$DB_28" CC_TASKS_FILE="$F5L" CC_SEND_FAILLOG="$F5B/fail" \
+env HOME="$F5H" PATH="$F5B:$PATH" CC_STATE_DB="$DB_28" CC_SEND_FAILLOG="$F5B/fail" \
   CC_SEND_VERIFY_SEC=0.1 CC_WT_SHARE="" CC_WT_PRETRUST=0 CC_CALLER_CWD="$R28" \
   bash "$CC/cc-dispatch.sh" surface "$D5B" "F5 brief 2" >/dev/null 2>&1
-eq "F5 no-base parent = caller branch" "$(CC_STATE_DB="$DB_28" CC_TASKS_FILE="$F5L" "$CC/cc-state" task-get "$D5B" | awk -F'\t' '{print $7}')" "main"
+eq "F5 no-base parent = caller branch" "$(CC_STATE_DB="$DB_28" "$CC/cc-state" task-get "$D5B" | awk -F'\t' '{print $7}')" "main"
 eq "F5 no-base leaves a crumb"     "$(grep -c 'merge target for feat/x28 recorded as: main (source: cwd)' "$F5B/fail")" "1"
 rm -rf "$F5H" "$F5B" "$D5A" "$D5B"; rm -f "$F5L" "$CR28"
 unstamp "$DB_28"
@@ -1067,11 +1063,11 @@ S28F=$(mktemp -u); S28=$(mktemp -u)
 eq "F8 status w/o board: no python"   "$(h28 "$S28J" status)" "0"
 printf '2026-01-01 00:00:00\tfeat/C\tsurface:1\t%s\tsurface:9\tt\tmain\n' "$RR28" | st_seed tasks "$DB_28"
 : > "$CNT28"; printf '%s' "$S28J" \
-  | env HOME="$F8H" PATH="$F8B:$PATH" CC_PY_LOG="$CNT28" CC_STATE_DB="$DB_28" CC_TASKS_FILE="$S28F" CC_STATUS_FILE="$S28" \
+  | env HOME="$F8H" PATH="$F8B:$PATH" CC_PY_LOG="$CNT28" CC_STATE_DB="$DB_28" \
     bash "$CC/cc-hooks.sh" status >/dev/null 2>&1
 eq "F8 status with board: parse+facade"  "$(wc -l < "$CNT28" | tr -d ' ')" "2"
 # the sidecar write is a side effect and has no per-dir question verb → raw `dump status`
-eq "F8 status sidecar still written"   "$(CC_STATE_DB="$DB_28" CC_STATUS_FILE="$S28" "$CC/cc-state" dump status | awk -F'\t' -v d="$RR28" '$1==d{print $2}')" "working"
+eq "F8 status sidecar still written"   "$(CC_STATE_DB="$DB_28" "$CC/cc-state" dump status | awk -F'\t' -v d="$RR28" '$1==d{print $2}')" "working"
 rm -rf "$F8H" "$F8B"; rm -f "$S28" "$S28F" "$CNT28"
 
 # ── F9: the header example must show the trailing base, 4 lines above "base is the target" ──
@@ -1236,7 +1232,7 @@ git -C "$MR3" worktree add -q wtT6 -b feat/T6 feat/T >/dev/null
 ( cd "$MR3/wtT6"; printf 'six\n' > f6.txt; git add f6.txt; git commit -q -m 'chore: t6' )
 "$CC/cc-merge.sh" set-parent "$MR3" feat/T6 feat/T
 "$CC/cc-merge.sh" done "$MR3" feat/T6 true
-printf '\ny\n' | HOME="$FH" CC_STATE_DB="$DB_8b" CC_TASKS_FILE="$TF8" CC_STATUS_FILE="$SF8" CC_ARCHIVE_FILE="$AF8" \
+printf '\ny\n' | HOME="$FH" CC_STATE_DB="$DB_8b" \
   zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; cd '$MR3'; gwt-merge feat/T6 --message 'chore(zsh): flag through gwt-merge'" >/dev/null 2>&1; zrc=$?
 eq "gwt-merge --message exit0"  "$zrc" "0"
 eq "gwt-merge passes --message" "$(git -C "$MR3" log -1 --format=%s feat/T)" "chore(zsh): flag through gwt-merge"
@@ -1367,7 +1363,7 @@ GT=$(mktemp -d); ( cd "$GT"; git init -q; git config user.email t@t; git config 
 "$CC/cc-merge.sh" set-parent "$GT" feat/A main
 "$CC/cc-merge.sh" set-parent "$GT" feat/A1 feat/A
 "$CC/cc-merge.sh" done "$GT" feat/A1 true
-GTOUT="$(cd "$GT" && CC_STATE_DB="$DB_13" CC_TASKS_FILE=/dev/null zsh -c "source '$CC/worktree.zsh'; gwt-tree" 2>/dev/null)"
+GTOUT="$(cd "$GT" && CC_STATE_DB="$DB_13" zsh -c "source '$CC/worktree.zsh'; gwt-tree" 2>/dev/null)"
 eq "tree root is trunk"        "$(echo "$GTOUT" | head -1)" "main"
 eq "tree shows feat/A"         "$(echo "$GTOUT" | grep -c 'feat/A ')" "1"
 eq "tree shows feat/A1"        "$(echo "$GTOUT" | grep -c 'feat/A1')" "1"
@@ -1573,7 +1569,7 @@ eq "26 no-list map = caller workspace only" "$(lm26 "" 1 | awk -F'\t' -v u="$UB2
 eq "26 no-list map still resolves what it saw" "$(lm26 "" 1 | awk -F'\t' -v u="$UA26" '$2==u{print $1}')" "surface:11"
 eq "26 no workspace list is INCOMPLETE evidence" "$(lm26 "" 1 | grep -cx '!partial')" "1"
 # THE invariant: a map carrying the sentinel prunes NOTHING — not even the row that is really dead
-prune26(){ ( set -u; . "$PR26/ledger.sh"; CC_STATE_DB="$DB_26" CC_TABS_FILE="$1" _cctabs_prune "$2" ) >/dev/null 2>&1; }
+prune26(){ ( set -u; . "$PR26/ledger.sh"; CC_STATE_DB="$DB_26" _cctabs_prune "$2" ) >/dev/null 2>&1; }
 L26="$PR26/tabs.tsv"
 mkl26(){ printf 'AAAAAAAA-0000-0000-0000-00000000000A\tOWN\t/tmp/a26\t-\tts\n' |  st_seed tabs "$DB_26"
          printf 'DEADDEAD-0000-0000-0000-00000000000D\tOWN\t/tmp/d26\t-\tts\n' | st_append tabs "$DB_26"; }
@@ -1582,7 +1578,7 @@ eq "26 partial map prunes nothing"    "$(rows26)" "2"
 # ...and the SAME map without the sentinel still prunes: the guard is the evidence, not the shape
 mkl26; prune26 "$L26" "$(printf 'surface:1\tAAAAAAAA-0000-0000-0000-00000000000A\tworkspace:1\n')"
 eq "26 complete map still prunes"     "$(rows26)" "1"
-eq "26 complete map kept the live row" "$(CC_STATE_DB="$DB_26" CC_TABS_FILE="$L26" "$CC/cc-state" dump tabs | awk -F'\t' 'NR==1{print substr($1,1,8)}')" "AAAAAAAA"
+eq "26 complete map kept the live row" "$(CC_STATE_DB="$DB_26" "$CC/cc-state" dump tabs | awk -F'\t' 'NR==1{print substr($1,1,8)}')" "AAAAAAAA"
 
 # ── consequence one (destructive): the opened-tabs prune ────────────────────────────────────
 TB26=$(mktemp -u)
@@ -1590,7 +1586,7 @@ mk26(){ : | st_seed tabs "$DB_26"
   printf '%s\t%s\t%s\t-\t2026-01-01 00:00:00\n' "$UA26" "$UP26" "$WA26" | st_append tabs "$DB_26"
   printf '%s\t%s\t%s\t-\t2026-01-01 00:00:00\n' "$UB26" "$UP26" "$WB26" | st_append tabs "$DB_26"
   printf '%s\t%s\t%s\t-\t2026-01-01 00:00:00\n' "$UD26" "$UP26" "/tmp/cc-gone-26" | st_append tabs "$DB_26"; }
-tabs26(){ ( cd "$R26" && env PATH="$WS26:$OP26" CC_STATE_DB="$DB_26" CC_TABS_FILE="$TB26" CC_CALLER_SURFACE_UUID="$UP26" \
+tabs26(){ ( cd "$R26" && env PATH="$WS26:$OP26" CC_STATE_DB="$DB_26" CC_CALLER_SURFACE_UUID="$UP26" \
     CC_FAKE_WSDOWN="${1:-}" CC_FAKE_NOWS="${2:-}" bash "$CC/cc-dispatch.sh" tabs --all ) 2>&1; }
 mk26; TO26="$(tabs26)"
 eq "26 tabs: caller-workspace tab alive"  "$(echo "$TO26" | grep -c "$UA26 .*alive")" "1"
@@ -1599,13 +1595,13 @@ eq "26 tabs: OTHER-workspace tab alive"   "$(echo "$TO26" | grep -c "$UB26 .*ali
 # they read the raw ledger through `dump tabs`. `tab-list` filters by owner at read time and
 # `tab-list --all` still skips empty-suuid rows: a filtered read would answer the same whether
 # the prune ran or not, which is how "NOT pruned" goes vacuously green.
-eq "26 cross-workspace row NOT pruned"    "$(CC_STATE_DB="$DB_26" CC_TABS_FILE="$TB26" "$CC/cc-state" dump tabs | grep -c "^$UB26")" "1"
-eq "26 genuinely dead row still pruned"   "$(CC_STATE_DB="$DB_26" CC_TABS_FILE="$TB26" "$CC/cc-state" dump tabs | grep -c "^$UD26")" "0"
+eq "26 cross-workspace row NOT pruned"    "$(CC_STATE_DB="$DB_26" "$CC/cc-state" dump tabs | grep -c "^$UB26")" "1"
+eq "26 genuinely dead row still pruned"   "$(CC_STATE_DB="$DB_26" "$CC/cc-state" dump tabs | grep -c "^$UD26")" "0"
 eq "26 prune kept exactly the live rows"  "$(rows26)" "2"
 # one workspace unreachable → nothing is pruned AT ALL, and the miss is reported as dead? not dead
 mk26; TO26="$(tabs26 workspace:2)"
 eq "26 partial probe prunes no row"       "$(rows26)" "3"
-eq "26 partial probe keeps the dead row"  "$(CC_STATE_DB="$DB_26" CC_TABS_FILE="$TB26" "$CC/cc-state" dump tabs | grep -c "^$UD26")" "1"
+eq "26 partial probe keeps the dead row"  "$(CC_STATE_DB="$DB_26" "$CC/cc-state" dump tabs | grep -c "^$UD26")" "1"
 eq "26 partial probe says so"             "$(echo "$TO26" | grep -c 'liveness partial')" "1"
 eq "26 unseen row prints dead?"           "$(echo "$TO26" | grep -c "$UB26 .*dead?")" "1"
 eq "26 seen row is still alive"           "$(echo "$TO26" | grep -c "$UA26 .*alive")" "1"
@@ -1615,8 +1611,8 @@ eq "26 seen row is still alive"           "$(echo "$TO26" | grep -c "$UA26 .*ali
 # grows, and a stale row is harmless (its uuid resolves to nothing → close says "no live tab", rc 0).
 mk26; TO26="$(tabs26 "" 1)"
 eq "26 no workspace list prunes NO row"   "$(rows26)" "3"
-eq "26 no workspace list keeps the dead row" "$(CC_STATE_DB="$DB_26" CC_TABS_FILE="$TB26" "$CC/cc-state" dump tabs | grep -c "^$UD26")" "1"
-eq "26 no workspace list keeps the cross-workspace row" "$(CC_STATE_DB="$DB_26" CC_TABS_FILE="$TB26" "$CC/cc-state" dump tabs | grep -c "^$UB26")" "1"
+eq "26 no workspace list keeps the dead row" "$(CC_STATE_DB="$DB_26" "$CC/cc-state" dump tabs | grep -c "^$UD26")" "1"
+eq "26 no workspace list keeps the cross-workspace row" "$(CC_STATE_DB="$DB_26" "$CC/cc-state" dump tabs | grep -c "^$UB26")" "1"
 eq "26 no workspace list says liveness is partial" "$(echo "$TO26" | grep -c 'liveness partial')" "1"
 eq "26 no workspace list still resolves its own tab" "$(echo "$TO26" | grep -c "$UA26 .*alive")" "1"
 
@@ -1625,7 +1621,7 @@ TF26=$(mktemp -u); SF26=$(mktemp -u); : | st_seed status "$DB_26"
 bt26(){ : | st_seed tasks "$DB_26"        # $1/$2 = the refs recorded for the wtA / wtB rows
   printf '2026-01-01 00:00:01\tfeat/A26\tsurface:%s\t%s\tsurface:9\ttask in the caller workspace\tmain\n' "${1:-11}" "$WA26" | st_append tasks "$DB_26"
   printf '2026-01-01 00:00:02\tfeat/B26\tsurface:%s\t%s\tsurface:9\ttask in ANOTHER workspace\tmain\n'  "${2:-21}" "$WB26" | st_append tasks "$DB_26"; }
-brd26(){ ( cd "$R26" && env PATH="${3:-$WS26:$OP26}" CC_STATE_DB="$DB_26" CC_TASKS_FILE="$TF26" CC_STATUS_FILE="$SF26" \
+brd26(){ ( cd "$R26" && env PATH="${3:-$WS26:$OP26}" CC_STATE_DB="$DB_26" \
     CC_FAKE_WSDOWN="${1:-}" CC_FAKE_NOWS="${2:-}" bash "$CC/cc-board.sh" --all ) 2>/dev/null; }
 tabof26(){ echo "$1" | awk -v d="$2" '$5==d{print $1}'; }
 bt26; BO26="$(brd26)"
@@ -1654,7 +1650,7 @@ eq "26 board: no workspace list makes a miss ?"   "$(tabof26 "$BO26" "$WB26")" "
 TFC26=$(mktemp -u); ST26="$WS26/store.json"; echo '{}' > "$ST26"
 printf '2026-01-01 00:00:01\tfeat/A26\tsurface:11\t%s\tsurface:9\ttask A\tmain\tuuid=u1:provider=anthropic:pm=auto:csuuid=%s:suuid=%s\n' "$WA26" "$UP26" "$UA26" |  st_seed tasks "$DB_26"
 printf '2026-01-01 00:00:02\tfeat/B26\tsurface:21\t%s\tsurface:9\ttask B\tmain\tuuid=u2:provider=anthropic:pm=auto:csuuid=%s:suuid=%s\n' "$WB26" "$UP26" "$UB26" | st_append tasks "$DB_26"
-cl26(){ ( cd "$R26" && env PATH="$WS26:$OP26" CC_STATE_DB="$DB_26" CC_TASKS_FILE="$TFC26" CC_TABS_FILE="$TB26" \
+cl26(){ ( cd "$R26" && env PATH="$WS26:$OP26" CC_STATE_DB="$DB_26" \
     CC_CMUX_SESSIONS="$ST26" CC_CALLER_SURFACE_UUID="$UP26" CLAUDECODE=1 \
     bash "$CC/cc-dispatch.sh" close "$1" ) 2>&1; }
 mk26; : > "$CC_FAKE_LOG26"
@@ -1666,7 +1662,7 @@ eq "26 close never used a short ref"       "$(grep -c 'CLOSE|--surface surface:'
 # an unreachable workspace keeps the idempotence contract (rc 0, closes nothing) but must not
 # claim the tab is gone — "I could not look there" is a different sentence
 mk26; : > "$CC_FAKE_LOG26"
-CO26="$( cd "$R26" && env PATH="$WS26:$OP26" CC_STATE_DB="$DB_26" CC_TASKS_FILE="$TFC26" CC_TABS_FILE="$TB26" \
+CO26="$( cd "$R26" && env PATH="$WS26:$OP26" CC_STATE_DB="$DB_26" \
     CC_CMUX_SESSIONS="$ST26" CC_CALLER_SURFACE_UUID="$UP26" CLAUDECODE=1 CC_FAKE_WSDOWN=workspace:2 \
     bash "$CC/cc-dispatch.sh" close "$WB26" 2>&1 )"; crc26=$?
 eq "26 close on a partial probe exit0"     "$crc26" "0"
@@ -1691,14 +1687,14 @@ TFR26=$(mktemp -u)
 printf '2026-01-01 00:00:01\tfeat/B26\tsurface:77\t%s\tsurface:9\ttask B\tmain\tuuid=55555555-5555-5555-5555-555555555555:provider=anthropic:pm=auto\n' "$WB26" | st_seed tasks "$DB_26"
 HM26="$WS26/home"; mkdir -p "$HM26/.config"; ln -s "$CC" "$HM26/.config/cc-stack"
 : > "$CC_FAKE_LOG26"
-RO26="$( cd "$R26" && env HOME="$HM26" PATH="$WS26:$OP26" CC_STATE_DB="$DB_26" CC_TASKS_FILE="$TFR26" CC_STATUS_FILE="$SF26" \
-    CC_STATE_DB="$DB_26" CC_TABS_FILE="$TB26" CC_CMUX_SESSIONS="$ST26" CC_RESUME_SETTLE=0 CC_WT_PRETRUST=0 \
+RO26="$( cd "$R26" && env HOME="$HM26" PATH="$WS26:$OP26" CC_STATE_DB="$DB_26" \
+    CC_STATE_DB="$DB_26" CC_CMUX_SESSIONS="$ST26" CC_RESUME_SETTLE=0 CC_WT_PRETRUST=0 \
     bash "$CC/cc-dispatch.sh" resume --all 2>&1 )"; rrc26=$?
 eq "26 resume exit0"                        "$rrc26" "0"
 eq "26 resume opens no duplicate tab"       "$(grep -c 'NEWSURF' "$CC_FAKE_LOG26")" "0"
 # (Task 8b) a VALUE of one dir's row → task-get answers exactly that question ("the newest row
 # recorded for this dir"), which is what the '$4==d' awk selected; $TFR26 holds a single row
-eq "26 resume refreshed the ref to the other workspace" "$(CC_STATE_DB="$DB_26" CC_TASKS_FILE="$TFR26" "$CC/cc-state" task-get "$WB26" | awk -F'\t' '{print $3}')" "surface:21"
+eq "26 resume refreshed the ref to the other workspace" "$(CC_STATE_DB="$DB_26" "$CC/cc-state" task-get "$WB26" | awk -F'\t' '{print $3}')" "surface:21"
 
 # insurance for a future regression: a resume that DOES reopen leaves a contentless dedup marker
 # in the real TMPDIR (hash-keyed, written by surface) — sweep ours either way
@@ -1744,7 +1740,7 @@ eq "adopt rejects the trunk"          "$arc" "1"
 
 # gwt-rm --branch must resolve the REAL branch (any prefix) from the worktree, not assume feat/<name>
 ( cd "$AR"; git worktree add -q .claude/worktrees/custom-pre -b fix/custom-pre >/dev/null 2>&1 )
-CC_STATE_DB="$DB_12" CC_TASKS_FILE=/dev/null CC_STATUS_FILE=/dev/null zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; cd '$AR'; gwt-rm custom-pre --branch" >/dev/null 2>&1
+CC_STATE_DB="$DB_12" zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; cd '$AR'; gwt-rm custom-pre --branch" >/dev/null 2>&1
 eq "gwt-rm removes the worktree"      "$([ -d "$AR/.claude/worktrees/custom-pre" ] && echo no || echo yes)" "yes"
 eq "gwt-rm deletes custom-prefix branch" "$(git -C "$AR" show-ref --verify --quiet refs/heads/fix/custom-pre && echo still-there || echo gone)" "gone"
 rm -rf "$AR" "$AFK"
@@ -2252,7 +2248,7 @@ json.dump({
 PY
 printf '* surface:55\t%s\tD2 tab\n  surface:60\t99999999-9999-9999-9999-999999999999\tunrelated\n' "$SURF2" > "$RF/live"
 renv17(){ # resume runner: fake HOME (copy of this checkout) + fake cmux + scratch TSVs
-  ( cd "$REPO17" && env HOME="$FH17" PATH="$RF:$OP17" CC_STATE_DB="$DB_17" CC_TASKS_FILE="$TF17" CC_STATUS_FILE="$SF17" \
+  ( cd "$REPO17" && env HOME="$FH17" PATH="$RF:$OP17" CC_STATE_DB="$DB_17" \
       CC_CMUX_SESSIONS="$RF/store.json" CC_RESUME_SETTLE=0 CC_SEND_VERIFY_SEC=0.1 \
       CC_SEND_FAILLOG="$RF/fail" CC_FAKE_LIVE="$RF/live" bash "$CC/cc-dispatch.sh" resume "$@" )
 }
@@ -2266,15 +2262,15 @@ eq "native restore invoked"  "$(grep -c 'RESTORE-SESSION' "$CC_FAKE_LOG")" "1"
 # store through `dump tasks`: the `sort -u` collapsing to a single value IS the assertion, and
 # task-get returns only the dir's NEWEST row — it would stay green with the older row still
 # carrying its pre-crash ref (mutation-proved: see the Task 8b report's red/green table).
-eq "restored row ref refreshed" "$(CC_STATE_DB="$DB_17" CC_TASKS_FILE="$TF17" "$CC/cc-state" dump tasks | awk -F'\t' -v d="$D2" '$4==d{print $3}' | sort -u)" "surface:55"
-eq "ALL rows of dir refreshed"  "$(CC_STATE_DB="$DB_17" CC_TASKS_FILE="$TF17" "$CC/cc-state" dump tasks | awk -F'\t' -v d="$D2" '$4==d{print $3}' | wc -l | tr -d ' ')" "2"
+eq "restored row ref refreshed" "$(CC_STATE_DB="$DB_17" "$CC/cc-state" dump tasks | awk -F'\t' -v d="$D2" '$4==d{print $3}' | sort -u)" "surface:55"
+eq "ALL rows of dir refreshed"  "$(CC_STATE_DB="$DB_17" "$CC/cc-state" dump tasks | awk -F'\t' -v d="$D2" '$4==d{print $3}' | wc -l | tr -d ' ')" "2"
 # a restored tab is a NEW surface: the recorded suuid must track it, or the close gate would go on
 # comparing against a dead uuid (and refuse the parent its own child forever)
-eq "suuid refreshed on restore" "$(CC_STATE_DB="$DB_17" CC_TASKS_FILE="$TF17" "$CC/cc-state" dump tasks | awk -F'\t' -v d="$D2" '$4==d{print $8}' | sort -u)" \
+eq "suuid refreshed on restore" "$(CC_STATE_DB="$DB_17" "$CC/cc-state" dump tasks | awk -F'\t' -v d="$D2" '$4==d{print $8}' | sort -u)" \
                                 "uuid=$SESS2:provider=anthropic:pm=auto:csuuid=$CSU17R:suuid=$SURF2:model=m1"
-eq "stale suuid is gone"        "$(CC_STATE_DB="$DB_17" CC_TASKS_FILE="$TF17" "$CC/cc-state" dump tasks | grep -cF "$OLDS17")" "0"
-eq "csuuid survived the rewrite" "$(CC_STATE_DB="$DB_17" CC_TASKS_FILE="$TF17" "$CC/cc-state" dump tasks | awk -F'\t' -v d="$D2" '$4==d{print ($8 ~ /:csuuid=/)?"y":"n"}' | sort -u)" "y"
-eq "model still LAST after rewrite" "$(CC_STATE_DB="$DB_17" CC_TASKS_FILE="$TF17" "$CC/cc-state" dump tasks | awk -F'\t' -v d="$D2" '$4==d{print ($8 ~ /:model=m1$/)?"y":"n"}' | sort -u)" "y"
+eq "stale suuid is gone"        "$(CC_STATE_DB="$DB_17" "$CC/cc-state" dump tasks | grep -cF "$OLDS17")" "0"
+eq "csuuid survived the rewrite" "$(CC_STATE_DB="$DB_17" "$CC/cc-state" dump tasks | awk -F'\t' -v d="$D2" '$4==d{print ($8 ~ /:csuuid=/)?"y":"n"}' | sort -u)" "y"
+eq "model still LAST after rewrite" "$(CC_STATE_DB="$DB_17" "$CC/cc-state" dump tasks | awk -F'\t' -v d="$D2" '$4==d{print ($8 ~ /:model=m1$/)?"y":"n"}' | sort -u)" "y"
 eq "reopened exact cld cmd"  "$(grep -cF "cld kimi --resume $U1 --permission-mode plan --model glm-4.6" "$CC_FAKE_LOG")" "1"
 eq "reopen dir VERBATIM"     "$(grep "NEWSURF" "$CC_FAKE_LOG" | grep -cF -- "--working-directory $D1")" "1"
 eq "idle degrade bare ccteam" "$(grep -cE "^SEND\|--surface surface:[0-9]+ ccteam$" "$CC_FAKE_LOG")" "1"
@@ -2282,23 +2278,23 @@ eq "listing shows idle note" "$(echo "$ROUT" | grep -c 'no recorded session')" "
 eq "listing header"          "$(echo "$ROUT" | grep -c 'BRANCH')" "1"
 # "no board row appended" COUNTS the dir's rows — task-get always prints exactly one, so it
 # would be green next to a duplicate row: raw read. The ref value below is a per-row question.
-eq "no board row appended"   "$(CC_STATE_DB="$DB_17" CC_TASKS_FILE="$TF17" "$CC/cc-state" dump tasks | awk -F'\t' -v d="$D1" '$4==d' | wc -l | tr -d ' ')" "1"
-eq "reopen ref recorded"     "$(CC_STATE_DB="$DB_17" CC_TASKS_FILE="$TF17" "$CC/cc-state" task-get "$D1" | awk -F'\t' '{print $3}')" \
+eq "no board row appended"   "$(CC_STATE_DB="$DB_17" "$CC/cc-state" dump tasks | awk -F'\t' -v d="$D1" '$4==d' | wc -l | tr -d ' ')" "1"
+eq "reopen ref recorded"     "$(CC_STATE_DB="$DB_17" "$CC/cc-state" task-get "$D1" | awk -F'\t' '{print $3}')" \
                              "$(grep -F -- "--working-directory $D1" "$CC_FAKE_LOG" | grep -oE 'surface:[0-9]+' | head -1)"
 # the sidecar has no per-dir question verb; these are clear/keep side effects → raw dump status
-eq "stale status D1 cleared" "$(CC_STATE_DB="$DB_17" CC_STATUS_FILE="$SF17" "$CC/cc-state" dump status | grep -cF "$D1")" "0"
-eq "stale status D2 cleared" "$(CC_STATE_DB="$DB_17" CC_STATUS_FILE="$SF17" "$CC/cc-state" dump status | grep -cF "$D2")" "0"
-eq "unrelated status kept"   "$(CC_STATE_DB="$DB_17" CC_STATUS_FILE="$SF17" "$CC/cc-state" dump status | grep -cF "$UNREL17")" "1"
+eq "stale status D1 cleared" "$(CC_STATE_DB="$DB_17" "$CC/cc-state" dump status | grep -cF "$D1")" "0"
+eq "stale status D2 cleared" "$(CC_STATE_DB="$DB_17" "$CC/cc-state" dump status | grep -cF "$D2")" "0"
+eq "unrelated status kept"   "$(CC_STATE_DB="$DB_17" "$CC/cc-state" dump status | grep -cF "$UNREL17")" "1"
 eq "foreign row not touched" "$(grep -cF -- "--working-directory $OTH17" "$CC_FAKE_LOG")" "0"
 eq "exactly 2 tabs opened"   "$(grep -c 'NEWSURF' "$CC_FAKE_LOG")" "2"
 eq "dead dir never opened"   "$(grep -cF -- "--working-directory $REPO17/gone" "$CC_FAKE_LOG")" "0"
 # B) declined confirm: nothing reopens (native restores above stand), rc 1, refs untouched
 : > "$CC_FAKE_LOG"
-BREF="$(CC_STATE_DB="$DB_17" CC_TASKS_FILE="$TF17" "$CC/cc-state" task-get "$D1" | awk -F'\t' '{print $3}')"
+BREF="$(CC_STATE_DB="$DB_17" "$CC/cc-state" task-get "$D1" | awk -F'\t' '{print $3}')"
 ROUT="$(printf 'n\n' | renv17 2>&1)"; rrc=$?
 eq "decline exit1"           "$rrc" "1"
 eq "decline opens nothing"   "$(grep -c 'NEWSURF' "$CC_FAKE_LOG")" "0"
-eq "decline keeps refs"      "$(CC_STATE_DB="$DB_17" CC_TASKS_FILE="$TF17" "$CC/cc-state" task-get "$D1" | awk -F'\t' '{print $3}')" "$BREF"
+eq "decline keeps refs"      "$(CC_STATE_DB="$DB_17" "$CC/cc-state" task-get "$D1" | awk -F'\t' '{print $3}')" "$BREF"
 # B2) immediate re-run on the SAME dirs must not be eaten by the 120s dedup marker (resume mode
 # skips it) — the marker from run A is minutes fresh here
 : > "$CC_FAKE_LOG"
@@ -2307,13 +2303,13 @@ eq "re-run not marker-blocked" "$(grep -c 'NEWSURF' "$CC_FAKE_LOG")" "2"
 # C) repo filter vs --all: a board holding ONLY a foreign-repo row
 TF17C=$(mktemp -u); printf '2026-01-01 00:00:01\tfeat/C1\tsurface:70\t%s\tsurface:1\tforeign only\tmain\tuuid=%s:provider=glm:pm=auto\n' "$OTH17" "$U4" | st_seed tasks "$DB_17"
 : > "$CC_FAKE_LOG"
-ROUT="$(printf 'y\n' | ( cd "$REPO17" && env HOME="$FH17" PATH="$RF:$OP17" CC_STATE_DB="$DB_17" CC_TASKS_FILE="$TF17C" CC_STATUS_FILE="$(mktemp -u)" \
+ROUT="$(printf 'y\n' | ( cd "$REPO17" && env HOME="$FH17" PATH="$RF:$OP17" CC_STATE_DB="$DB_17" \
       CC_CMUX_SESSIONS="$RF/store.json" CC_RESUME_SETTLE=0 CC_SEND_FAILLOG="$RF/fail" CC_FAKE_LIVE="$RF/live" \
       bash "$CC/cc-dispatch.sh" resume) 2>&1)"; rrc=$?
 eq "filter: nothing in repo" "$rrc" "0"
 eq "filter says try --all"   "$(echo "$ROUT" | grep -c 'no resumable board rows')" "1"
 eq "filter opens nothing"    "$(grep -c 'NEWSURF' "$CC_FAKE_LOG")" "0"
-ROUT="$(printf 'y\n' | ( cd "$REPO17" && env HOME="$FH17" PATH="$RF:$OP17" CC_STATE_DB="$DB_17" CC_TASKS_FILE="$TF17C" CC_STATUS_FILE="$(mktemp -u)" \
+ROUT="$(printf 'y\n' | ( cd "$REPO17" && env HOME="$FH17" PATH="$RF:$OP17" CC_STATE_DB="$DB_17" \
       CC_CMUX_SESSIONS="$RF/store.json" CC_RESUME_SETTLE=0 CC_SEND_FAILLOG="$RF/fail" CC_FAKE_LIVE="$RF/live" \
       bash "$CC/cc-dispatch.sh" resume --all) 2>&1)"; rrc=$?
 eq "--all reopens foreign"   "$rrc" "0"
@@ -2326,7 +2322,7 @@ eq "no --model when unrecorded" "$(grep -c -- '--model' "$CC_FAKE_LOG")" "0"
 TF17D=$(mktemp -u); D0="$(cn17 "$(mktemp -d)")"
 CSU17="EEEEEEEE-1111-2222-3333-444444444444"
 : > "$CC_FAKE_LOG"
-env HOME="$FH17" PATH="$RF:$OP17" CC_STATE_DB="$DB_17" CC_TASKS_FILE="$TF17D" CC_SEND_FAILLOG="$RF/fail" \
+env HOME="$FH17" PATH="$RF:$OP17" CC_STATE_DB="$DB_17" CC_SEND_FAILLOG="$RF/fail" \
   CC_SEND_VERIFY_SEC=0.1 CC_LAUNCH_FILE="$RF/launch" CC_WT_PERMISSION_MODE=plan CC_WT_MODEL='glm-4.6[1m]' \
   CC_CALLER_SURFACE_UUID="$CSU17" \
   bash "$CC/cc-dispatch.sh" surface "$D0" "mint test brief" >/dev/null 2>&1
@@ -2337,15 +2333,15 @@ eq "minted id on launch"     "$(grep -cF -- "ccteam --session-id $MINT --permiss
 # count reads off the returned row unchanged. task-get collapses to the dir's NEWEST row, which
 # is exact here (D0/D0B are each dispatched once); "how many rows does a dir have" is a separate
 # question and stays on the raw read, above ("no board row appended").
-eq "minted id on log row"    "$(CC_STATE_DB="$DB_17" CC_TASKS_FILE="$TF17D" "$CC/cc-state" task-get "$D0" | awk -F'\t' '{print $8}')" "uuid=$MINT:provider=anthropic:pm=plan:csuuid=$CSU17:model=glm-4.6[1m]"
-eq "mint row has 8 fields"   "$(CC_STATE_DB="$DB_17" CC_TASKS_FILE="$TF17D" "$CC/cc-state" task-get "$D0" | awk -F'\t' '{print NF}')" "8"
+eq "minted id on log row"    "$(CC_STATE_DB="$DB_17" "$CC/cc-state" task-get "$D0" | awk -F'\t' '{print $8}')" "uuid=$MINT:provider=anthropic:pm=plan:csuuid=$CSU17:model=glm-4.6[1m]"
+eq "mint row has 8 fields"   "$(CC_STATE_DB="$DB_17" "$CC/cc-state" task-get "$D0" | awk -F'\t' '{print NF}')" "8"
 D0B="$(cn17 "$(mktemp -d)")"
 : > "$CC_FAKE_LOG"
-env HOME="$FH17" PATH="$RF:$OP17" CC_STATE_DB="$DB_17" CC_TASKS_FILE="$TF17D" CC_SEND_FAILLOG="$RF/fail" \
+env HOME="$FH17" PATH="$RF:$OP17" CC_STATE_DB="$DB_17" CC_SEND_FAILLOG="$RF/fail" \
   CC_SEND_VERIFY_SEC=0.1 CC_LAUNCH_FILE="$RF/launch" CC_WT_MODEL='bad model;rm -rf' \
   bash "$CC/cc-dispatch.sh" surface "$D0B" "model guard" >/dev/null 2>&1
 eq "bad model never launched" "$(grep -c -- '--model' "$CC_FAKE_LOG")" "0"
-eq "bad model not recorded"   "$(CC_STATE_DB="$DB_17" CC_TASKS_FILE="$TF17D" "$CC/cc-state" task-get "$D0B" | awk -F'\t' '{print ($8 ~ /model=/)?"bad":"ok"}')" "ok"
+eq "bad model not recorded"   "$(CC_STATE_DB="$DB_17" "$CC/cc-state" task-get "$D0B" | awk -F'\t' '{print ($8 ~ /model=/)?"bad":"ok"}')" "ok"
 rm -rf "$RF" "$FH17" "$REPO17" "$OTH17" "$UNREL17" "$D0" "$D0B"; rm -f "$TF17" "$SF17" "$TF17C" "$TF17D"
 # fresh-mode surface leaves dedup markers in the real TMPDIR (hash-keyed, contentless) — sweep ours
 unstamp "$DB_17"
@@ -2366,37 +2362,36 @@ DB_32="$(mktemp -u).db"   # this section's library
 # F32OR literals recorded from the writer this facade replaced, and (below) the legacy TSV as
 # it was on disk before migration touched it. Comparing dump against those is not comparing
 # cc-state with cc-state.
-S32=$(mktemp -d); export CC_TASKS_FILE="$S32/t.tsv" CC_STATUS_FILE="$S32/s.tsv" \
-  CC_ARCHIVE_FILE="$S32/a.tsv" CC_TABS_FILE="$S32/b.tsv" CC_STATE_DB="$S32/cc-state.db"
+S32=$(mktemp -d); export CC_STATE_DB="$S32/cc-state.db"
 # dump used to be a raw byte passthrough of the store file, so "byte-identical" compared it to
 # `cat`. There is no file to cat; what dump has to reproduce now is the legacy TSV it IMPORTED,
 # and the migration keeps that file (renamed, never deleted) which makes it a perfectly good
 # independent expectation — bytes written by a printf, not by the facade.
-printf '2026-01-01 00:00:00\tfeat/x\tsurface:1\t/d/x\tsurface:9\tdo x\tcamp\tuuid=u1\n' > "$CC_TASKS_FILE"
-cp "$CC_TASKS_FILE" "$S32/pre-migration"
+printf '2026-01-01 00:00:00\tfeat/x\tsurface:1\t/d/x\tsurface:9\tdo x\tcamp\tuuid=u1\n' > "$S32/worktree-tasks.tsv"
+cp "$S32/worktree-tasks.tsv" "$S32/pre-migration"
 "$CC/cc-state" dump tasks >/dev/null            # first open imports and renames the TSV aside
 eq "32 dump rebuilds the imported bytes exactly" \
   "$("$CC/cc-state" dump tasks | od -An -c | tr -d ' \n')" "$(od -An -c "$S32/pre-migration" | tr -d ' \n')"
-eq "32 the legacy file was renamed, not deleted" "$(ls "$S32"/t.tsv.migrated.* 2>/dev/null | wc -l | tr -d ' ')" "1"
+eq "32 the legacy file was renamed, not deleted" "$(ls "$S32"/worktree-tasks.tsv.migrated.* 2>/dev/null | wc -l | tr -d ' ')" "1"
 eq "32 ...and the renamed copy still holds the original bytes" \
-  "$(cmp -s "$S32"/t.tsv.migrated.* "$S32/pre-migration" && echo same || echo differ)" "same"
+  "$(cmp -s "$S32"/worktree-tasks.tsv.migrated.* "$S32/pre-migration" && echo same || echo differ)" "same"
 eq "32 dump of an empty store is empty" "$("$CC/cc-state" dump tabs)" ""
 # A final line with NO newline: still a row, and the rebuild supplies the newline. That second
 # half is the ONE deliberate deviation the engine adds to dump's byte contract — state-model
 # §3.5 #10. It is asserted, not tolerated, so it cannot happen again unnoticed.
 # NB: a FRESH library. Migration imports a legacy TSV only when the library does not exist
 # yet, so this fixture cannot reuse the section's — that one was created by the import above.
-S32NL=$(mktemp -d); printf 'a\tb' > "$S32NL/b.tsv"
-nl32(){ env CC_TABS_FILE="$S32NL/b.tsv" CC_STATE_DB="$S32NL/cc-state.db" "$CC/cc-state" "$@"; }
+S32NL=$(mktemp -d); printf 'a\tb' > "$S32NL/opened-tabs.tsv"
+nl32(){ env CC_STATE_DB="$S32NL/cc-state.db" "$CC/cc-state" "$@"; }
 eq "32 a newline-less final row is still a row"  "$(nl32 dump tabs)" "$(printf 'a\tb')"
 eq "32 ...and the rebuild supplies the newline (deviation 10)" \
   "$(nl32 dump tabs | tail -c 1 | od -An -tx1 -v | tr -d ' \n')" "0a"
 rm -rf "$S32NL"
 # ... and the same row reaches the VERBS as a row, not chaff — a reader that dropped it would
 # turn the next rewrite into data loss
-S32X=$(mktemp -d); printf '2026-01-01 00:00:00\tfeat/nt\tsurface:1\t/d/nt\tc\trow sans newline\tcamp\t' > "$S32X/t.tsv"
+S32X=$(mktemp -d); printf '2026-01-01 00:00:00\tfeat/nt\tsurface:1\t/d/nt\tc\trow sans newline\tcamp\t' > "$S32X/worktree-tasks.tsv"
 eq "32 no-trailing-newline row is still a row" \
-  "$(CC_TASKS_FILE="$S32X/t.tsv" CC_STATE_DB="$S32X/cc-state.db" "$CC/cc-state" task-get /d/nt | cut -f2)" "feat/nt"
+  "$(CC_STATE_DB="$S32X/cc-state.db" "$CC/cc-state" task-get /d/nt | cut -f2)" "feat/nt"
 rm -rf "$S32X"
 # The four mkdir-lock assertions that stood here are GONE, not moved: there is no lock to hold,
 # reclaim or wait on. Deleting real assertions in exchange for a structural grep is how a suite
@@ -2406,8 +2401,7 @@ rm -rf "$S32X"
 # ── Task 2: the tasks-store verbs (byte contract of the retired cc-board.sh log —
 # frozen as the oracle below — / cc-hooks.sh status / the worktree.zsh rewriters /
 # cc-dispatch.sh's $TMPDIR marker) ──────────
-S32B=$(mktemp -d); export CC_TASKS_FILE="$S32B/t.tsv" CC_STATUS_FILE="$S32B/s.tsv" \
-  CC_ARCHIVE_FILE="$S32B/a.tsv" CC_TABS_FILE="$S32B/b.tsv" CC_STATE_DB="$S32B/cc-state.db"
+S32B=$(mktemp -d); export CC_STATE_DB="$S32B/cc-state.db"
 # task-add / task-get: the placeholder row is exactly the retired cc-board.sh log's
 # row (see the frozen oracle below) with caller+largs left empty for task-set-launch
 # to fill at the end of the dispatch
@@ -2461,11 +2455,11 @@ eq "32 empty ref falls back to ? (frozen)" \
 # replicated from log ([ -n "$dir" ] || exit 0 → task-add returns 0, writes nothing).
 RT32="$(cd "$(mktemp -d)" && pwd -P)"    # live dir: the sweep inside the render must keep it
 RTF32=$(mktemp -u)
-CC_TASKS_FILE="$RTF32" CC_STATE_DB="$RTF32.db" "$CC/cc-state" task-add "$RT32" '' surface:2 'round trip task' feat/rt
-CC_TASKS_FILE="$RTF32" CC_STATE_DB="$RTF32.db" "$CC/cc-state" task-set-launch "$RT32" surface:1 ''
+CC_STATE_DB="$RTF32.db" "$CC/cc-state" task-add "$RT32" '' surface:2 'round trip task' feat/rt
+CC_STATE_DB="$RTF32.db" "$CC/cc-state" task-set-launch "$RT32" surface:1 ''
 eq "32 full write keeps 8 fields" "$(st_dump tasks "$RTF32.db" | awk -F'\t' '{print NF}')" "8"
 eq "32 facade-written row renders on the board" \
-  "$(CC_TASKS_FILE="$RTF32" CC_STATE_DB="$RTF32.db" CC_STATUS_FILE=/dev/null bash "$CC/cc-board.sh" --all 2>/dev/null | grep -c 'round trip task')" "1"
+  "$(CC_STATE_DB="$RTF32.db" bash "$CC/cc-board.sh" --all 2>/dev/null | grep -c 'round trip task')" "1"
 rm -f "$RTF32"
 N32E="$("$CC/cc-state" dump tasks | wc -l | tr -d ' ')"
 "$CC/cc-state" task-add '' feat/x s:1 'no dir' p; rc=$?
@@ -2536,8 +2530,8 @@ eq "32 task-list --archive keeps every row" "$("$CC/cc-state" task-list --archiv
 "$CC/cc-state" task-drop "$D32B"
 eq "32 task-drop removes the dir's rows" "$("$CC/cc-state" dump tasks | grep -c "$D32B")" "0"
 S32C=$(mktemp -d)
-CC_TASKS_FILE="$S32C/one.tsv" CC_STATE_DB="$S32C/cc-state.db" "$CC/cc-state" task-add /d/solo feat/s s:1 solo p
-CC_TASKS_FILE="$S32C/one.tsv" CC_STATE_DB="$S32C/cc-state.db" "$CC/cc-state" task-drop /d/solo
+CC_STATE_DB="$S32C/cc-state.db" "$CC/cc-state" task-add /d/solo feat/s s:1 solo p
+CC_STATE_DB="$S32C/cc-state.db" "$CC/cc-state" task-drop /d/solo
 eq "32 empty row set deletes the file" "$([ -f "$S32C/one.tsv" ] && echo yes || echo no)" "no"
 rm -rf "$S32C"
 # task-prune: sweeps dead-dir rows from the task list AND the sidecar (both real
@@ -2557,7 +2551,7 @@ eq "32 task-prune keeps live sidecar rows" "$("$CC/cc-state" dump status | grep 
 printf '2026-01-01 00:00:00\tfeat/OLD7\tsurface:7\t%s\tsurface:1\told row task\tmain\n' "$LIVE32" | st_append tasks
 "$CC/cc-state" task-prune
 eq "32 7-field row survives the sweep as 7 fields" "$("$CC/cc-state" dump tasks | awk -F'\t' '$2=="feat/OLD7"{print NF}')" "7"
-eq "32 7-field row still renders" "$(CC_STATUS_FILE=/dev/null bash "$CC/cc-board.sh" --all 2>/dev/null | grep -c 'old row task')" "1"
+eq "32 7-field row still renders" "$(bash "$CC/cc-board.sh" --all 2>/dev/null | grep -c 'old row task')" "1"
 # task-archive: row verbatim + merged-at (8→9 fields), moved dirs on stdout, sidecar
 # rows of the moved dirs swept (the _gwt_archive_branch contract)
 "$CC/cc-state" task-set-state "$D32A" blocked          # the moved dir gets a sidecar row
@@ -2686,7 +2680,7 @@ eq "32 tab-prune keeps live uuids (case-folded)" "$("$CC/cc-state" tab-list --al
 eq "32 tab-prune dropped the dead" "$("$CC/cc-state" tab-list --all | cut -f1 | sort -u)" "AAAA-1"
 printf 'surface:1\tZZZZ-0\tworkspace:1\n' > "$S32/live.none"
 "$CC/cc-state" tab-prune "$S32/live.none"
-eq "32 tab-prune all-dead removes the file" "$([ -f "$CC_TABS_FILE" ] && echo yes || echo no)" "no"
+"$CC/cc-state" exists tabs; eq "32 tab-prune all-dead empties the store" "$?" "1"
 # the CLI surface itself
 eq "32 help lists every verb" "$("$CC/cc-state" --help 2>&1 | grep -oE 'task-add|tab-prune|dump' | wc -l | tr -d ' ')" "3"
 "$CC/cc-state" bogus-verb >/dev/null 2>&1; eq "32 unknown verb rc2" "$?" "2"
@@ -2699,11 +2693,11 @@ eq "32 dump status works" "$("$CC/cc-state" dump status)" "$(printf '/d/x\tworki
 # plain-campaign race: 40 concurrent appends against 40 concurrent rewrites of the
 # same pre-existing row — every one of the 41 records must survive.
 S32R=$(mktemp -d); R32="$S32R/race"; mkdir -p "$R32"
-CC_TASKS_FILE="$S32R/t.tsv" CC_STATE_DB="$S32R/cc-state.db" "$CC/cc-state" task-add "$R32" feat/race s:1 'race seed' p
+CC_STATE_DB="$S32R/cc-state.db" "$CC/cc-state" task-add "$R32" feat/race s:1 'race seed' p
 for i in $(seq 1 40); do mkdir -p "$S32R/w$i"; done
 for i in $(seq 1 40); do
-  ( CC_TASKS_FILE="$S32R/t.tsv" CC_STATE_DB="$S32R/cc-state.db" "$CC/cc-state" task-add "$S32R/w$i" "feat/w$i" s:1 "race $i" p ) &
-  ( CC_TASKS_FILE="$S32R/t.tsv" CC_STATE_DB="$S32R/cc-state.db" "$CC/cc-state" task-set-ref "$R32" "surface:$i" "UUID-$i" ) &
+  ( CC_STATE_DB="$S32R/cc-state.db" "$CC/cc-state" task-add "$S32R/w$i" "feat/w$i" s:1 "race $i" p ) &
+  ( CC_STATE_DB="$S32R/cc-state.db" "$CC/cc-state" task-set-ref "$R32" "surface:$i" "UUID-$i" ) &
 done
 wait
 eq "32 no row lost to a concurrent rewrite (B1)" "$(st_dump tasks "$S32R/cc-state.db" | wc -l | tr -d ' ')" "41"
@@ -2804,7 +2798,6 @@ sys.dont_write_bytecode = True   # no __pycache__/ next to the repo's cc-state
 loader = SourceFileLoader("ccstate", sys.argv[1])   # no .py extension → explicit loader
 spec = importlib.util.spec_from_loader("ccstate", loader)
 m = importlib.util.module_from_spec(spec); loader.exec_module(m)
-os.environ["CC_TASKS_FILE"] = sys.argv[2]
 os.environ["CC_STATE_DB"] = sys.argv[2] + ".db"
 m.append_line("tasks", "a\tb")
 def inplace(rows):
@@ -2868,7 +2861,7 @@ eq "32 C5 rc stays 0 through the window" "$r32c5" "0"
 # other verb provides: clearing the agent-state row of a dir that is still ALIVE.
 # task-prune only sweeps dirs that are GONE; task-drop only touches the task list.
 S32CL=$(mktemp -d); D32CL="$S32CL/live dir"; mkdir -p "$D32CL"   # NB: a SPACE in the path
-export CC_STATUS_FILE="$S32CL/s.tsv" CC_TASKS_FILE="$S32CL/t.tsv" CC_STATE_DB="$S32CL/cc-state.db"
+export CC_STATE_DB="$S32CL/cc-state.db"
 P32CL="$(cd "$D32CL" && pwd -P)"
 # D 期：状态是任务行上的列,所以两条状态行各自要有一条任务行。原夹具故意把 tasks 留空来表达
 # 「清除不受板成员资格约束」—— 那个前提在新模型下结构上不成立(没有任务行就没有状态)。同一条
@@ -2895,11 +2888,12 @@ eq "32 clear-state matches a physical row by its logical form" "$("$CC/cc-state"
 c32cl="$("$CC/cc-state" task-clear-state /d/never-recorded 2>&1)"; rc32cl=$?
 eq "32 clear-state on an unknown dir is rc 0" "$rc32cl" "0"
 eq "32 clear-state on an unknown dir is silent" "$c32cl" ""
-# emptying the store removes the file, exactly as today's `[ -s ] || rm -f` does
+# emptying the store leaves NO rows — the observable end of today's `[ -s ] || rm -f`.
+# Stated on rows, not on a file: there has been no per-store file to stat since the engine
+# swap, so the `[ -e ]` form of this assertion could only ever answer "no".
 printf '%s\tworking\t111\n' "$P32CL" | st_seed status
 "$CC/cc-state" task-clear-state "$P32CL"
-eq "32 clear-state emptying the store removes the file" \
-  "$([ -e "$CC_STATUS_FILE" ] && echo yes || echo no)" "no"
+"$CC/cc-state" exists status; eq "32 clear-state leaves the store with no rows" "$?" "1"
 rm -rf "$S32CL"
 
 # ── task-archive --repo / task-prune --compact ───────────────────────────────────
@@ -2908,8 +2902,7 @@ rm -rf "$S32CL"
 # so every existing caller and fixture is untouched — the flags are opt-in.
 S32F=$(mktemp -d); A32="$S32F/repoA"; B32="$S32F/repoB"; O32="$S32F/repoA-other"
 mkdir -p "$A32/wt" "$A32/wt2" "$B32/wt" "$O32/wt"
-export CC_TASKS_FILE="$S32F/t.tsv" CC_ARCHIVE_FILE="$S32F/a.tsv" CC_STATUS_FILE="$S32F/s.tsv" \
-       CC_STATE_DB="$S32F/cc-state.db"
+export CC_STATE_DB="$S32F/cc-state.db"
 # spec 3.5 defect 2: _gwt_archive_branch matched on branch NAME alone, so merging
 # feat/x in repo A archived repo B's feat/x rows too.
 mk32f(){
@@ -2960,7 +2953,7 @@ rm -rf "$S32F"
 # joining on the raw string shows '-' for exactly the rows defect 3 is about, which
 # is a STATUS regression, not a cosmetic one. So the facade owns the join.
 S32S=$(mktemp -d); D32S="$S32S/wt"; mkdir -p "$D32S"
-export CC_TASKS_FILE="$S32S/t.tsv" CC_STATUS_FILE="$S32S/s.tsv" CC_STATE_DB="$S32S/cc-state.db"
+export CC_STATE_DB="$S32S/cc-state.db"
 L32S="$S32S/wt"; P32S="$(cd "$D32S" && pwd -P)"
 # the row is recorded LOGICAL (/var/...), the hook writes the sidecar CANONICAL
 # (/private/var/...) because cc-hooks.sh does cd + pwd -P before calling the facade
@@ -3036,7 +3029,7 @@ TR21="$(cn21 "$(mktemp -d)")"
 FH21=$(mktemp -d); mkdir -p "$FH21/.config"; cp -R "$CC" "$FH21/.config/cc-stack"
 TF21=$(mktemp -u); TB21=$(mktemp -u)
 srf21(){ # $1 = the directory handed to `surface`, always called FROM INSIDE the caller repo
-  ( cd "$CR21" && env HOME="$FH21" PATH="$SF21:$OP21" CC_STATE_DB="$DB_21" CC_TASKS_FILE="$TF21" CC_TABS_FILE="$TB21" \
+  ( cd "$CR21" && env HOME="$FH21" PATH="$SF21:$OP21" CC_STATE_DB="$DB_21" \
       CC_CALLER_CWD="$CR21" CC_WT_PRETRUST=0 CC_WT_SHARE=shared21 CC_SEND_VERIFY_SEC=0.1 \
       CC_SEND_FAILLOG="$SF21/fail" CC_CALLER_SURFACE_UUID="22222222-AAAA-AAAA-AAAA-222222222222" \
       bash "$CC/cc-dispatch.sh" surface "$1" ) >/dev/null 2>&1
@@ -3072,7 +3065,7 @@ printf '2026-01-01 00:00:01\tfeat/ready21\tsurface:801\t%s\tsurface:9\tready mai
   "$MR21" "$U21O" "$U21H" | st_seed tasks "$DB_21"
 printf '%s\t%s\t%s\t-\t2026-01-01 00:00:00\n' "$U21H" "$U21S" "$MR21" | st_seed tabs "$DB_21"
 : > "$CC_FAKE_LOG21"
-CO21="$( cd "$CR21" && env PATH="$SF21:$OP21" CC_STATE_DB="$DB_21" CC_TASKS_FILE="$TF21B" CC_TABS_FILE="$TB21B" \
+CO21="$( cd "$CR21" && env PATH="$SF21:$OP21" CC_STATE_DB="$DB_21" \
     CC_CMUX_SESSIONS="$ST21" CC_CALLER_SURFACE_UUID="$U21S" CLAUDECODE=1 \
     bash "$CC/cc-dispatch.sh" close "$MR21" 2>&1 )"; crc21=$?
 eq "close reads gwt-done from the TARGET repo" "$(echo "$CO21" | grep -c 'branch feat/ready21 is marked ready')" "1"
@@ -3090,7 +3083,7 @@ eq "and it closed BY UUID"                     "$(grep -cF "CLOSE|--surface $U21
 PR21=$(mktemp -d)
 awk '/^_cctabs_uc\(\)/{f=1} /^case /{f=0} f' "$CC/cc-dispatch.sh" > "$PR21/ledger.sh"
 eq "ledger helpers extracted" "$(grep -c '^_cctabs_prune()' "$PR21/ledger.sh")" "1"
-prune21(){ ( set -u; . "$PR21/ledger.sh"; CC_STATE_DB="$DB_21" CC_TABS_FILE="$1" _cctabs_prune "$2" ) >/dev/null 2>&1; }
+prune21(){ ( set -u; . "$PR21/ledger.sh"; CC_STATE_DB="$DB_21" _cctabs_prune "$2" ) >/dev/null 2>&1; }
 L21="$PR21/tabs.tsv"
 mk21(){ { printf 'AAAAAAAA-0000-0000-0000-00000000000A\tOWN\t/tmp/a21\t-\tts\n'
           printf 'BBBBBBBB-0000-0000-0000-00000000000B\tOWN\t/tmp/b21\t-\tts\n'; } | st_seed tabs "$DB_21"; }
@@ -3209,13 +3202,11 @@ REPO29=$(mktemp -d); ( cd "$REPO29"; git init -q; git config user.email t@t; git
   git worktree add -q ".claude/worktrees/wtp" -b feat/v1.2 >/dev/null 2>&1 )
 WTA="$(cn29 "$REPO29/.claude/worktrees/wta")"; WTB="$(cn29 "$REPO29/.claude/worktrees/wtb")"; WTP="$(cn29 "$REPO29/.claude/worktrees/wtp")"
 OTH29="$(cn29 "$(mktemp -d)")"
-svT="${CC_TASKS_FILE:-}"; svS="${CC_STATUS_FILE:-}"; svA="${CC_ARCHIVE_FILE:-}"
-TF29B=$(mktemp -u); SF29B=$(mktemp -u); AF29B=$(mktemp -u)
 printf '2026-01-01 00:00:01\tfeat/wtb\tsurface:41\t%s\tsurface:1\ttask sibling b\tmain\n' "$WTB"  | st_seed tasks "$DB_29"
 printf '2026-01-01 00:00:02\tfeat/v1.2\tsurface:42\t%s\tsurface:1\ttask parent-map\tfeat/STALE7\n' "$WTP" | st_append tasks "$DB_29"
 printf '2026-01-01 00:00:03\tfeat/foreign29\tsurface:43\t%s\tsurface:1\ttask foreign29\tmain\n' "$OTH29" | st_append tasks "$DB_29"
 git -C "$REPO29" config branch.feat/v1.2.ccMergeInto feat/camp-29
-export CC_STATE_DB="$DB_29" CC_TASKS_FILE="$TF29B" CC_STATUS_FILE="$SF29B" CC_ARCHIVE_FILE="$AF29B"
+export CC_STATE_DB="$DB_29"
 
 # ── F1a: the board's repo filter, run from a LINKED WORKTREE, must resolve the MAIN repo root
 # (pre-fix: `git rev-parse --show-toplevel` answered the worktree itself → only its own row)
@@ -3250,8 +3241,8 @@ rm -f "$LOGB29"
 # ── F1b: `resume` run from a linked worktree must list SIBLING rows of the same repo
 TF29R=$(mktemp -u); echo '{}' > "$S29/store29.json"
 printf '2026-01-01 00:00:01\tfeat/rsm-sib\tsurface:51\t%s\tsurface:1\tresume sibling row\tmain\tuuid=66666666-6666-6666-6666-666666666666:provider=anthropic:pm=auto\n' "$WTB" | st_seed tasks "$DB_29"
-OUT29R="$( cd "$WTA" && echo n | env HOME="$HOME" PATH="$S29:$OP29" CC_STATE_DB="$DB_29" CC_TASKS_FILE="$TF29R" \
-  CC_STATE_DB="$DB_29" CC_STATUS_FILE="$SF29B" CC_CMUX_SESSIONS="$S29/store29.json" CC_RESUME_SETTLE=0 \
+OUT29R="$( cd "$WTA" && echo n | env HOME="$HOME" PATH="$S29:$OP29" CC_STATE_DB="$DB_29" \
+  CC_STATE_DB="$DB_29" CC_CMUX_SESSIONS="$S29/store29.json" CC_RESUME_SETTLE=0 \
   CC_SEND_VERIFY_SEC=0.1 CC_SEND_FAILLOG="$FL29" bash "$CC/cc-dispatch.sh" resume 2>&1 )"
 eq "F1 resume: sibling branch listed from a linked worktree" "$(printf '%s' "$OUT29R" | grep -c 'feat/rsm-sib')" "1"
 
@@ -3270,10 +3261,10 @@ SUP29=$(mktemp -d); ( cd "$SUP29" && git init -q && git config user.email t@t &&
 SUB29="$(cn29 "$SUP29/sub")"                       # the submodule CHECKOUT (worktrees don't survive a clone)
 TF29SUB=$(mktemp -u)
 printf '2026-01-01 00:00:01\tfeat/wtb\tsurface:41\t%s\tsurface:1\tsub sibling row\tmain\n' "$SUB29" | st_seed tasks "$DB_29"
-BO29S="$( ( cd "$SUB29" && CC_STATE_DB="$DB_29" CC_TASKS_FILE="$TF29SUB" CC_STATUS_FILE="$SF29B" bash "$CC/cc-board.sh" ) 2>/dev/null )"
+BO29S="$( ( cd "$SUB29" && CC_STATE_DB="$DB_29" bash "$CC/cc-board.sh" ) 2>/dev/null )"
 eq "SUB: board inside a submodule still shows rows" "$(echo "$BO29S" | grep -c 'sub sibling row')" "1"
-OUT29S="$( cd "$SUB29" && echo n | env HOME="$HOME" PATH="$S29:$OP29" CC_STATE_DB="$DB_29" CC_TASKS_FILE="$TF29SUB" \
-  CC_STATE_DB="$DB_29" CC_STATUS_FILE="$SF29B" CC_CMUX_SESSIONS="$S29/store29.json" CC_RESUME_SETTLE=0 \
+OUT29S="$( cd "$SUB29" && echo n | env HOME="$HOME" PATH="$S29:$OP29" CC_STATE_DB="$DB_29" \
+  CC_STATE_DB="$DB_29" CC_CMUX_SESSIONS="$S29/store29.json" CC_RESUME_SETTLE=0 \
   CC_SEND_VERIFY_SEC=0.1 CC_SEND_FAILLOG="$FL29" bash "$CC/cc-dispatch.sh" resume 2>&1 )"
 eq "SUB: resume inside a submodule still lists siblings" "$(printf '%s' "$OUT29S" | grep -c 'feat/wtb')" "1"
 # ── SUBWT (gate round 4 — the regression the OR criterion exists for): from a submodule's
@@ -3287,7 +3278,7 @@ git -C "$SUB29" worktree add -q ".claude/worktrees/swtx" -b feat/swtx >/dev/null
 WTX29="$(cn29 "$SUB29/.claude/worktrees/swtx")"
 TF29X=$(mktemp -u)
 printf '2026-01-01 00:00:01\tfeat/swtx\tsurface:46\t%s\tsurface:1\tsubwt own row\tmain\n' "$WTX29" | st_seed tasks "$DB_29"
-BO29X="$( ( cd "$WTX29" && CC_STATE_DB="$DB_29" CC_TASKS_FILE="$TF29X" CC_STATUS_FILE="$SF29B" bash "$CC/cc-board.sh" ) 2>/dev/null )"
+BO29X="$( ( cd "$WTX29" && CC_STATE_DB="$DB_29" bash "$CC/cc-board.sh" ) 2>/dev/null )"
 eq "SUBWT: a submodule's linked worktree still shows its own row" "$(echo "$BO29X" | grep -c 'subwt own row')" "1"
 rm -rf "$SUP29"; rm -f "$TF29SUB" "$TF29X"
 # --separate-git-dir (gate placement: worktree and gitdir SHARE a parent — the six-shape
@@ -3305,7 +3296,7 @@ WTSEP="$(cn29 "$SEP29B/sepwt")"; SIBSEP="$(cn29 "$SEP29B/sib")"
 TF29SEP=$(mktemp -u)
 printf '2026-01-01 00:00:01\tfeat/sepwt\tsurface:44\t%s\tsurface:1\tsep own row\tmain\n' "$WTSEP"  | st_seed tasks "$DB_29"
 printf '2026-01-01 00:00:02\tfeat/sepsib\tsurface:45\t%s\tsurface:1\tsep sibling row\tmain\n' "$SIBSEP" | st_append tasks "$DB_29"
-BO29SEP="$( ( cd "$WTSEP" && CC_STATE_DB="$DB_29" CC_TASKS_FILE="$TF29SEP" CC_STATUS_FILE="$SF29B" bash "$CC/cc-board.sh" ) 2>/dev/null )"
+BO29SEP="$( ( cd "$WTSEP" && CC_STATE_DB="$DB_29" bash "$CC/cc-board.sh" ) 2>/dev/null )"
 eq "SEP: own row visible from the separate-git-dir checkout (fixture proof)" "$(echo "$BO29SEP" | grep -c 'sep own row')" "1"
 eq "SEP: --separate-git-dir does NOT fall back (sibling under the shared parent shows)" "$(echo "$BO29SEP" | grep -c 'sep sibling row')" "1"
 rm -rf "$SEP29B"; rm -f "$TF29SEP"
@@ -3320,7 +3311,7 @@ git -C "$REPO29" worktree add -q "$OUTWT29" -b feat/outwt >/dev/null 2>&1 || tru
 TF29O=$(mktemp -u)
 printf '2026-01-01 00:00:01\tfeat/outwt\tsurface:47\t%s\tsurface:1\toutwt own row\tmain\n' "$OUTWT29" | st_seed tasks "$DB_29"
 st_dump tasks "$DB_29" | st_append tasks "$DB_29"
-BO29O="$( ( cd "$OUTWT29" && CC_STATE_DB="$DB_29" CC_TASKS_FILE="$TF29O" CC_STATUS_FILE="$SF29B" bash "$CC/cc-board.sh" ) 2>/dev/null )"
+BO29O="$( ( cd "$OUTWT29" && CC_STATE_DB="$DB_29" bash "$CC/cc-board.sh" ) 2>/dev/null )"
 eq "OUTWT: own row visible from the out-of-repo worktree"        "$(echo "$BO29O" | grep -c 'outwt own row')"   "1"
 eq "OUTWT: main-repo sibling rows hidden (containment fallback)" "$(echo "$BO29O" | grep -c 'task sibling b')" "0"
 git -C "$REPO29" worktree remove --force "$OUTWT29" >/dev/null 2>&1; rm -rf "$OWTB29"; rm -f "$TF29O"
@@ -3330,8 +3321,8 @@ git -C "$REPO29" worktree remove --force "$OUTWT29" >/dev/null 2>&1; rm -rf "$OW
 # US (0x1f) is not IFS whitespace, so empty fields survive the awk→read handoff.
 TF297=$(mktemp -u)
 printf '2026-01-01 00:00:01\tfeat/f7-empty-surf\t\t%s\tsurface:1\tf7 task text\tmain\tuuid=77777777-7777-7777-7777-777777777777:provider=anthropic:pm=auto\n' "$WTB" | st_seed tasks "$DB_29"
-OUT297="$( cd "$WTA" && echo n | env HOME="$HOME" PATH="$S29:$OP29" CC_STATE_DB="$DB_29" CC_TASKS_FILE="$TF297" \
-  CC_STATE_DB="$DB_29" CC_STATUS_FILE="$SF29B" CC_CMUX_SESSIONS="$S29/store29.json" CC_RESUME_SETTLE=0 \
+OUT297="$( cd "$WTA" && echo n | env HOME="$HOME" PATH="$S29:$OP29" CC_STATE_DB="$DB_29" \
+  CC_STATE_DB="$DB_29" CC_CMUX_SESSIONS="$S29/store29.json" CC_RESUME_SETTLE=0 \
   CC_SEND_VERIFY_SEC=0.1 CC_SEND_FAILLOG="$FL29" bash "$CC/cc-dispatch.sh" resume 2>&1 )"
 eq "F7: empty surface field keeps the uuid → --resume replay" "$(printf '%s' "$OUT297" | grep -c -- '--resume 77777777-7777-7777-7777-777777777777')" "1"
 eq "F7: not misread as a pre-recording idle row"              "$(printf '%s' "$OUT297" | grep -c 'no recorded session')" "0"
@@ -3375,7 +3366,7 @@ mk29(){ : > "$CC_FAKE_LOG29"; rm -f "$CC_FAKE_LOG29.nscnt"; cp "$1" "$CC_FAKE_SC
         unset CC_FAKE_ON_SEND CC_FAKE_TUI29 CC_FAKE_FLUSH_AT CC_FAKE_PINGDOWN CC_LAUNCH_FILE
         unstamp "$DB_29"; }
 srf29(){ # $1 dir, $2 prompt (screens are set by mk29); extra knobs come from the environment
-  ( cd "$REPO29" && env HOME="$FH29" PATH="$S29:$OP29" TMPDIR="$S29" CC_STATE_DB="$DB_29" CC_TASKS_FILE="$TSKV29" CC_TABS_FILE="$TB29" \
+  ( cd "$REPO29" && env HOME="$FH29" PATH="$S29:$OP29" TMPDIR="$S29" CC_STATE_DB="$DB_29" \
       CC_CALLER_CWD="$REPO29" CC_WT_PRETRUST=0 CC_WT_SHARE="" CC_SEND_VERIFY_SEC=0.1 \
       CC_SEND_FAILLOG="$LF29" CC_CALLER_SURFACE_UUID="22222222-AAAA-AAAA-AAAA-222222222222" \
       CC_WT_SESSION_ID="55555555-5555-5555-5555-555555555555" CC_RESUME_SETTLE=0 \
@@ -3470,10 +3461,10 @@ grep -q '(6) Keep every edit inside THIS worktree' "$CC/cc-dispatch.sh" && ok "A
 
 # ── restore section-external state and sweep every scratch artefact
 PATH="$OP29"
-export CC_STATE_DB="$DB_29" CC_TASKS_FILE="$svT" CC_STATUS_FILE="$svS" CC_ARCHIVE_FILE="$svA"
+export CC_STATE_DB="$DB_29"
 unstamp "$DB_29"
 pfsweep29
-rm -rf "$S29" "$FH29" "$REPO29" "$OTH29" 2>/dev/null; rm -f "$TF29B" "$SF29B" "$AF29B" "$TSKV29" "$TB29" "$LF29" "$FL29"
+rm -rf "$S29" "$FH29" "$REPO29" "$OTH29" 2>/dev/null; rm -f "$TSKV29" "$TB29" "$LF29" "$FL29"
 unset CC_FAKE_LOG29 CC_FAKE_SCREEN29 CC_FAKE_ON_SEND CC_FAKE_TUI29 CC_FAKE_FLUSH_AT CC_FAKE_PINGDOWN CC_LAUNCH_FILE
 
 echo ""
@@ -3562,14 +3553,14 @@ tb18 "$UD" "$UP" "/tmp/cc-gone" "-"  # a dead surface: lazy pruning must drop th
 eq "ledger rows are 5 fields"  "$(st_dump tabs "$DB_18" | awk -F'\t' 'NR==1{print NF}')" "5"
 eq "ledger writes - for an empty field" "$(st_dump tabs "$DB_18" | awk -F'\t' 'NR==2{print $4}')" "-"
 
-tabs18(){ ( cd "$R18" && env PATH="${2:-$CF:$OP18}" CC_STATE_DB="$DB_18" CC_TABS_FILE="$TB18" \
+tabs18(){ ( cd "$R18" && env PATH="${2:-$CF:$OP18}" CC_STATE_DB="$DB_18" \
     CC_CALLER_SURFACE_UUID="${3:-$UP}" bash "$CC/cc-dispatch.sh" tabs ${1:-} ) 2>&1; }
 # cmux unreachable → nothing is pruned (a probe that failed is not evidence that the tabs died)
 TO18="$(tabs18 "" "/usr/bin:/bin")"
 eq "tabs warns when cmux is unreachable" "$(echo "$TO18" | grep -c 'cmux unreachable')" "1"
 # (Task 8b, §4-trap) prune side effects on the ledger: raw `dump tabs`. `tab-list` hides rows
 # this process does not own — with it, pruned and unpruned ledgers read the same
-eq "unreachable cmux prunes nothing"     "$(CC_STATE_DB="$DB_18" CC_TABS_FILE="$TB18" "$CC/cc-state" dump tabs | grep -c "^$UD")" "1"
+eq "unreachable cmux prunes nothing"     "$(CC_STATE_DB="$DB_18" "$CC/cc-state" dump tabs | grep -c "^$UD")" "1"
 # with a live map: the inventory renders and the dead row is pruned away
 TO18="$(tabs18)"
 eq "tabs prints the header"        "$(echo "$TO18" | grep -cE '^REF +UUID +STATE +OWNER +DIR')" "1"
@@ -3577,15 +3568,15 @@ eq "tabs resolves the live ref"    "$(echo "$TO18" | grep -c "surface:100 .*$UA 
 eq "tabs shows the helper tab"     "$(echo "$TO18" | grep -c "$UH .*alive")" "1"
 eq "tabs marks this session"       "$(echo "$TO18" | grep -c "$UP (self)")" "2"
 eq "tabs prints the dir"           "$(echo "$TO18" | grep -cF "$HD18")" "1"
-eq "lazy prune dropped the dead row" "$(CC_STATE_DB="$DB_18" CC_TABS_FILE="$TB18" "$CC/cc-state" dump tabs | awk -v u="$UD" '$1==u{c++} END{print c+0}')" "0"
-eq "lazy prune kept the live rows"    "$(CC_STATE_DB="$DB_18" CC_TABS_FILE="$TB18" "$CC/cc-state" dump tabs | grep -c .)" "2"
+eq "lazy prune dropped the dead row" "$(CC_STATE_DB="$DB_18" "$CC/cc-state" dump tabs | awk -v u="$UD" '$1==u{c++} END{print c+0}')" "0"
+eq "lazy prune kept the live rows"    "$(CC_STATE_DB="$DB_18" "$CC/cc-state" dump tabs | grep -c .)" "2"
 # the default view is "tabs I opened"; --all is everyone's
 tb18 "$UB" "$UO" "$WB" "u2"
 eq "tabs hides another session's row" "$(tabs18 | grep -c "$UB")" "0"
 eq "tabs --all shows every row"       "$(tabs18 --all | grep -c "$UB")" "1"
 
 # — the sanctioned primitive: resolves by RECORDED uuid, prints it, enforces the policy —
-cl18(){ ( cd "$R18" && env PATH="$CF:$OP18" CC_STATE_DB="$DB_18" CC_TASKS_FILE="$TF18" CC_TABS_FILE="$TB18" CC_CMUX_SESSIONS="$ST18" \
+cl18(){ ( cd "$R18" && env PATH="$CF:$OP18" CC_STATE_DB="$DB_18" CC_CMUX_SESSIONS="$ST18" \
     CC_CALLER_SURFACE_UUID="${2:-$UP}" CLAUDECODE=1 bash "$CC/cc-dispatch.sh" close "$1" ) 2>&1; }
 : > "$CC_FAKE_LOG"
 CO="$(cl18 "$WA")"; crc=$?
@@ -3640,7 +3631,7 @@ eq "third-session refusal closes nothing"      "$(grep -c 'CLOSE|' "$CC_FAKE_LOG
 TF18P=$(mktemp -u); TB18P=$(mktemp -u); PW18="$(cn18 "$(mktemp -d)")"; PWD18="$PW18/.claude/worktrees/wtP"; mkdir -p "$PWD18"
 printf '2026-01-01 00:00:01\tfeat/P\tsurface:101\t%s\tsurface:9\tpre-ledger child\tmain\tuuid=u9:provider=anthropic:pm=auto\n' "$PWD18" | st_seed tasks "$TB18P.db"
 printf '%s\t%s\t%s\tu9\t2026-01-01 00:00:00\n' "$UA" "$UP" "$PWD18" | st_seed tabs "$TB18P.db"
-plc18(){ ( cd "$R18" && env PATH="$CF:$OP18" CC_STATE_DB="$TB18P.db" CC_TASKS_FILE="${2:-$TF18P}" CC_TABS_FILE="$TB18P" \
+plc18(){ ( cd "$R18" && env PATH="$CF:$OP18" CC_STATE_DB="$TB18P.db" \
     CC_CMUX_SESSIONS="$ST18" CC_CALLER_SURFACE_UUID="$UP" CLAUDECODE=1 \
     bash "$CC/cc-dispatch.sh" close "$1" ) 2>&1; }
 : > "$CC_FAKE_LOG"
@@ -3668,7 +3659,7 @@ DOWN="$(cn18 "$DR18/.claude/worktrees/wtOwn")"; DOTH="$(cn18 "$DR18/.claude/work
 TF18T=$(mktemp -u); TB18T=$(mktemp -u); : | st_seed tabs "$TB18T.db"
 printf '2026-01-01 00:00:01\tfeat/own\tsurface:101\t%s\tsurface:9\towned child\tmain\t%s\n'   "$DOWN" "$(la18 1 "$UP" "$UA")" | st_seed tasks "$TB18T.db"
 printf '2026-01-01 00:00:02\tfeat/other\tsurface:201\t%s\tsurface:9\tother child\tmain\t%s\n' "$DOTH" "$(la18 2 "$UO" "$UB")" | st_append tasks "$TB18T.db"
-tt18(){ ( cd "$DR18" && env PATH="$CF:$OP18" CC_STATE_DB="$TB18T.db" CC_TASKS_FILE="$TF18T" CC_TABS_FILE="$TB18T" \
+tt18(){ ( cd "$DR18" && env PATH="$CF:$OP18" CC_STATE_DB="$TB18T.db" \
     CC_CMUX_SESSIONS="$ST18" CC_CALLER_SURFACE_UUID="$UP" CLAUDECODE=1 \
     bash "$CC/cc-dispatch.sh" close "$1" >/dev/null 2>&1; echo $? ); }
 eq "truth table: owner + NOT done → allow"      "$(tt18 "$DOWN")" "0"
@@ -3678,7 +3669,7 @@ bash "$CC/cc-merge.sh" done "$DR18" feat/other true >/dev/null 2>&1
 eq "truth table: owner + done → allow"          "$(tt18 "$DOWN")" "0"
 eq "truth table: third party + done → allow"    "$(tt18 "$DOTH")" "0"
 : > "$CC_FAKE_LOG"
-CO="$( ( cd "$DR18" && env PATH="$CF:$OP18" CC_STATE_DB="$TB18T.db" CC_TASKS_FILE="$TF18T" CC_TABS_FILE="$TB18T" \
+CO="$( ( cd "$DR18" && env PATH="$CF:$OP18" CC_STATE_DB="$TB18T.db" \
     CC_CMUX_SESSIONS="$ST18" CC_CALLER_SURFACE_UUID="$UP" CLAUDECODE=1 \
     bash "$CC/cc-dispatch.sh" close "$DOTH" ) 2>&1 )"
 eq "done-unlock says why it is allowed" "$(echo "$CO" | grep -c 'collectible by any automated caller')" "1"
@@ -3716,7 +3707,7 @@ chmod +x "$CF/ps"
 printf '90001 90002 -/bin/zsh\n90002 90003 /usr/bin/login\n90003 1 /sbin/launchd\n' > "$CF/ps.human"
 printf '90001 90002 /bin/bash\n90002 90003 /opt/homebrew/bin/claude\n90003 1 /sbin/launchd\n' > "$CF/ps.agent"
 anc18(){ # $1 = chain fixture, $2 = dir  →  runs the primitive with CLAUDECODE stripped
-  ( cd "$R18" && env -u CLAUDECODE PATH="$CF:$OP18" CC_STATE_DB="$DB_18" CC_TASKS_FILE="$TF18" CC_TABS_FILE="$TB18" \
+  ( cd "$R18" && env -u CLAUDECODE PATH="$CF:$OP18" CC_STATE_DB="$DB_18" \
       CC_CMUX_SESSIONS="$ST18" CC_FAKE_PSMAP="$CF/ps.$1" CC_CALLER_SURFACE_UUID="$UP" \
       bash "$CC/cc-dispatch.sh" close "$2" ) 2>&1; }
 : > "$CC_FAKE_LOG"
@@ -3733,7 +3724,7 @@ eq "human shell still reports the owner"   "$(echo "$CO" | grep -c 'ownership ch
 CO="$(anc18 human "$R18")"
 eq "human shell still refused the primary checkout" "$(echo "$CO" | grep -c 'not a worktree checkout')" "1"
 : > "$CC_FAKE_LOG"
-CO="$( ( cd "$R18" && env -u CLAUDECODE PATH="$CF:$OP18" CC_STATE_DB="$DB_18" CC_TASKS_FILE="$TF18" CC_TABS_FILE="$TB18" \
+CO="$( ( cd "$R18" && env -u CLAUDECODE PATH="$CF:$OP18" CC_STATE_DB="$DB_18" \
       CC_CMUX_SESSIONS="$ST18" CC_FAKE_PSMAP="$CF/ps.human" CC_CALLER_SURFACE_UUID="$UA" \
       bash "$CC/cc-dispatch.sh" close "$WA" ) 2>&1 )"
 eq "human shell still refused a self-close" "$(echo "$CO" | grep -c 'no automated self-close')" "1"
@@ -3743,30 +3734,30 @@ eq "self refusal closed nothing"            "$(grep -c 'CLOSE|' "$CC_FAKE_LOG")"
 FH18=$(mktemp -d); mkdir -p "$FH18/.config"; cp -R "$CC" "$FH18/.config/cc-stack"
 TF18D=$(mktemp -u); TB18D=$(mktemp -u); DD="$(cn18 "$(mktemp -d)")"
 : > "$CC_FAKE_LOG"
-env HOME="$FH18" PATH="$CF:$OP18" CC_STATE_DB="$TB18D.db" CC_TASKS_FILE="$TF18D" CC_TABS_FILE="$TB18D" CC_CMUX_SESSIONS="$ST18" \
+env HOME="$FH18" PATH="$CF:$OP18" CC_STATE_DB="$TB18D.db" CC_CMUX_SESSIONS="$ST18" \
   CC_SEND_FAILLOG="$CF/fail" CC_SEND_VERIFY_SEC=0.1 CC_LAUNCH_FILE="$CF/launch" \
   CC_CALLER_SURFACE_UUID="$UP" bash "$CC/cc-dispatch.sh" surface "$DD" "dispatch brief" >/dev/null 2>&1
-DLA="$(CC_STATE_DB="$TB18D.db" CC_TASKS_FILE="$TF18D" "$CC/cc-state" task-get "$DD" | awk -F'\t' '{print $8}')"
+DLA="$(CC_STATE_DB="$TB18D.db" "$CC/cc-state" task-get "$DD" | awk -F'\t' '{print $8}')"
 NSU="$(grep -oE 'NEWSURF\|surface:[0-9]+' "$CC_FAKE_LOG" | head -1 | cut -d: -f2)"
 DSU="99999999-7777-7777-7777-$(printf '%012d' "$NSU")"
 eq "dispatch asks for both ids" "$(grep -c -- '--id-format both' "$CC_FAKE_LOG")" "1"
 eq "row records the caller uuid" "$(printf '%s' "$DLA" | grep -c "csuuid=$UP")" "1"
 eq "row records the tab uuid"    "$(printf '%s' "$DLA" | grep -c "suuid=$DSU")" "1"
 eq "model still composed LAST"   "$(printf '%s' "$DLA" | grep -c 'suuid=[^:]*$')" "1"
-eq "dispatch row has 8 fields"   "$(CC_STATE_DB="$TB18D.db" CC_TASKS_FILE="$TF18D" "$CC/cc-state" task-get "$DD" | awk -F'\t' '{print NF}')" "8"
+eq "dispatch row has 8 fields"   "$(CC_STATE_DB="$TB18D.db" "$CC/cc-state" task-get "$DD" | awk -F'\t' '{print NF}')" "8"
 # the second ledger: one row per opened tab, keyed by the tab's own surface uuid
 # the ledger gaining a row IS the assertion (a write side effect) → raw `dump tabs`; the OWNER
 # has its own verb, `tab-owner <suuid>`, which answers exactly this question. The remaining
 # fields (dir, session) have no by-uuid verb — tab-resolve goes dir→candidates, not uuid→row.
-eq "ledger row written on open"     "$(CC_STATE_DB="$TB18D.db" CC_TABS_FILE="$TB18D" "$CC/cc-state" dump tabs | awk -F'\t' -v u="$DSU" 'toupper($1)==toupper(u){c++} END{print c+0}')" "1"
-eq "ledger row records the OWNER"   "$(CC_STATE_DB="$TB18D.db" CC_TABS_FILE="$TB18D" "$CC/cc-state" tab-owner "$DSU")" "$UP"
-eq "ledger row records the dir"     "$(CC_STATE_DB="$TB18D.db" CC_TABS_FILE="$TB18D" "$CC/cc-state" dump tabs | awk -F'\t' -v u="$DSU" 'toupper($1)==toupper(u){print $3}')" "$DD"
-eq "ledger row records the session" "$(CC_STATE_DB="$TB18D.db" CC_TABS_FILE="$TB18D" "$CC/cc-state" dump tabs | awk -F'\t' -v u="$DSU" 'toupper($1)==toupper(u){print ($4!="-" && $4!="")?"yes":"no"}')" "yes"
-eq "ledger session matches the board" "$(CC_STATE_DB="$TB18D.db" CC_TABS_FILE="$TB18D" "$CC/cc-state" dump tabs | awk -F'\t' -v u="$DSU" 'toupper($1)==toupper(u){print "uuid=" $4}')" "$(printf '%s' "$DLA" | cut -d: -f1)"
+eq "ledger row written on open"     "$(CC_STATE_DB="$TB18D.db" "$CC/cc-state" dump tabs | awk -F'\t' -v u="$DSU" 'toupper($1)==toupper(u){c++} END{print c+0}')" "1"
+eq "ledger row records the OWNER"   "$(CC_STATE_DB="$TB18D.db" "$CC/cc-state" tab-owner "$DSU")" "$UP"
+eq "ledger row records the dir"     "$(CC_STATE_DB="$TB18D.db" "$CC/cc-state" dump tabs | awk -F'\t' -v u="$DSU" 'toupper($1)==toupper(u){print $3}')" "$DD"
+eq "ledger row records the session" "$(CC_STATE_DB="$TB18D.db" "$CC/cc-state" dump tabs | awk -F'\t' -v u="$DSU" 'toupper($1)==toupper(u){print ($4!="-" && $4!="")?"yes":"no"}')" "yes"
+eq "ledger session matches the board" "$(CC_STATE_DB="$TB18D.db" "$CC/cc-state" dump tabs | awk -F'\t' -v u="$DSU" 'toupper($1)==toupper(u){print "uuid=" $4}')" "$(printf '%s' "$DLA" | cut -d: -f1)"
 # both counts stay RAW: each verb collapses its store to at most one row per key (task-get to
 # the newest, tab-owner to one owner), and "kept in BOTH ledgers, never deduped" is precisely
 # a statement about how many rows are on disk
-eq "board and ledger both kept (no dedupe)" "$(CC_STATE_DB="$TB18D.db" CC_TASKS_FILE="$TF18D" "$CC/cc-state" dump tasks | awk -F'\t' -v d="$DD" '$4==d{c++} END{print c+0}')+$(CC_STATE_DB="$TB18D.db" CC_TABS_FILE="$TB18D" "$CC/cc-state" dump tabs | awk -F'\t' -v d="$DD" '$3==d{c++} END{print c+0}')" "1+1"
+eq "board and ledger both kept (no dedupe)" "$(CC_STATE_DB="$TB18D.db" "$CC/cc-state" dump tasks | awk -F'\t' -v d="$DD" '$4==d{c++} END{print c+0}')+$(CC_STATE_DB="$TB18D.db" "$CC/cc-state" dump tabs | awk -F'\t' -v d="$DD" '$3==d{c++} END{print c+0}')" "1+1"
 unstamp "$TB18D.db"
 # WINDOW B (spec §3.1): resume REOPENS a tab, so it must stamp the dedup timestamp too. The stamp
 # used to sit inside the `if [ -z "$rsmode" ]` branch, i.e. only on the fresh-dispatch path, so a
@@ -3774,24 +3765,24 @@ unstamp "$TB18D.db"
 # opened a SECOND one. Behavioural, not a grep: dispatch in resume mode against a row that already
 # exists (which is exactly why resume skips task-add), then ask the gate itself.
 WB18="$(cn18 "$(mktemp -d)")"
-env CC_STATE_DB="$TB18D.db" CC_TASKS_FILE="$TF18D" "$CC/cc-state" task-add "$WB18" "" s:1 'resume row' main >/dev/null
-eq "window B: no stamp before the resume" "$(env CC_STATE_DB="$TB18D.db" CC_TASKS_FILE="$TF18D" "$CC/cc-state" task-opened-recently "$WB18" 120; echo $?)" "1"
+env CC_STATE_DB="$TB18D.db" "$CC/cc-state" task-add "$WB18" "" s:1 'resume row' main >/dev/null
+eq "window B: no stamp before the resume" "$(env CC_STATE_DB="$TB18D.db" "$CC/cc-state" task-opened-recently "$WB18" 120; echo $?)" "1"
 : > "$CC_FAKE_LOG"
-env HOME="$FH18" PATH="$CF:$OP18" CC_STATE_DB="$TB18D.db" CC_TASKS_FILE="$TF18D" CC_TABS_FILE="$TB18D" \
+env HOME="$FH18" PATH="$CF:$OP18" CC_STATE_DB="$TB18D.db" \
   CC_CMUX_SESSIONS="$ST18" CC_SEND_FAILLOG="$CF/fail" CC_SEND_VERIFY_SEC=0.1 CC_LAUNCH_FILE="$CF/launch" \
   CC_CALLER_SURFACE_UUID="$UP" CC_WT_LAUNCH_CMD='ccteam --resume probe' \
   bash "$CC/cc-dispatch.sh" surface "$WB18" "resume brief" >/dev/null 2>&1
 eq "window B: resume really reopened a tab" "$(grep -c 'NEWSURF|' "$CC_FAKE_LOG")" "1"
-eq "window B: and it stamped the dedup timestamp" "$(env CC_STATE_DB="$TB18D.db" CC_TASKS_FILE="$TF18D" "$CC/cc-state" task-opened-recently "$WB18" 120; echo $?)" "0"
+eq "window B: and it stamped the dedup timestamp" "$(env CC_STATE_DB="$TB18D.db" "$CC/cc-state" task-opened-recently "$WB18" 120; echo $?)" "0"
 # …and a workspace open (gwt-new / gwt-adopt path) lands in the same ledger
 WSD="$(cn18 "$(mktemp -d)")"
 : > "$CC_FAKE_LOG"
-env HOME="$FH18" PATH="$CF:$OP18" CC_STATE_DB="$TB18D.db" CC_TABS_FILE="$TB18D" CC_CALLER_SURFACE_UUID="$UP" \
+env HOME="$FH18" PATH="$CF:$OP18" CC_STATE_DB="$TB18D.db" CC_CALLER_SURFACE_UUID="$UP" \
   bash "$CC/cc-dispatch.sh" workspace "$WSD" >/dev/null 2>&1
 WSU="$(grep -oE 'NEWWS\|' "$CC_FAKE_LOG" | head -1)"
 eq "workspace really opened one"     "${WSU:-none}" "NEWWS|"
-eq "workspace open records a row"    "$(CC_STATE_DB="$TB18D.db" CC_TABS_FILE="$TB18D" "$CC/cc-state" dump tabs | awk -F'\t' -v d="$WSD" '$3==d{c++} END{print c+0}')" "1"
-eq "workspace row records the owner" "$(CC_STATE_DB="$TB18D.db" CC_TABS_FILE="$TB18D" "$CC/cc-state" dump tabs | awk -F'\t' -v d="$WSD" '$3==d{print $2}')" "$UP"
+eq "workspace open records a row"    "$(CC_STATE_DB="$TB18D.db" "$CC/cc-state" dump tabs | awk -F'\t' -v d="$WSD" '$3==d{c++} END{print c+0}')" "1"
+eq "workspace row records the owner" "$(CC_STATE_DB="$TB18D.db" "$CC/cc-state" dump tabs | awk -F'\t' -v d="$WSD" '$3==d{print $2}')" "$UP"
 
 # — old rows keep working: a 7-field board row parses and simply has no recorded identity —
 TF18O=$(mktemp -u); WO7="$(cn18 "$(mktemp -d)")"
@@ -3799,8 +3790,8 @@ printf '2026-01-01 00:00:01\tfeat/O7\tsurface:101\t%s\tsurface:9\tseven fields\t
 # FORMAT PIN: the fixture row's own layout, selected by file position — direct read stays
 eq "7-field row still 7 fields" "$(st_dump tasks "$TF18O.db" | awk -F'\t' 'NR==1{print NF}')" "7"
 TB18O=$(mktemp -u); : | st_seed tabs "$TF18O.db"
-eq "7-field row has nothing to close" "$( ( cd "$R18" && env PATH="$CF:$OP18" CC_STATE_DB="$TF18O.db" CC_TASKS_FILE="$TF18O" \
-  CC_STATE_DB="$TF18O.db" CC_TABS_FILE="$TB18O" CC_CMUX_SESSIONS="$ST18" CC_CALLER_SURFACE_UUID="$UP" CLAUDECODE=1 \
+eq "7-field row has nothing to close" "$( ( cd "$R18" && env PATH="$CF:$OP18" CC_STATE_DB="$TF18O.db" \
+  CC_STATE_DB="$TF18O.db" CC_CMUX_SESSIONS="$ST18" CC_CALLER_SURFACE_UUID="$UP" CLAUDECODE=1 \
   bash "$CC/cc-dispatch.sh" close "$WO7" 2>&1 | grep -c 'nothing to do' ) )" "1"
 
 # — gwt-rm --close routes the tab close through the primitive (and only that way) —
@@ -3811,7 +3802,7 @@ SW18="$(cn18 "$RM18/.claude/worktrees/wtS")"
 TF18R=$(mktemp -u); SF18R=$(mktemp -u); TB18R=$(mktemp -u); : | st_seed tabs "$TB18R.db"
 printf '2026-01-01 00:00:01\tfeat/S\tsurface:101\t%s\tsurface:9\trm close\tmain\t%s\n' "$SW18" "$(la18 5 "$UP" "$UA")" | st_seed tasks "$TB18R.db"
 : > "$CC_FAKE_LOG"
-RMOUT="$(env HOME="$FH18" PATH="$CF:$OP18" CC_STATE_DB="$TB18R.db" CC_TASKS_FILE="$TF18R" CC_STATUS_FILE="$SF18R" CC_TABS_FILE="$TB18R" \
+RMOUT="$(env HOME="$FH18" PATH="$CF:$OP18" CC_STATE_DB="$TB18R.db" \
   CC_CMUX_SESSIONS="$ST18" CC_CALLER_SURFACE_UUID="$UP" \
   zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; cd '$RM18'; gwt-rm wtS --close" 2>&1)"
 eq "gwt-rm --close removed the worktree" "$([ -d "$SW18" ] && echo yes || echo no)" "no"
@@ -3819,13 +3810,13 @@ eq "gwt-rm --close closed BY UUID"       "$(grep -cF "CLOSE|--surface $UA" "$CC_
 eq "gwt-rm --close printed the resolution" "$(echo "$RMOUT" | grep -c "uuid=$UA")" "1"
 # a row REMOVAL: raw read (and `dump` of the store gwt-rm may have deleted outright is silently
 # empty, so the `2>/dev/null || echo 0` fallback the awk needed is gone rather than muffled)
-eq "gwt-rm --close still drops the row"  "$(CC_STATE_DB="$TB18R.db" CC_TASKS_FILE="$TF18R" "$CC/cc-state" dump tasks | awk -F'\t' -v d="$SW18" '$4==d{c++} END{print c+0}')" "0"
+eq "gwt-rm --close still drops the row"  "$(CC_STATE_DB="$TB18R.db" "$CC/cc-state" dump tasks | awk -F'\t' -v d="$SW18" '$4==d{c++} END{print c+0}')" "0"
 # plain gwt-rm (no flag) touches no tab
 ( cd "$RM18" && git worktree add -q .claude/worktrees/wtT -b feat/T >/dev/null )
 ST18B="$(cn18 "$RM18/.claude/worktrees/wtT")"
 printf '2026-01-01 00:00:02\tfeat/T\tsurface:102\t%s\tsurface:9\tno close\tmain\t%s\n' "$ST18B" "$(la18 6 "$UP" "$UA")" | st_seed tasks "$TB18R.db"
 : > "$CC_FAKE_LOG"
-env HOME="$FH18" PATH="$CF:$OP18" CC_STATE_DB="$TB18R.db" CC_TASKS_FILE="$TF18R" CC_STATUS_FILE="$SF18R" CC_TABS_FILE="$TB18R" \
+env HOME="$FH18" PATH="$CF:$OP18" CC_STATE_DB="$TB18R.db" \
   CC_CMUX_SESSIONS="$ST18" CC_CALLER_SURFACE_UUID="$UP" \
   zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; cd '$RM18'; gwt-rm wtT" >/dev/null 2>&1
 eq "plain gwt-rm closes no tab"          "$(grep -c 'CLOSE|' "$CC_FAKE_LOG")" "0"
@@ -3962,7 +3953,7 @@ DD35="$(cn35 "$(mktemp -d)")"; TF35=$(mktemp -u); TB35=$(mktemp -u)   # physical
 : > "$CC_35_LOG"; rm -f "${CC_35_LOG}.nscnt" "${CC_35_LOG}.saw" "${CC_35_LOG}.launched"
 export CC_35_DIR="$DD35"; export CC_35_LIVE="$S35/live.empty"; : > "$CC_35_LIVE"
 CC_35_SCREEN="$S35/scr-settle" \
-env PATH="$S35:$OP35" TMPDIR="$TMPDIR" CC_STATE_DB="$DB_35" CC_TASKS_FILE="$TF35" CC_TABS_FILE="$TB35" \
+env PATH="$S35:$OP35" TMPDIR="$TMPDIR" CC_STATE_DB="$DB_35" \
   CC_SEND_FAILLOG="$S35/fail" CC_SEND_VERIFY_SEC=0.1 CC_LAUNCH_FILE="$S35/launch" \
   CC_WT_PRETRUST=0 CC_WT_SESSION_ID="abcdef01-1234-4567-890a-bcdef0123456" \
   CC_WT_PERMISSION_MODE=plan CC_CALLER_SURFACE_UUID="CCCCCCCC-3333-3333-3333-333333333333" \
@@ -3972,19 +3963,19 @@ eq "35 dispatch opened exactly one tab"  "$(grep -c 'NEWSURF' "$CC_35_LOG")" "1"
 # (Task 8) the dispatch row's assertions read through the facade — task-get picks the dir's
 # newest row (what the old '$4==d' awk selected); TF35 is a section-local file, so the read
 # is env-scoped to it. Expected values unchanged.
-eq "35 completed row has its launch args" "$(CC_STATE_DB="$DB_35" CC_TASKS_FILE="$TF35" "$CC/cc-state" task-get "$DD35" | awk -F'\t' '{print ($8 ~ /uuid=/)?"y":"n"}')" "y"
-eq "35 completed row has its caller ref"  "$(CC_STATE_DB="$DB_35" CC_TASKS_FILE="$TF35" "$CC/cc-state" task-get "$DD35" | awk -F'\t' '{print $5}')" "surface:9"
+eq "35 completed row has its launch args" "$(CC_STATE_DB="$DB_35" "$CC/cc-state" task-get "$DD35" | awk -F'\t' '{print ($8 ~ /uuid=/)?"y":"n"}')" "y"
+eq "35 completed row has its caller ref"  "$(CC_STATE_DB="$DB_35" "$CC/cc-state" task-get "$DD35" | awk -F'\t' '{print $5}')" "surface:9"
 # D 期：戳记是 tasks 上的 tab_opened_ts 列,不再是 $TMPDIR 里的标记文件。问题没变 ——
 # 「这个 dir 最近开过 tab 吗」—— 所以这两条断言的主题一字未动,只是问法换了。
 eq "35 dispatch stamped the dedup timestamp" \
-  "$(env CC_STATE_DB="$DB_35" CC_TASKS_FILE="$TF35" "$CC/cc-state" task-opened-recently "$DD35" 120; echo $?)" "0"
+  "$(env CC_STATE_DB="$DB_35" "$CC/cc-state" task-opened-recently "$DD35" 120; echo $?)" "0"
 
 # H2 window: a fresh marker silently eats the retry; a 121s-stale one lets it through
 n35b=$(grep -c 'NEWSURF' "$CC_35_LOG")
-env PATH="$S35:$OP35" TMPDIR="$TMPDIR" CC_STATE_DB="$DB_35" CC_TASKS_FILE="$TF35" CC_TABS_FILE="$TB35" \
+env PATH="$S35:$OP35" TMPDIR="$TMPDIR" CC_STATE_DB="$DB_35" \
   CC_SEND_FAILLOG="$S35/fail" CC_SEND_VERIFY_SEC=0.1 CC_WT_PRETRUST=0 \
   bash "$CC/cc-dispatch.sh" surface "$DD35" "retry brief" >/dev/null 2>&1
-eq "35 fresh stamp eats the retry"  "$([ "$(grep -c 'NEWSURF' "$CC_35_LOG")" = "$n35b" ] && [ "$(CC_STATE_DB="$DB_35" CC_TASKS_FILE="$TF35" "$CC/cc-state" dump tasks | wc -l | tr -d ' ')" = 1 ] && echo yes || echo no)" "yes"
+eq "35 fresh stamp eats the retry"  "$([ "$(grep -c 'NEWSURF' "$CC_35_LOG")" = "$n35b" ] && [ "$(CC_STATE_DB="$DB_35" "$CC/cc-state" dump tasks | wc -l | tr -d ' ')" = 1 ] && echo yes || echo no)" "yes"
 # 把戳记做旧 121 秒（原来是 touch -t 那个标记文件）
 python3 -c 'import sqlite3, sys, time
 c = sqlite3.connect(sys.argv[1])
@@ -3992,7 +3983,7 @@ c.execute("UPDATE tasks SET tab_opened_ts=? WHERE tab_opened_ts IS NOT NULL", (i
 c.commit()' "$DB_35"
 : > "$CC_35_LOG"; rm -f "${CC_35_LOG}.nscnt"
 CC_35_SCREEN="$S35/scr-tui" \
-env PATH="$S35:$OP35" TMPDIR="$TMPDIR" CC_STATE_DB="$DB_35" CC_TASKS_FILE="$TF35" CC_TABS_FILE="$TB35" \
+env PATH="$S35:$OP35" TMPDIR="$TMPDIR" CC_STATE_DB="$DB_35" \
   CC_SEND_FAILLOG="$S35/fail" CC_SEND_VERIFY_SEC=0.1 CC_WT_PRETRUST=0 \
   bash "$CC/cc-dispatch.sh" surface "$DD35" "retry brief" >/dev/null 2>&1
 eq "35 stale (121s) stamp lets the retry through" "$(grep -c 'NEWSURF' "$CC_35_LOG")" "1"
@@ -4003,7 +3994,7 @@ UP35="CCCCCCCC-3333-3333-3333-333333333333"; UO35="DDDDDDDD-4444-4444-4444-44444
 R35="$(mktemp -d)"; mkdir -p "$R35/.claude/worktrees/wt35"; WA35="$R35/.claude/worktrees/wt35"
 printf '  surface:100\t%s\tw1\n' "$UA35" > "$S35/live.one"
 TF35C=$(mktemp -u); TB35C=$(mktemp -u); echo '{}' > "$S35/store35.json"
-cl35(){ ( cd "$R35" && env PATH="$S35:$OP35" CC_STATE_DB="$DB_35" CC_TASKS_FILE="$TF35C" CC_TABS_FILE="$TB35C" \
+cl35(){ ( cd "$R35" && env PATH="$S35:$OP35" CC_STATE_DB="$DB_35" \
     CC_CMUX_SESSIONS="$S35/store35.json" CC_CALLER_SURFACE_UUID="${2:-$UP35}" CLAUDECODE=1 \
     CC_35_NOWS="${3:-}" CC_35_LIVE="${4:-$S35/live.one}" \
     bash "$CC/cc-dispatch.sh" close "${1:-$WA35}" ) 2>&1; }
@@ -4061,25 +4052,25 @@ PY35
 { printf '  surface:41\t%s\tw1\n' "$SP35"; printf '  surface:42\t%s\tw1\n' "$S735"; } > "$S35/live.resume"
 : > "$CC_35_LOG"; rm -f "${CC_35_LOG}.nscnt"
 CC_35_LIVE="$S35/live.resume" CC_35_SCREEN="$S35/scr-tui" \
-env HOME="$FH35" PATH="$S35:$OP35" TMPDIR="$TMPDIR" CC_STATE_DB="$DB_35" CC_TASKS_FILE="$TF35R" CC_STATUS_FILE="$SF35R" \
-  CC_STATE_DB="$DB_35" CC_TABS_FILE="$(mktemp -u)" CC_CMUX_SESSIONS="$S35/store35b.json" CC_RESUME_SETTLE=0 \
+env HOME="$FH35" PATH="$S35:$OP35" TMPDIR="$TMPDIR" CC_STATE_DB="$DB_35" \
+  CC_STATE_DB="$DB_35" CC_CMUX_SESSIONS="$S35/store35b.json" CC_RESUME_SETTLE=0 \
   CC_SEND_VERIFY_SEC=0.1 CC_WT_PRETRUST=0 CC_SEND_FAILLOG="$S35/fail" \
   bash -c 'printf "y\n" | "$0" resume --all' "$FH35/.config/cc-stack/cc-dispatch.sh" >/dev/null 2>&1
 # spec §3.5 #1 — _ccres_dropstatus split on whitespace; a dir WITH A SPACE never lost its row
 # (Task 8) sidecar reads via `dump status`, env-scoped to the section-local file
-eq "35 resume clears a space-dir sidecar row" "$(CC_STATE_DB="$DB_35" CC_STATUS_FILE="$SF35R" "$CC/cc-state" dump status | grep -cF "$DSP35")" "0"
-eq "35 resume clears the reopened dir's sidecar row" "$(CC_STATE_DB="$DB_35" CC_STATUS_FILE="$SF35R" "$CC/cc-state" dump status | grep -cF "$LOGD35")" "0"
-eq "35 resume keeps unrelated sidecar rows"  "$(CC_STATE_DB="$DB_35" CC_STATUS_FILE="$SF35R" "$CC/cc-state" dump status | grep -cF "$RD35/elsewhere")" "1"
+eq "35 resume clears a space-dir sidecar row" "$(CC_STATE_DB="$DB_35" "$CC/cc-state" dump status | grep -cF "$DSP35")" "0"
+eq "35 resume clears the reopened dir's sidecar row" "$(CC_STATE_DB="$DB_35" "$CC/cc-state" dump status | grep -cF "$LOGD35")" "0"
+eq "35 resume keeps unrelated sidecar rows"  "$(CC_STATE_DB="$DB_35" "$CC/cc-state" dump status | grep -cF "$RD35/elsewhere")" "1"
 # spec §3.5 #6 — the old $3=r OFS rebuild widened legacy rows; the facade rewrite must not
 eq "35 resume keeps a 7-field row 7 fields" \
-  "$(CC_STATE_DB="$DB_35" CC_TASKS_FILE="$TF35R" "$CC/cc-state" task-get "$D735" | awk -F'\t' '{print NF}')" "7"
+  "$(CC_STATE_DB="$DB_35" "$CC/cc-state" task-get "$D735" | awk -F'\t' '{print NF}')" "7"
 eq "35 7-field row still got its ref refreshed" \
-  "$(CC_STATE_DB="$DB_35" CC_TASKS_FILE="$TF35R" "$CC/cc-state" task-get "$D735" | awk -F'\t' '{print $3}')" "surface:42"
+  "$(CC_STATE_DB="$DB_35" "$CC/cc-state" task-get "$D735" | awk -F'\t' '{print $3}')" "surface:42"
 # H3 — the recorded dir string survives the refresh as the row's own field (the facade matches it
 # through the canonical form; what it writes back is the RECORDED string), and the reopened tab
 # went to that dir (surface canonicalizes for cmux, as it always has)
 eq "35 refreshed row keeps its logical dir string" \
-  "$(CC_STATE_DB="$DB_35" CC_TASKS_FILE="$TF35R" "$CC/cc-state" task-get "$LOGD35" | awk -F'\t' '{print $4}')" "$LOGD35"
+  "$(CC_STATE_DB="$DB_35" "$CC/cc-state" task-get "$LOGD35" | awk -F'\t' '{print $4}')" "$LOGD35"
 eq "35 logical row's tab reopened in its dir" \
   "$(grep 'NEWSURF' "$CC_35_LOG" | grep -cF -- "--working-directory $PHYD35")" "1"
 
@@ -4289,8 +4280,8 @@ CGD=$(mktemp -d); CGDR="$(cn "$CGD")"
 ( cd "$CGDR"; git init -q; git config user.email t@t; git config user.name t; git commit -q --allow-empty -m i
   mkdir .claude; git worktree add -q .claude/worktrees/wd -b feat/wd >/dev/null )
 CGDW="$(cn "$CGDR/.claude/worktrees/wd")"
-( cd "$CGDR" && env HOME="$FH25" PATH="$CGS:$OP25" CC_STATE_DB="$DB_25" CC_TASKS_FILE="$CC_TEST_SANDBOX/25-tasks.tsv" \
-    CC_STATE_DB="$DB_25" CC_TABS_FILE="$CC_TEST_SANDBOX/25-tabs.tsv" CC_WT_PRETRUST=0 CC_WT_SHARE="" CC_SEND_VERIFY_SEC=0.1 \
+( cd "$CGDR" && env HOME="$FH25" PATH="$CGS:$OP25" CC_STATE_DB="$DB_25" \
+    CC_STATE_DB="$DB_25" CC_WT_PRETRUST=0 CC_WT_SHARE="" CC_SEND_VERIFY_SEC=0.1 \
     CC_SEND_FAILLOG="$CGS/fail" bash "$CC/cc-dispatch.sh" surface "$CGDW" ) >/dev/null 2>&1
 eq "surface mounts the gate"             "$(grep -c 'cc-stack:commit-gate' "$CGDR/.git/hooks/pre-commit" 2>/dev/null || echo 0)" "1"
 cgb="$(cgn "$CGDW")"
@@ -4299,15 +4290,15 @@ eq "and a dispatched worktree is gated"  "$(cgn "$CGDW")" "$cgb"
 # a MAIN checkout handed to the public `surface` subcommand gets no hook it never asked for
 CGT=$(mktemp -d); CGTR="$(cn "$CGT")"
 ( cd "$CGTR"; git init -q; git config user.email t@t; git config user.name t; git commit -q --allow-empty -m i )
-( cd "$CGDR" && env HOME="$FH25" PATH="$CGS:$OP25" CC_STATE_DB="$DB_25" CC_TASKS_FILE="$CC_TEST_SANDBOX/25-tasks.tsv" \
-    CC_STATE_DB="$DB_25" CC_TABS_FILE="$CC_TEST_SANDBOX/25-tabs.tsv" CC_WT_PRETRUST=0 CC_WT_SHARE="" CC_SEND_VERIFY_SEC=0.1 \
+( cd "$CGDR" && env HOME="$FH25" PATH="$CGS:$OP25" CC_STATE_DB="$DB_25" \
+    CC_STATE_DB="$DB_25" CC_WT_PRETRUST=0 CC_WT_SHARE="" CC_SEND_VERIFY_SEC=0.1 \
     CC_SEND_FAILLOG="$CGS/fail" bash "$CC/cc-dispatch.sh" surface "$CGTR" ) >/dev/null 2>&1
 eq "a plain main checkout is left alone" "$([ -e "$CGTR/.git/hooks/pre-commit" ] && echo present || echo gone)" "gone"
 # and the workspace path (gwt-new / gwt-adopt) mounts it too
 CGN=$(mktemp -d); CGNR="$(cn "$CGN")"
 ( cd "$CGNR"; git init -q; git config user.email t@t; git config user.name t; git commit -q --allow-empty -m i
   mkdir .claude; git worktree add -q .claude/worktrees/wn -b feat/wn >/dev/null )
-( cd "$CGNR" && env HOME="$FH25" PATH="$CGS:$OP25" CC_STATE_DB="$DB_25" CC_TABS_FILE="$CC_TEST_SANDBOX/25-tabs.tsv" \
+( cd "$CGNR" && env HOME="$FH25" PATH="$CGS:$OP25" CC_STATE_DB="$DB_25" \
     bash "$CC/cc-dispatch.sh" workspace "$CGNR/.claude/worktrees/wn" wn false ) >/dev/null 2>&1
 eq "workspace mounts the gate"           "$(grep -c 'cc-stack:commit-gate' "$CGNR/.git/hooks/pre-commit" 2>/dev/null || echo 0)" "1"
 
@@ -4367,7 +4358,7 @@ W30_CN(){ CDPATH= cd -- "$1" >/dev/null 2>&1 && pwd -P; }
 W30_T=$(mktemp -u); W30_S=$(mktemp -u); W30_TRUST=$(mktemp -u); : > "$W30_T"; : > "$W30_S"; : > "$W30_TRUST"
 # every zsh -c below carries its OWN sandbox overrides (the suite's rule: never the live TSVs /
 # ~/.claude.json) and disables CC_WT_SHARE so the real cc-worktree-shared.sh is never reached.
-w30env(){ echo "CC_STATE_DB='$DB_30' CC_TASKS_FILE='$W30_T' CC_STATUS_FILE='$W30_S' CC_TRUST_CFG_OVERRIDE='$W30_TRUST' CC_WT_SHARE=''"; }
+w30env(){ echo "CC_STATE_DB='$DB_30' CC_TRUST_CFG_OVERRIDE='$W30_TRUST' CC_WT_SHARE=''"; }
 
 # ── F1: dirty worktree refused without --force ───────────────────────────────────────────────
 W30_D=$(mktemp -d); W30_D="$(W30_CN "$W30_D")"
@@ -4383,7 +4374,7 @@ eq "30 dirty tree: lists the files"    "$(echo "$W30_O" | grep -c 'untracked.txt
 eq "30 dirty tree: worktree survives"  "$([ -d "$W30_W" ] && echo y || echo n)" "y"
 # (Task 8b) the guard's whole point is that NOTHING was written — read the raw store, a filtered
 # view would answer the same with the row already gone
-eq "30 dirty tree: board row survives" "$(CC_STATE_DB="$DB_30" CC_TASKS_FILE="$W30_T" "$CC/cc-state" dump tasks | grep -c 'dirty row')" "1"
+eq "30 dirty tree: board row survives" "$(CC_STATE_DB="$DB_30" "$CC/cc-state" dump tasks | grep -c 'dirty row')" "1"
 eq "30 dirty tree: sidecar untouched"  "$([ -f "$W30_S" ] && echo y || echo n)" "y"
 # --force names the deletion: worktree AND its uncommitted file fall, branch stays (no --branch)
 W30_O="$(zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; cd '$W30_D'; $(w30env) gwt-rm dirty --force" 2>&1)"; W30_RC=$?
@@ -4391,7 +4382,7 @@ eq "30 --force: rc=0"                  "$W30_RC" "0"
 eq "30 --force: worktree gone"         "$([ -d "$W30_W" ] && echo y || echo n)" "n"
 eq "30 --force: branch kept (no --branch)" "$(git -C "$W30_D" branch --list 'feat/dirty' | wc -l | tr -d ' ')" "1"
 # cat-first: a successful gwt-rm may leave the TSV deleted (_gwt_drop_lines removes an emptied file)
-eq "30 --force: board row dropped"     "$(CC_STATE_DB="$DB_30" CC_TASKS_FILE="$W30_T" "$CC/cc-state" dump tasks | grep -c 'dirty row')" "0"
+eq "30 --force: board row dropped"     "$(CC_STATE_DB="$DB_30" "$CC/cc-state" dump tasks | grep -c 'dirty row')" "0"
 
 # ── F1: unmerged branch survives --branch unless --force ─────────────────────────────────────
 W30_DB=$(mktemp -d); W30_DB="$(W30_CN "$W30_DB")"
@@ -4467,7 +4458,7 @@ printf '2026-01-01 00:00:01\tfeat/w30A\tsurface:101\t%s\tsurface:1\ttask A\tmain
 printf '2026-01-01 00:00:02\tfeat/w30B\tsurface:202\t%s\tsurface:1\ttask B\tmain\n' "$W30_R/.claude/worktrees/wtB" | st_append tasks "$DB_30"
 printf '2026-01-01 00:00:03\tfeat/w30C\tsurface:10\t%s\tsurface:1\ttask C\tmain\n' "$W30_R/.claude/worktrees/wtC" | st_append tasks "$DB_30"
 printf '2026-01-01 00:00:04\tfeat/w30D\tsurface:3\t%s\tsurface:1\ttask D\tmain\n' "$W30_R/.claude/worktrees/wtD" | st_append tasks "$DB_30"
-w30tree(){ ( cd "$W30_R" && PATH="$W30_WS:$PATH" CC_FAKE_WSDOWN="${1:-}" CC_STATE_DB="$DB_30" CC_TASKS_FILE="$W30_TT" \
+w30tree(){ ( cd "$W30_R" && PATH="$W30_WS:$PATH" CC_FAKE_WSDOWN="${1:-}" CC_STATE_DB="$DB_30" \
     zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; gwt-tree" ) 2>/dev/null; }
 W30_TO="$(w30tree)"
 eq "30 tree: caller-workspace tab live"   "$(echo "$W30_TO" | grep -c 'feat/w30A.*✔live')" "1"
@@ -4693,7 +4684,7 @@ eq "36 gwt-rm clears state by dir"   "$(grep -c 'task-clear-state' "$CC/worktree
 cn36(){ CDPATH= cd -- "$1" >/dev/null 2>&1 && pwd -P; }
 zw36(){ zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; $*" ; }
 S36=$(mktemp -d); T36="$S36/t.tsv"; ST36="$S36/s.tsv"; A36="$S36/a.tsv"
-export CC_TASKS_FILE="$T36" CC_STATUS_FILE="$ST36" CC_ARCHIVE_FILE="$A36" CC_STATE_DB="$T36.db"
+export CC_STATE_DB="$T36.db"
 L36='uuid=36363636-1111-2222-3333-444444444444:provider=glm:pm=auto:model=g1'
 D36A="$(cn36 "$(mktemp -d)")"; D36B="$(cn36 "$(mktemp -d)")"; D36D="$S36/gone"   # D36D never created
 zw36 gwt-prune >"$S36/p0" 2>&1; eq "36 prune: no list says so" "$(cat "$S36/p0")" "list is empty"
@@ -4806,7 +4797,7 @@ eq "_gwt_wt_path healthy echoes dir/name" "$(zsh -c 'source "'"$CC"'/worktree.zs
 # their mtime moving) and reached into the live ~/.claude.json. The sandbox at the top of this
 # file already covers it; the explicit prefix keeps the call site self-documenting, matching the
 # other gwt-rm tests (§2b, §12).
-env CC_STATE_DB="$DB_19b" CC_TASKS_FILE="$CC_TEST_SANDBOX/19b-tasks.tsv" CC_STATUS_FILE="$CC_TEST_SANDBOX/19b-status.tsv" \
+env CC_STATE_DB="$DB_19b" \
   CC_TRUST_CFG_OVERRIDE="$CC_TEST_SANDBOX/19b-claude.json" \
   zsh -c 'source "'"$CC"'/worktree.zsh" >/dev/null 2>&1; cd "'"$GT2"'"; gwt-rm wtguard --branch' >/dev/null 2>&1
 eq "gwt-rm healthy path still works" "$(git -C "$GT2" worktree list --porcelain | grep -c wtguard)" "0"
@@ -4831,8 +4822,8 @@ DB_37="$(mktemp -u).db"   # this section's library: one per store set, like the 
 cn37(){ CDPATH= cd -- "$1" >/dev/null 2>&1 && pwd -P; }
 S37=$(mktemp -d); S37="$(cn37 "$S37")"
 T37="$S37/tasks.tsv"; ST37="$S37/status.tsv"; A37="$S37/archive.tsv"; TB37="$S37/tabs.tsv"
-st37(){ env CC_STATE_DB="$DB_37" CC_TASKS_FILE="$T37" CC_STATUS_FILE="$ST37" \
-            CC_ARCHIVE_FILE="$A37" CC_TABS_FILE="$TB37" "$CC/cc-state" "$@"; }
+st37(){ env CC_STATE_DB="$DB_37" \
+            "$CC/cc-state" "$@"; }
 ex37(){ st37 exists "$1" >"$S37/o" 2>"$S37/e"; echo $?; }
 
 # ── the verb's contract: the engine swap replaced its implementation, not one word of this ──
@@ -4884,8 +4875,8 @@ row37(){ printf '2026-01-01 00:00:0%s\t%s\tsurface:%s\t%s\tsurface:9\t%s\tmain\t
            "$1" "$2" "$3" "$4" "$5"; }
 
 # ── cc-board.sh: the two messages the precheck exists to tell apart ─────────────────────────
-brd37(){ ( cd "$B37" && env PATH=/usr/bin:/bin CC_STATE_DB="$DB_37" CC_TASKS_FILE="$T37" \
-    CC_STATUS_FILE="$ST37" CC_ARCHIVE_FILE="$A37" CC_SEND_FAILLOG=/dev/null \
+brd37(){ ( cd "$B37" && env PATH=/usr/bin:/bin CC_STATE_DB="$DB_37" \
+    CC_SEND_FAILLOG=/dev/null \
     bash "$CC/cc-board.sh" ${1:-} ) 2>/dev/null; }
 : | st_seed tasks "$DB_37"; : | st_seed archive "$DB_37"
 eq "37 board: no task store names the store"  "$(brd37)" "no registered worktree tasks"
@@ -4927,8 +4918,8 @@ chmod +x "$PY37/cmux"
 export CC_37_LIVE="$S37/live"
 printf 'surface:13  AAAAAAAA-1111-1111-1111-111111111111\n' > "$CC_37_LIVE"
 brdpy37(){ : > "$S37/pylog"
-  ( cd "$B37" && env PATH="$PY37:/usr/bin:/bin" CC_PY_LOG="$S37/pylog" CC_STATE_DB="$DB_37" CC_TASKS_FILE="$T37" \
-      CC_STATE_DB="$DB_37" CC_STATUS_FILE="$ST37" CC_ARCHIVE_FILE="$A37" CC_SEND_FAILLOG=/dev/null \
+  ( cd "$B37" && env PATH="$PY37:/usr/bin:/bin" CC_PY_LOG="$S37/pylog" CC_STATE_DB="$DB_37" \
+      CC_STATE_DB="$DB_37" CC_SEND_FAILLOG=/dev/null \
       bash "$CC/cc-board.sh" ) >/dev/null 2>&1; }
 row37 3 feat/37W 13 "$W37" '37 live row' | st_seed tasks "$DB_37"
 brdpy37
@@ -4940,7 +4931,7 @@ eq "37 cost: the empty board asks exists once"        "$(grep -cw exists "$S37/p
 
 # ── cc-dispatch.sh tabs: ledger absent vs ledger present but none of mine ───────────────────
 SELF37="CCCCCCCC-3333-3333-3333-333333333333"
-tabs37(){ ( cd "$S37" && env PATH=/usr/bin:/bin CC_STATE_DB="$DB_37" CC_TABS_FILE="$TB37" \
+tabs37(){ ( cd "$S37" && env PATH=/usr/bin:/bin CC_STATE_DB="$DB_37" \
     CC_CALLER_SURFACE_UUID="$SELF37" bash "$CC/cc-dispatch.sh" tabs ) 2>&1; }
 : | st_seed tabs "$DB_37"
 O37="$(tabs37)"
@@ -4961,8 +4952,8 @@ eq "37 tabs: an unreachable probe pruned nothing" \
   "$(st_dump tabs "$DB_37" | grep -c .)" "1"
 
 # ── cc-dispatch.sh resume: same split, over the task store ─────────────────────────────────
-res37(){ ( cd "$B37" && env PATH="$PY37:/usr/bin:/bin" CC_STATE_DB="$DB_37" CC_TASKS_FILE="$T37" CC_STATUS_FILE="$ST37" \
-    CC_STATE_DB="$DB_37" CC_TABS_FILE="$TB37" CC_CMUX_SESSIONS="$S37/nosuch.json" CC_RESUME_SETTLE=0 \
+res37(){ ( cd "$B37" && env PATH="$PY37:/usr/bin:/bin" CC_STATE_DB="$DB_37" \
+    CC_STATE_DB="$DB_37" CC_CMUX_SESSIONS="$S37/nosuch.json" CC_RESUME_SETTLE=0 \
     bash "$CC/cc-dispatch.sh" resume ) 2>&1; }
 : | st_seed tasks "$DB_37"
 eq "37 resume: no task store names the store" "$(res37 | tail -1)" \
@@ -4974,8 +4965,8 @@ eq "37 resume: store present, nothing matched" "$(res37 | tail -1)" \
 # ── worktree.zsh gwt-prune: three messages, one facade ──────────────────────────────────────
 # PATH carries the fake cmux: gwt-tree's TAB cell is a liveness verdict, so on the real cmux
 # the tree assertions below would render whatever surfaces this machine happens to have open.
-zw37(){ ( cd "${2:-$S37}" && env PATH="$PY37:/usr/bin:/bin" CC_STATE_DB="$DB_37" CC_TASKS_FILE="$T37" CC_STATUS_FILE="$ST37" \
-    CC_STATE_DB="$DB_37" CC_ARCHIVE_FILE="$A37" CC_TABS_FILE="$TB37" zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; $1" ) 2>&1; }
+zw37(){ ( cd "${2:-$S37}" && env PATH="$PY37:/usr/bin:/bin" CC_STATE_DB="$DB_37" \
+    CC_STATE_DB="$DB_37" zsh -c "source '$CC/worktree.zsh' >/dev/null 2>&1; $1" ) 2>&1; }
 : | st_seed tasks "$DB_37"
 eq "37 gwt-prune: no store says list is empty" "$(zw37 gwt-prune)" "list is empty"
 row37 5 feat/37W 13 "$W37" '37 live row' | st_seed tasks "$DB_37"
@@ -5024,11 +5015,15 @@ eq "37 worktree.zsh names no store file"  "$(grep -cE '\$\{CC_(TASKS|STATUS|ARCH
 eq "37 cc-dispatch.sh now names none"     "$(grep -cE '\$\{CC_(TASKS|STATUS|ARCHIVE|TABS)_FILE:-' "$CC/cc-dispatch.sh")" "0"
 eq "37 ...and its tabs header names the verb instead" \
    "$(grep -cF 'opened tabs (cc-state dump tabs)' "$CC/cc-dispatch.sh")" "1"
-eq "37 cc-hooks.sh keeps its fast path"   "$(grep -cE '\$\{CC_(TASKS|STATUS|ARCHIVE|TABS)_FILE:-' "$CC/cc-hooks.sh")" "1"
-eq "37 ...and the fast path also knows the library" \
+# cc-hooks.sh is the ONE caller outside cc-state that still knows where state lives, and since
+# phase D it needs ONE variable to know it: the legacy TSV is DERIVED from the library's dir,
+# so this is a duplicated derivation rule, not a second knob that could drift on its own.
+eq "37 cc-hooks.sh names no retired override" \
+   "$(grep -cE '\$\{CC_(TASKS|STATUS|ARCHIVE|TABS)_FILE:-' "$CC/cc-hooks.sh")" "0"
+eq "37 ...and its fast path knows the library" \
    "$(grep -cE '\$\{CC_STATE_DB:-' "$CC/cc-hooks.sh")" "1"
 eq "37 ...and takes BOTH legs before giving up" \
-   "$(grep -cF '[ -f "$db" ] || [ -f "$tasks" ] || exit 0' "$CC/cc-hooks.sh")" "1"
+   "$(grep -cF '[ -f "$db" ] || [ -f "$dbdir/worktree-tasks.tsv" ] || exit 0' "$CC/cc-hooks.sh")" "1"
 eq "37 no caller tests a store with [ -f ]" \
    "$(grep -cE '\[ *-f *"\$(tasks|arch|status|tabs_f|_tl_f)"' "$CC/cc-board.sh" "$CC/cc-dispatch.sh" | awk -F: '{s+=$2} END{print s+0}')" "0"
 unset CC_37_LIVE
@@ -5049,8 +5044,8 @@ echo "== 38. cc-state load: the byte-level write half of the dump/load pair =="
 # always was, so it is documented, not gated — and pinned here, so a later "helpful"
 # normalization inside load shows up as a red assertion instead of as silently rewritten state.
 S38=$(mktemp -d)
-st38(){ env CC_TASKS_FILE="$S38/t.tsv" CC_STATUS_FILE="$S38/s.tsv" \
-            CC_ARCHIVE_FILE="$S38/a.tsv" CC_TABS_FILE="$S38/b.tsv" "$CC/cc-state" "$@"; }
+st38(){ env \
+            "$CC/cc-state" "$@"; }
 # The fixture carries all three byte-level oddities at once: a real 0xff (NOT an ASCII stand-in
 # — a TEXT-typed column cannot hold one, so this row is what makes the round-trip a real test),
 # a 7-field legacy row, and an empty middle field.
@@ -5144,9 +5139,7 @@ echo "== 39. the engine: one sqlite library, no locks =="
 # below was run against the PRE-SWAP code first and confirmed RED; the evidence is in the
 # C2b report, not a claim that someone checked.
 S39=$(mktemp -d)
-st39(){ env CC_TASKS_FILE="$S39/t.tsv" CC_STATUS_FILE="$S39/s.tsv" \
-            CC_ARCHIVE_FILE="$S39/a.tsv" CC_TABS_FILE="$S39/b.tsv" \
-            CC_STATE_DB="$S39/cc-state.db" "$CC/cc-state" "$@"; }
+st39(){ env CC_STATE_DB="$S39/cc-state.db" "$CC/cc-state" "$@"; }
 # Structural, but split into five: a HALF-removed lock (say the contextmanager gone but the
 # stale knob still read, or one `with lock(...)` left behind) must not be able to hide inside
 # a single coarse grep.
@@ -5174,8 +5167,8 @@ eq "39 schema version is stamped" \
 # empty sidecar over the columns that still hold the real state. Simulated here rather than run
 # against an old binary: the two things old code leaves behind are exactly these two statements.
 DG39="$S39/dg"; mkdir -p "$DG39/w"
-dg39(){ env CC_TASKS_FILE="$DG39/t.tsv" CC_STATUS_FILE="$DG39/s.tsv" CC_ARCHIVE_FILE="$DG39/a.tsv" \
-            CC_TABS_FILE="$DG39/b.tsv" CC_STATE_DB="$DG39/cc-state.db" "$CC/cc-state" "$@"; }
+dg39(){ env \
+            CC_STATE_DB="$DG39/cc-state.db" "$CC/cc-state" "$@"; }
 dg39 task-add "$DG39/w" feat/dg s:1 'downgrade probe' main >/dev/null
 dg39 task-set-state "$DG39/w" working
 eq "39 state is carried before the downgrade" "$(dg39 dump status | wc -l | tr -d ' ')" "1"
@@ -5233,9 +5226,7 @@ eq "39 an over-wide row keeps its overflow"  "$(st39 dump tasks | awk -F'\t' 'NR
 # Its own tests, not a side effect of fixtures: the importer is the one piece of this task that
 # touches data the human cannot get back if it is wrong.
 M39=$(mktemp -d)
-m39(){ env CC_STATE_DB="$M39/cc-state.db" CC_TASKS_FILE="$M39/worktree-tasks.tsv" \
-           CC_STATUS_FILE="$M39/worktree-status.tsv" CC_ARCHIVE_FILE="$M39/worktree-tasks-archive.tsv" \
-           CC_TABS_FILE="$M39/opened-tabs.tsv" "$CC/cc-state" "$@"; }
+m39(){ env CC_STATE_DB="$M39/cc-state.db" "$CC/cc-state" "$@"; }
 printf '2026-01-01 00:00:01\tfeat/m\ts:1\t/d/m\tc\tlegacy 7 field\tmain\n' > "$M39/worktree-tasks.tsv"
 printf '2026-01-01 00:00:02\tfeat/n\ts:2\t/d/n\tc\tno final newline\tmain\tu' >> "$M39/worktree-tasks.tsv"
 printf '/d/m\tworking\t100\n' > "$M39/worktree-status.tsv"
@@ -5266,7 +5257,7 @@ eq "39 the newline-less legacy row gained a newline (deviation 10)" \
 MH39=$(mktemp -d)
 printf '2026-01-01 00:00:01\tfeat/h\ts:1\t/d/h\tc\tunreadable\tmain\n' > "$MH39/worktree-tasks.tsv"
 chmod 000 "$MH39/worktree-tasks.tsv"
-env CC_STATE_DB="$MH39/cc-state.db" CC_TASKS_FILE="$MH39/worktree-tasks.tsv" \
+env CC_STATE_DB="$MH39/cc-state.db" \
     "$CC/cc-state" dump tasks >/dev/null 2>&1; r39u=$?
 chmod 644 "$MH39/worktree-tasks.tsv"
 eq "39 a mid-flight migration failure removes the library it created" \
@@ -5281,7 +5272,7 @@ MF39=$(mktemp -d)
 printf '2026-01-01 00:00:01\tfeat/f\ts:1\t/d/f\tc\tstays put\tmain\n' > "$MF39/worktree-tasks.tsv"
 cp "$MF39/worktree-tasks.tsv" "$MF39.keep"
 chmod 555 "$MF39"
-mf39(){ env CC_STATE_DB="$MF39/cc-state.db" CC_TASKS_FILE="$MF39/worktree-tasks.tsv" "$CC/cc-state" "$@"; }
+mf39(){ env CC_STATE_DB="$MF39/cc-state.db" "$CC/cc-state" "$@"; }
 mf39 dump tasks >/dev/null 2>&1; r39f=$?
 o39f="$(mf39 task-set-state /d/f working 2>&1)"; r39h=$?
 chmod 755 "$MF39"
@@ -5292,19 +5283,21 @@ eq "39 ...and leaves the legacy file exactly as it was" \
 eq "39 ...loud for a reader"                   "$r39f" "1"
 eq "39 ...but a silent no-op for the hook path" "$r39h/$o39f" "0/"
 
-# THE incident guard: the four store paths and the library have independent overrides, so a
-# caller that points only CC_STATE_DB somewhere scratch must NOT import — and rename away —
-# the real ledgers next door. This cost the live opened-tabs and archive ledgers once during
-# this task, from a one-off command that set CC_STATE_DB and nothing else.
+# THE incident guard: a caller that points CC_STATE_DB somewhere scratch must NOT import —
+# and rename away — the real ledgers next door. This cost the live opened-tabs and archive
+# ledgers once during this task, from a one-off command that set CC_STATE_DB and nothing else.
+# Phase D turned the rule that fixed it from a CHECK into the way the paths are built (there
+# is no second place to point a store at any more), which is why this assertion outlives the
+# _migratable function it was written for: the property is the deliverable, not the code.
 I39=$(mktemp -d); J39=$(mktemp -d)
 printf '2026-01-01 00:00:01\tfeat/live\ts:1\t/d/live\tc\tsomebody else store\tmain\n' > "$I39/worktree-tasks.tsv"
-CC_STATE_DB="$J39/cc-state.db" CC_TASKS_FILE="$I39/worktree-tasks.tsv" "$CC/cc-state" dump tasks >/dev/null 2>&1
+CC_STATE_DB="$J39/cc-state.db" "$CC/cc-state" dump tasks >/dev/null 2>&1
 eq "39 a library does not import a store from another directory" \
   "$([ -e "$I39/worktree-tasks.tsv" ] && echo untouched || echo EATEN)" "untouched"
 eq "39 ...and renamed nothing there"  "$(ls "$I39"/*.migrated.* 2>/dev/null | wc -l | tr -d ' ')" "0"
 eq "39 ...while the same store beside its own library DOES import" \
   "$(cp "$I39/worktree-tasks.tsv" "$J39/worktree-tasks.tsv"
-     CC_STATE_DB="$J39/cc-state.db" CC_TASKS_FILE="$J39/worktree-tasks.tsv" "$CC/cc-state" dump tasks | grep -c 'somebody else store')" "1"
+     CC_STATE_DB="$J39/cc-state.db" "$CC/cc-state" dump tasks | grep -c 'somebody else store')" "1"
 
 # The hook's fast path has TWO legs and the library-only half is the silent one: a machine
 # that still has legacy TSVs and no library must STILL record state (the first call migrates).
@@ -5312,56 +5305,60 @@ eq "39 ...while the same store beside its own library DOES import" \
 HK39=$(mktemp -d); HW39="$(cd "$(mktemp -d)" && pwd -P)"
 printf '2026-01-01 00:00:01\tfeat/hk\ts:1\t%s\tc\thook leg\tmain\n' "$HW39" > "$HK39/worktree-tasks.tsv"
 printf '{"hook_event_name":"UserPromptSubmit","cwd":"%s","message":""}' "$HW39" \
-  | env CC_STATE_DB="$HK39/cc-state.db" CC_TASKS_FILE="$HK39/worktree-tasks.tsv" \
+  | env CC_STATE_DB="$HK39/cc-state.db" \
     bash "$CC/cc-hooks.sh" status >/dev/null 2>&1
 eq "39 legacy TSVs but no library: the hook still records state" \
   "$(env CC_STATE_DB="$HK39/cc-state.db" "$CC/cc-state" dump status | cut -f2)" "working"
 rm -rf "$HK39" "$HW39"
 
-# ── a store the user MOVED out from under the library ────────────────────────────────────────
-# README documents CC_TASKS_FILE as a user-facing knob (the other three say "override for
-# tests"), so moving it is supported — and the same-directory rule means the moved file is
-# never imported. Silent invisibility is the failure shape this campaign keeps hunting, so it
-# is said out loud on stderr. Three assertions, because two of them would be green forever on
-# an implementation that simply always warns.
+# ── the four retired ledger overrides ────────────────────────────────────────────────────────
+# Phase D (spec §8 invariant 9) retired CC_TASKS_FILE / CC_STATUS_FILE / CC_ARCHIVE_FILE /
+# CC_TABS_FILE. What replaced them is not a smaller knob, it is the removal of a REPRESENTABLE
+# STATE: five paths that could be aimed at each other's directories became one, so "half the
+# overrides set" — the shape of the incident guarded just above, and of two sandbox escapes
+# before it — cannot be written down any more.
+# What can still bite is a shell that has one of the four exported from before: its file goes
+# quietly unread, and a silently empty board is the failure this campaign keeps hunting. So the
+# retirement is said out loud, and these assertions are what keep it honest — the two negative
+# ones are there because an implementation that simply always warns passes the positive ones.
 O39=$(mktemp -d); P39=$(mktemp -d)
 printf '2026-01-01 00:00:01\tfeat/orph\ts:1\t/d/orph\tc\tmoved away\tmain\n' > "$P39/worktree-tasks.tsv"
 env CC_STATE_DB="$O39/cc-state.db" CC_TASKS_FILE="$P39/worktree-tasks.tsv" \
     "$CC/cc-state" dump tasks >/dev/null 2>"$O39/err"
-eq "39 a moved-away store is named on stderr" \
-  "$(grep -c 'is not in the state library.*never imported' "$O39/err")" "1"
-eq "39 ...and the notice names the fix"  "$(grep -c 'cc-state load tasks ' "$O39/err")" "1"
+eq "39 a retired override is named on stderr" \
+  "$(grep -c 'CC_TASKS_FILE is retired and IGNORED' "$O39/err")" "1"
+eq "39 ...and the notice names the fix"  "$(grep -cF "cc-state load tasks $P39/worktree-tasks.tsv" "$O39/err")" "1"
+# IGNORED has to be literally true: the file it points at is neither read nor renamed aside
+eq "39 ...and the file it points at is untouched" \
+  "$([ -e "$P39/worktree-tasks.tsv" ] && echo untouched || echo EATEN)/$(ls "$P39"/*.migrated.* 2>/dev/null | wc -l | tr -d ' ')" "untouched/0"
+eq "39 ...and none of its rows appear" \
+  "$(env CC_STATE_DB="$O39/cc-state.db" CC_TASKS_FILE="$P39/worktree-tasks.tsv" "$CC/cc-state" dump tasks 2>/dev/null | grep -c 'moved away')" "0"
 # the hook may not gain a voice from this: cc-hooks.sh redirects, and that is pinned, not assumed
 printf '{"hook_event_name":"UserPromptSubmit","cwd":"%s","message":""}' "$PWD" \
   | env CC_STATE_DB="$O39/cc-state.db" CC_TASKS_FILE="$P39/worktree-tasks.tsv" \
     bash "$CC/cc-hooks.sh" status >"$O39/hout" 2>"$O39/herr"; r39o=$?
 eq "39 ...while the hook path stays silent and exits 0" \
   "$r39o/$(cat "$O39/hout")$(cat "$O39/herr")" "0/"
-# and the store that is where it belongs must NOT be complained about — without this, an
-# implementation that warns unconditionally passes everything above
-cp "$P39/worktree-tasks.tsv" "$O39/worktree-tasks.tsv"
-env CC_STATE_DB="$O39/cc-state.db" CC_TASKS_FILE="$O39/worktree-tasks.tsv" \
-    "$CC/cc-state" dump tasks >/dev/null 2>"$O39/err2"
-eq "39 a store beside its own library draws no notice" "$(wc -c < "$O39/err2" | tr -d ' ')" "0"
-# ...and neither does one that was never MOVED. A store still sitting at its default is not
-# something anybody relocated, so it must not be reported even when the library is elsewhere —
-# otherwise every caller that points only CC_STATE_DB somewhere gets four lines about files it
-# never touched. Reaching the default path needs HOME redirected (that is what _p expands), and
-# the four overrides unset so they actually fall back. Without this the "always warn" mutation
-# passes everything above: the other three stores point at sandbox paths that do not exist.
-H39=$(mktemp -d); mkdir -p "$H39/.config/cc-stack"
-printf '2026-01-01 00:00:01\tfeat/dflt\ts:1\t/d/dflt\tc\tnever moved\tmain\n' > "$H39/.config/cc-stack/worktree-tasks.tsv"
-env -u CC_TASKS_FILE -u CC_STATUS_FILE -u CC_ARCHIVE_FILE -u CC_TABS_FILE \
-    HOME="$H39" CC_STATE_DB="$O39/cc-state.db" "$CC/cc-state" dump tabs >/dev/null 2>"$O39/err3"
-eq "39 a store at its DEFAULT path is not 'moved away'" "$(wc -c < "$O39/err3" | tr -d ' ')" "0"
-# and the same file, once explicitly pointed at from outside the library's dir, IS reported —
-# the pair is what makes the rule "explicitly moved", not "silent about everything"
-env -u CC_STATUS_FILE -u CC_ARCHIVE_FILE -u CC_TABS_FILE \
-    HOME="$H39" CC_TASKS_FILE="$H39/.config/cc-stack/worktree-tasks.tsv" \
-    CC_STATE_DB="$O39/cc-state.db" "$CC/cc-state" dump tabs >/dev/null 2>"$O39/err4"
-eq "39 ...but the same file explicitly moved IS reported" \
-  "$(grep -c 'never imported' "$O39/err4")" "1"
-rm -rf "$O39" "$P39" "$H39"
+# NEGATIVE 1: export none of them and there is nothing to say
+env CC_STATE_DB="$O39/cc-state.db" "$CC/cc-state" dump tasks >/dev/null 2>"$O39/err2"
+eq "39 no retired override set draws no notice" "$(wc -c < "$O39/err2" | tr -d ' ')" "0"
+# NEGATIVE 2: an EMPTY value is not someone pointing anywhere — same `or` rule the paths used
+env CC_STATE_DB="$O39/cc-state.db" CC_ARCHIVE_FILE= "$CC/cc-state" dump tasks >/dev/null 2>"$O39/err5"
+eq "39 an empty retired override draws no notice" "$(wc -c < "$O39/err5" | tr -d ' ')" "0"
+# it fires on the VALUE being set, not on the file existing — someone pointing at a path that
+# never existed still believes it works, and is the person who most needs telling
+env CC_STATE_DB="$O39/cc-state.db" CC_STATUS_FILE="$O39/never-existed.tsv" \
+    "$CC/cc-state" dump tasks >/dev/null 2>"$O39/err3"
+eq "39 the notice does not wait for the file to exist" \
+  "$(grep -c 'CC_STATUS_FILE is retired' "$O39/err3")" "1"
+# all four at once: one line each, each naming ITS OWN store for the load command — a single
+# shared "some override is set" line would pass every assertion above
+env CC_STATE_DB="$O39/cc-state.db" CC_TASKS_FILE=/x/a CC_STATUS_FILE=/x/b \
+    CC_ARCHIVE_FILE=/x/c CC_TABS_FILE=/x/d "$CC/cc-state" dump tasks >/dev/null 2>"$O39/err4"
+eq "39 every retired override gets its own line" "$(grep -c 'is retired and IGNORED' "$O39/err4")" "4"
+eq "39 ...each naming its own store" \
+  "$(grep -oE 'cc-state load [a-z]+ /x/.' "$O39/err4" | LC_ALL=C sort | tr '\n' ',')" "cc-state load archive /x/c,cc-state load status /x/b,cc-state load tabs /x/d,cc-state load tasks /x/a,"
+rm -rf "$O39" "$P39"
 
 # ── the writes are ATOMIC, not merely serialized ─────────────────────────────────────────────
 # The concurrency block below tests "no write is lost" — 24 processes over 24 different dirs,
@@ -5474,7 +5471,7 @@ grep -q "gwt-resume" "$CC/README.md" && ok "gwt-resume documented" || no "gwt-re
 grep -q "cc-board.sh" "$CC/README.md" && ok "cc-board.sh documented" || no "cc-board.sh documented" missing present
 grep -q "gwt-tabs" "$CC/worktree.zsh" && grep -q "gwt-tabs" "$CC/README.md" \
   && ok "gwt-tabs documented" || no "gwt-tabs documented" missing present
-grep -q "opened-tabs.tsv" "$CC/README.md" && grep -q "CC_TABS_FILE" "$CC/README.md" \
+grep -q "opened-tabs.tsv" "$CC/README.md" && grep -q "gwt-tabs" "$CC/README.md" \
   && ok "opened-tabs ledger documented" || no "opened-tabs ledger documented" missing present
 grep -qxF "opened-tabs.tsv" "$CC/.gitignore" \
   && ok "opened-tabs.tsv gitignored" || no "opened-tabs.tsv gitignored" missing present

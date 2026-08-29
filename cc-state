@@ -16,11 +16,13 @@ nothing (task-get / tab-owner / tab-resolve / task-opened-recently / exists), 2 
 usage error. Safe to call from sh: no verb reads stdin unless explicitly pointed at
 it (`load <store> -`), no output on failure paths that today are silent.
 
-Stores and their overrides (same env names the sandbox uses):
-  tasks   CC_TASKS_FILE    worktree-tasks.tsv           time\\tbranch\\tsurface\\tdir\\tcaller\\ttask\\tparent\\tlargs
-  status  CC_STATUS_FILE   worktree-status.tsv          dir\\tstate\\tunix-ts
-  archive CC_ARCHIVE_FILE  worktree-tasks-archive.tsv   a tasks row verbatim + \\tmerged-at[ + \\tmerged-into]
-  tabs    CC_TABS_FILE     opened-tabs.tsv              suuid\\towner\\tdir\\tsession\\ttime
+Stores, and the legacy TSV each one was imported FROM (phase D retired the four
+per-store overrides: the library's location is the only knob, and the legacy files are
+found beside it — see _p):
+  tasks   worktree-tasks.tsv           time\\tbranch\\tsurface\\tdir\\tcaller\\ttask\\tparent\\tlargs
+  status  worktree-status.tsv          dir\\tstate\\tunix-ts
+  archive worktree-tasks-archive.tsv   a tasks row verbatim + \\tmerged-at[ + \\tmerged-into]
+  tabs    opened-tabs.tsv              suuid\\towner\\tdir\\tsession\\ttime
 
 Phase D (model convergence) closed the last three gaps the Phase A API was written
 against: state/state_ts and the tab-opened dedup timestamp are columns on the task
@@ -70,24 +72,32 @@ for _s in (sys.stdout, sys.stderr):
     except (AttributeError, OSError):
         pass
 
-# ── store paths ─────────────────────────────────────────────────────────────────
-def _p(env, name):
-    # `or`, not a plain default: an EMPTY override must fall through to the default
-    # path, same as ${VAR:-...} in the shell callers.
-    return os.environ.get(env) or os.path.join(
-        os.path.expanduser("~"), ".config", "cc-stack", name)
+# ── legacy store paths ──────────────────────────────────────────────────────────
+# Phase D, spec §8 invariant 9: the four CC_*_FILE overrides are RETIRED. A legacy TSV
+# is now found beside the library, full stop — which is what the store set has always
+# physically been, and what _migratable already had to re-assert as a RULE because the
+# five paths could be pointed at each other's directories independently. That hole was
+# not hypothetical: one shell command that set CC_STATE_DB and nothing else imported —
+# and renamed away — the live ledgers into a scratch library it then threw away.
+# Deriving the paths makes the same accident unrepresentable instead of merely checked,
+# and collapses the sandbox to ONE variable, which is the actual invariant ("tests never
+# write real state" had been failing on half-set overrides, not on a missing check).
+def _p(name):
+    d = os.path.dirname(os.path.abspath(_db_path()))
+    return os.path.join(d or ".", name)
 
 PATHS = {
-    "tasks":   lambda: _p("CC_TASKS_FILE",   "worktree-tasks.tsv"),
-    "status":  lambda: _p("CC_STATUS_FILE",  "worktree-status.tsv"),
-    "archive": lambda: _p("CC_ARCHIVE_FILE", "worktree-tasks-archive.tsv"),
-    "tabs":    lambda: _p("CC_TABS_FILE",    "opened-tabs.tsv"),
+    "tasks":   lambda: _p("worktree-tasks.tsv"),
+    "status":  lambda: _p("worktree-status.tsv"),
+    "archive": lambda: _p("worktree-tasks-archive.tsv"),
+    "tabs":    lambda: _p("opened-tabs.tsv"),
 }
 
-# Which override names a store's legacy path — needed to tell "the user MOVED this one"
-# apart from "this one is still where it has always been" (see _orphan_legacy).
-ENVS = {"tasks": "CC_TASKS_FILE", "status": "CC_STATUS_FILE",
-        "archive": "CC_ARCHIVE_FILE", "tabs": "CC_TABS_FILE"}
+# The retired names, and which store each one used to point at. Kept ONLY to say so out
+# loud: someone whose shell still exports one would otherwise have their rows go quietly
+# invisible, which is the exact failure shape this campaign keeps hunting.
+RETIRED = (("CC_TASKS_FILE", "tasks"), ("CC_STATUS_FILE", "status"),
+           ("CC_ARCHIVE_FILE", "archive"), ("CC_TABS_FILE", "tabs"))
 
 def _open_rd(p):
     """A caller-supplied file, NOT a store: tab-prune takes the raw cmux live map as an
@@ -246,14 +256,17 @@ def _connect(create):
         return _CONN
     p = _db_path()
     # Before any branch: a read that finds neither library nor importable legacy returns
-    # None below, and that early return is exactly the case the orphan warning is FOR.
-    _warn_orphans(p)
+    # None below, and that early return is exactly the case the notice is FOR.
+    _warn_retired()
     try:
         if os.path.exists(p):
             conn = _open(p)
             _schema(conn)
         else:
-            legacy = [s for s in MIGRATE_ORDER if _migratable(p, PATHS[s]())]
+            # Beside the library, or not part of this store set at all — the rule that
+            # used to be _migratable's explicit same-directory check is now the way the
+            # paths are BUILT, so existence is the whole question.
+            legacy = [s for s in MIGRATE_ORDER if os.path.exists(PATHS[s]())]
             if not legacy and not create:
                 return None
             d = os.path.dirname(p)
@@ -285,72 +298,31 @@ def _connect(create):
         _LAST_ERR = e
         return None
 
-def _migratable(db, legacy):
-    """Is this legacy TSV part of THIS library's store set?
-
-    Only if it sits in the same directory. The four store paths and the library have
-    independent overrides, so without this rule a caller that points CC_STATE_DB at a
-    scratch library while leaving the CC_*_FILE overrides unset would import — and
-    RENAME AWAY — the real ledgers in ~/.config/cc-stack, into a library it is about to
-    throw away. That is not a hypothetical: it happened once during this task, from a
-    one-off shell command that set CC_STATE_DB and nothing else, and it took the live
-    opened-tabs and archive ledgers with it. Same-directory is also just what the store
-    set IS — the four TSVs and the library have always lived side by side — so the rule
-    costs nothing in production and closes the hole everywhere else."""
-    try:
-        return (os.path.exists(legacy)
-                and os.path.dirname(os.path.abspath(legacy))
-                    == os.path.dirname(os.path.abspath(db)))
-    except OSError:
-        return False
-
 _WARNED = False
 
-def _orphan_legacy(db):
-    """Legacy stores that EXIST but sit outside the library's directory, so _migratable
-    refused them and their rows are invisible.
+def _warn_retired():
+    """The four CC_*_FILE overrides are gone; say so to anyone still exporting one.
 
-    Checked on every open, not only while migrating, and that is the whole point: once
-    the library exists _connect never looks at a legacy path again, so a notice wired
-    into the migration path would fire exactly ZERO times on the machine that needs it
-    — the library is created from whatever IS beside it and the orphan is never seen
-    again. Four os.path.exists calls (measured well under 0.1 ms against a 13.7 ms
-    python start) buy the difference between "the board went blank" and a sentence
-    saying which file, and how to put it back.
-    Only stores whose path was EXPLICITLY overridden count. A store still sitting at its
-    default is not one anybody MOVED, and warning about those would fire on every caller
-    that points the library somewhere without touching the four ledger paths — noise, and
-    aimed at the wrong thing. The case this exists for is the documented one: README calls
-    CC_TASKS_FILE a user-facing knob (the other three say "override for tests"), so a user
-    may legitimately move it, and before this that made the board silently empty forever.
-    """
-    out = []
-    for store in sorted(COLS):
-        try:
-            if not os.environ.get(ENVS[store]):
-                continue
-            p = PATHS[store]()
-            if os.path.exists(p) and not _migratable(db, p):
-                out.append((store, p))
-        except OSError:
-            pass
-    return out
-
-def _warn_orphans(db):
-    """stderr only, never the rc. The hook path is silent by construction — cc-hooks.sh
-    calls the facade with >/dev/null 2>&1 — and §39 pins that rather than trusting it.
-    README documents CC_TASKS_FILE as a user-facing knob (the other three say "for
-    tests"), so moving just that one is a supported thing to do, and before this it made
-    the board silently empty forever."""
+    Without this the retirement is a silent behaviour change for the one person it can
+    hurt: a shell that still points CC_TASKS_FILE somewhere now gets a library built from
+    whatever sits beside CC_STATE_DB instead, and the moved file is never read again. The
+    board would just be empty, forever, with nothing to grep for. stderr only, never the
+    rc — the hook path redirects and §39 pins that rather than trusting it — and once per
+    process, so a board render that makes several calls says it once.
+    Note this fires on the VALUE being set, not on the file existing: an override pointing
+    at a path that never existed is still someone who believes it works."""
     global _WARNED
     if _WARNED:
         return
+    hits = [(env, store) for env, store in RETIRED if os.environ.get(env)]
+    if not hits:
+        return
     _WARNED = True
-    d = os.path.dirname(os.path.abspath(db)) or "."
-    for store, p in _orphan_legacy(db):
-        print("cc-state: %s is not in the state library's directory (%s), so its rows "
-              "were never imported and are invisible. Fix: cc-state load %s %s"
-              % (p, d, store, p), file=sys.stderr)
+    for env, store in hits:
+        v = os.environ[env]
+        print("cc-state: %s is retired and IGNORED — the store set is now whatever sits "
+              "beside CC_STATE_DB. If %s still holds rows: cc-state load %s %s"
+              % (env, v, store, v), file=sys.stderr)
 
 def _read_legacy(path):
     """A legacy TSV exactly as read_lines used to read it: no universal-newline
