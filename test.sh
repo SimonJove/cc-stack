@@ -5169,6 +5169,13 @@ eq "39 the row columns are named" \
 c=sqlite3.connect(sys.argv[1])
 print(",".join(r[1] for r in c.execute("PRAGMA table_info(tasks)")))' "$S39/cc-state.db")" \
   "seq,nf,created_at,branch,surface_ref,dir,caller_ref,task,parent,launch_args,fx,state,state_ts,tab_opened_ts"
+# D2c: no verb may index a store row by a bare number again. Positional indexing IS the
+# shape of the awk field-shift bugs this campaign started from — the position and the column
+# name now come from one definition (NAMES → _Ix), and a hand-written f[3] is how they would
+# drift apart again. The one place that legitimately parses by position (cmux's live map, not
+# a store) uses a differently-named variable so this pin needs no exception list.
+eq "39 no verb indexes a store row by a bare position" \
+  "$(grep -c '\bf\[[0-9]\+\]' "$CC/cc-state")" "0"
 eq "39 ...and the archive carries merged_into as a column, not overflow" \
   "$(python3 -c 'import sqlite3,sys
 c=sqlite3.connect(sys.argv[1])

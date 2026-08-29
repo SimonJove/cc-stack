@@ -145,6 +145,26 @@ COLS["status"] = 3          # a projection, not a table — see _get_status
 # The v1/v2 widths, needed only by the one-way rebuild in _upgrade.
 OLD_COLS = {"tasks": 8, "archive": 9, "tabs": 5}
 
+class _Ix(object):
+    """Field positions BY NAME, derived from the column names above.
+
+    The verbs still work on whole TSV lines — a rewrite has to re-emit the fields it
+    did not mean to touch byte-for-byte, and that is what a line gives you and a
+    reconstructed row does not. What they stopped doing is spelling the position: a
+    hand-written index and the `dir` column could drift apart, `f[TASK.dir]` and the
+    column cannot, because there is now exactly ONE definition of the row's shape.
+    §39 pins that no store row is indexed by a bare number again — which is why this
+    note says "a hand-written index" instead of showing you one."""
+    def __init__(self, names):
+        for i, n in enumerate(names):
+            setattr(self, n, i)
+
+TASK = _Ix(NAMES["tasks"])
+TAB = _Ix(NAMES["tabs"])
+# The sidecar projection has no table of its own (it IS two columns on the task row),
+# but `dump status` / `load status` / task-set-state still speak its 3-field line.
+SIDE = _Ix(("dir", "state", "ts"))
+
 # D 期（模型收敛）：真正的表只剩三张。`status` 仍是一个 STORE —— 动词、dump / load、沙箱
 # 变量全部照旧 —— 但它不再有自己的表，而是 tasks 上两列的投影（§3.1「sidecar 只是任务行的
 # 两列」）。虚拟化整个发生在 _get / _put 里，上面 20 个动词一行没动，与 C 期换引擎用的是
@@ -467,7 +487,7 @@ def _put_status(conn, lines):
     conn.execute("UPDATE tasks SET state=NULL, state_ts=NULL")
     for line in lines:
         f = line.split("\t")
-        raw = f[0] if f else ""
+        raw = f[SIDE.dir] if f else ""
         c = canon(raw)
         hit = None
         for seq, d in rows:
@@ -476,8 +496,8 @@ def _put_status(conn, lines):
         if hit is None:
             continue
         conn.execute("UPDATE tasks SET state=?, state_ts=? WHERE seq=?",
-                     (_enc(f[1]) if len(f) > 1 else None,
-                      _enc(f[2]) if len(f) > 2 else None, hit))
+                     (_enc(f[SIDE.state]) if len(f) > SIDE.state else None,
+                      _enc(f[SIDE.ts]) if len(f) > SIDE.ts else None, hit))
 
 # The columns that do NOT live in the TSV line. Every verb above the storage layer still
 # works on whole lines, so a rewrite of `tasks` is DELETE + re-INSERT of the row columns —
@@ -760,10 +780,10 @@ def cmd_task_set_launch(args):
         out = list(rows)                       # build NEW rows — fn must never
         for i in range(len(out) - 1, -1, -1):  # mutate in place, or rewrite()'s
             f = fields(out[i])                 # out != rows change check compares
-            if len(f) >= 4 and dir_match(f[3], d, c):   # an object against itself
-                f[4] = caller                 # written raw — exactly the retired log's $caller
-                if len(f) >= 8:
-                    f[7] = _sanitize(largs, 200, False)
+            if len(f) > TASK.dir and dir_match(f[TASK.dir], d, c):   # an object against itself
+                f[TASK.caller_ref] = caller   # written raw — exactly the retired log's $caller
+                if len(f) > TASK.launch_args:
+                    f[TASK.launch_args] = _sanitize(largs, 200, False)
                 out[i] = "\t".join(f)
                 break
         return out
@@ -778,7 +798,7 @@ def cmd_task_get(args):
     c = canon(args[0])
     for line in reversed(read_lines("tasks")):
         f = fields(line)
-        if len(f) >= 4 and dir_match(f[3], args[0], c):
+        if len(f) > TASK.dir and dir_match(f[TASK.dir], args[0], c):
             print(line)
             return 0
     return 1
@@ -825,8 +845,9 @@ def cmd_task_list(args):
         if not with_state:
             return line
         for sf in state_rows:
-            if len(sf) >= 2 and dir_match(sf[0], row_dir, row_canon):
-                return line + "\t" + sf[1] + "\t" + (sf[2] if len(sf) > 2 else "")
+            if len(sf) > SIDE.state and dir_match(sf[SIDE.dir], row_dir, row_canon):
+                return (line + "\t" + sf[SIDE.state] + "\t"
+                        + (sf[SIDE.ts] if len(sf) > SIDE.ts else ""))
         return line + "\t-\t"
     repo = None if all_flag or repo_val is None else canon(repo_val)
     def under(c):
@@ -834,20 +855,20 @@ def cmd_task_list(args):
     if archive:
         for line in read_lines("archive"):
             f = fields(line)
-            if len(f) >= 4 and under(canon_or_raw(f[3])):
-                print(decorate(line, f[3], canon(f[3])))
+            if len(f) > TASK.dir and under(canon_or_raw(f[TASK.dir])):
+                print(decorate(line, f[TASK.dir], canon(f[TASK.dir])))
         return 0
     seen = set()
     for line in reversed(read_lines("tasks")):
         f = fields(line)
-        if len(f) < 4 or not f[3] or not os.path.isdir(f[3]):
+        if len(f) <= TASK.dir or not f[TASK.dir] or not os.path.isdir(f[TASK.dir]):
             continue
-        c = canon(f[3])
+        c = canon(f[TASK.dir])
         if c in seen:
             continue
         seen.add(c)
         if under(c):
-            print(decorate(line, f[3], c))
+            print(decorate(line, f[TASK.dir], c))
     return 0
 
 def cmd_task_set_state(args):
@@ -866,13 +887,14 @@ def cmd_task_set_state(args):
         return 2
     state = _sanitize_field(state)
     c = canon(d)
-    if not any(len(f) >= 4 and dir_match(f[3], d, c)
+    if not any(len(f) > TASK.dir and dir_match(f[TASK.dir], d, c)
                for f in (fields(l) for l in read_lines("tasks"))):
         return 0
     fresh = "\t".join([c, state, str(int(time.time()))])
     def fn(rows):
         return [l for l in rows
-                if not (len(fields(l)) >= 1 and dir_match(fields(l)[0], d, c))] + [fresh]
+                if not (len(fields(l)) > SIDE.dir
+                        and dir_match(fields(l)[SIDE.dir], d, c))] + [fresh]
     rewrite("status", fn)
     return 0
 
@@ -890,7 +912,8 @@ def cmd_task_clear_state(args):
     c = canon(d)
     def fn(rows):
         return [l for l in rows
-                if not (len(fields(l)) >= 1 and dir_match(fields(l)[0], d, c))]
+                if not (len(fields(l)) > SIDE.dir
+                        and dir_match(fields(l)[SIDE.dir], d, c))]
     rewrite("status", fn)
     return 0
 
@@ -922,10 +945,10 @@ def cmd_task_set_ref(args):
         out = list(rows)                       # new list, not in-place (see
         for i, line in enumerate(out):         # task-set-launch's note)
             f = fields(line)
-            if len(f) >= 4 and dir_match(f[3], d, c):
-                f[2] = ref
-                if su and len(f) >= 8:
-                    f[7] = _swap_suuid(f[7], su)
+            if len(f) > TASK.dir and dir_match(f[TASK.dir], d, c):
+                f[TASK.surface_ref] = ref
+                if su and len(f) > TASK.launch_args:
+                    f[TASK.launch_args] = _swap_suuid(f[TASK.launch_args], su)
                 out[i] = "\t".join(f)
         return out
     rewrite("tasks", fn)
@@ -939,7 +962,8 @@ def cmd_task_drop(args):
     c = canon(d)
     def fn(rows):
         return [l for l in rows
-                if not (len(fields(l)) >= 4 and dir_match(fields(l)[3], d, c))]
+                if not (len(fields(l)) > TASK.dir
+                        and dir_match(fields(l)[TASK.dir], d, c))]
     rewrite("tasks", fn)
     return 0
 
@@ -968,7 +992,7 @@ def cmd_task_prune(args):
         seen, out = set(), []
         for l in reversed(rows):
             f = fields(l)
-            d = f[3] if len(f) > 3 else ""
+            d = f[TASK.dir] if len(f) > TASK.dir else ""
             if not d or d in seen:
                 continue
             seen.add(d)
@@ -976,13 +1000,13 @@ def cmd_task_prune(args):
         out.reverse()
         return out
 
-    ok = rewrite("tasks", lambda rows: newest_per_dir(live(rows, 3)) if compact
-                 else live(rows, 3))
+    ok = rewrite("tasks", lambda rows: newest_per_dir(live(rows, TASK.dir)) if compact
+                 else live(rows, TASK.dir))
     if not ok:
         # today's gwt-prune on a failed compaction: the list is left as it was, loudly
         print("cc-state: compaction failed — task list left untouched", file=sys.stderr)
         return 1
-    rewrite("status", lambda rows: live(rows, 0))
+    rewrite("status", lambda rows: live(rows, SIDE.dir))
     return 0
 
 def cmd_task_archive(args):
@@ -1042,13 +1066,13 @@ def cmd_task_archive(args):
         kept, moved_rows = [], []
         for line in lines:
             f = fields(line)
-            hit = len(f) >= 2 and f[1] == branch
+            hit = len(f) > TASK.branch and f[TASK.branch] == branch
             if hit and root_canon is not None:
-                hit = under_root(f[3] if len(f) > 3 else "", root_canon)
+                hit = under_root(f[TASK.dir] if len(f) > TASK.dir else "", root_canon)
             if hit:
                 moved_rows.append(line + "\t" + ts + ("\t" + into if into else ""))
-                if len(f) >= 4 and f[3]:
-                    moved_dirs.append(f[3])
+                if len(f) > TASK.dir and f[TASK.dir]:
+                    moved_dirs.append(f[TASK.dir])
             else:
                 kept.append(line)
         # The whole move is ONE transaction, which is what retires spec 3.5 defect 5: the
@@ -1081,7 +1105,7 @@ def cmd_task_archive(args):
     moved_canon = [(d, canon(d)) for d in moved_dirs]
     def fn(rows):
         return [l for l in rows
-                if not any(dir_match(fields(l)[0], d, c) for d, c in moved_canon)]
+                if not any(dir_match(fields(l)[SIDE.dir], d, c) for d, c in moved_canon)]
     rewrite("status", fn)
     for d in moved_dirs:
         print(d)
@@ -1199,9 +1223,9 @@ def cmd_tab_list(args):
     self_u = _self_uuid()
     for line in read_lines("tabs"):
         f = fields(line)
-        if not f[0]:
+        if not f[TAB.suuid]:
             continue
-        owner = ("" if len(f) < 2 or f[1] == "-" else f[1])
+        owner = ("" if len(f) <= TAB.owner or f[TAB.owner] == "-" else f[TAB.owner])
         if args == [] and self_u and owner != self_u:
             continue
         print(line)
@@ -1212,8 +1236,8 @@ def _tabs_owner_of(suuid):
     owner ("-" and empty do not count)."""
     for line in reversed(read_lines("tabs")):
         f = fields(line)
-        if len(f) > 1 and f[0] == suuid and f[1] not in ("", "-"):
-            return f[1]
+        if len(f) > TAB.owner and f[TAB.suuid] == suuid and f[TAB.owner] not in ("", "-"):
+            return f[TAB.owner]
     return ""
 
 def cmd_tab_resolve(args):
@@ -1239,21 +1263,24 @@ def cmd_tab_resolve(args):
     out = []
     for line in reversed(read_lines("tasks")):   # newest board row for the dir
         f = fields(line)
-        if len(f) >= 4 and f[3] and dir_match(f[3], raw_given, canon_given):
+        if (len(f) > TASK.dir and f[TASK.dir]
+                and dir_match(f[TASK.dir], raw_given, canon_given)):
             su, owner = "", ""
-            if len(f) >= 8:
-                su = _identity(_largs_seg(f[7], "suuid"))
-                owner = _largs_seg(f[7], "csuuid").upper()
+            if len(f) > TASK.launch_args:
+                su = _identity(_largs_seg(f[TASK.launch_args], "suuid"))
+                owner = _largs_seg(f[TASK.launch_args], "csuuid").upper()
             if su:
                 if not owner:
                     owner = _tabs_owner_of(su)
                 out.append("\t".join(
-                    ["board", su, owner or "-", (f[1] if len(f) > 1 and f[1] else "-")]))
+                    ["board", su, owner or "-",
+                     (f[TASK.branch] if len(f) > TASK.branch and f[TASK.branch] else "-")]))
             break                               # close reads the newest row only
     for line in reversed(read_lines("tabs")):    # _cctabs_by_dir: RAW row dir ==
         f = fields(line)                         # canon(given) or the given string
-        if len(f) >= 3 and f[0] and dir_match(f[2], raw_given, canon_given):
-            su = _identity(f[0])
+        if (len(f) > TAB.dir and f[TAB.suuid]
+                and dir_match(f[TAB.dir], raw_given, canon_given)):
+            su = _identity(f[TAB.suuid])
             if su:
                 out.append("\t".join(
                     ["tabs", su, _tabs_owner_of(su) or "-", "-"]))
@@ -1296,15 +1323,15 @@ def cmd_tab_prune(args):
     if any(l.strip() == "!partial" for l in map_lines):
         return 0
     keys = set()
-    for l in map_lines:
-        f = l.split("\t")
-        if len(f) >= 2 and f[1]:
-            keys.add(f[1].upper())
+    for l in map_lines:                   # cmux's live map, NOT a store: its own format
+        mf = l.split("\t")               # (surface-ref \t uuid \t workspace). Named `mf`
+        if len(mf) >= 2 and mf[1]:        # so the "no bare position on a store row" pin
+            keys.add(mf[1].upper())       # in §39 does not have to carve out an exception
     if not keys:
         return 0
     def fn(rows):
         return [l for l in rows
-                if len(fields(l)) > 1 and fields(l)[0] in keys]
+                if len(fields(l)) > TAB.owner and fields(l)[TAB.suuid] in keys]
     rewrite("tabs", fn)
     return 0
 
