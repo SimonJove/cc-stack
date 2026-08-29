@@ -2410,6 +2410,40 @@ eq "32 task-add appends"        "$("$CC/cc-state" task-get /d/y | cut -f2)" "fea
 eq "32 task-add 8 fields"       "$("$CC/cc-state" task-get /d/y | awk -F'\t' '{print NF}')" "8"
 eq "32 placeholder caller+largs empty" "$("$CC/cc-state" task-get /d/y | awk -F'\t' '{print $5"|"$8}')" "|"
 "$CC/cc-state" task-get /d/nope >/dev/null 2>&1; eq "32 task-get miss rc1" "$?" "1"
+# D2b (§3.1 "dir 做主键就吃掉了 newest-per-dir 去重"): the LIVE store holds ONE row per dir —
+# a re-dispatch REPLACES that dir's row instead of stacking a second one. Enforced at every
+# write the PRODUCT makes; `load` deliberately stays the raw byte footgun it was designed as,
+# so a hand-written or migrated duplicate is still expressible and task-prune --compact still
+# has a job. (A UNIQUE index on the raw string was the other candidate and is the wrong tool:
+# it cannot express the actual rule — dir_match, not string equality — and it would take
+# `load`'s contract with it. See docs/state-model-d-plan.md §8.)
+S32AD=$(mktemp -d); D32AD="$(cd "$S32AD" && pwd -P)/wt"; mkdir -p "$D32AD"
+DB32AD="$S32AD/cc-state.db"
+ad32(){ env CC_STATE_DB="$DB32AD" "$CC/cc-state" "$@"; }
+ad32 task-add "$D32AD" feat/first s:1 'first dispatch' main
+ad32 task-set-state "$D32AD" working
+ad32 task-mark-opened "$D32AD"
+ad32 task-add "$D32AD" feat/second s:2 'second dispatch' main
+eq "32 a re-dispatch replaces the dir's row" "$(ad32 dump tasks | wc -l | tr -d ' ')" "1"
+eq "32 ...and the surviving row is the NEW one" "$(ad32 dump tasks | cut -f2)" "feat/second"
+# the two columns that live OUTSIDE the line are keyed to the DIR, not to the row — they were a
+# sidecar file and a $TMPDIR marker keyed by dir before they were columns, and replacing the row
+# under them must not lose that. _put's carry/restore already does it; this is what says so.
+eq "32 ...the dir's state survived the replace" "$(ad32 dump status | cut -f2)" "working"
+ad32 task-opened-recently "$D32AD" 120; eq "32 ...and so did the tab-opened stamp" "$?" "0"
+# matching is dir_match, NOT string equality: a legacy row holding the LOGICAL /var form names
+# the same worktree as the canonical /private/var one task-add writes, and a re-dispatch that
+# left both would put two rows for one worktree back on the board — defect 3 all over again.
+V32AD=$(mktemp -d); P32AD="$(cd "$V32AD" && pwd -P)"
+printf '2026-01-01 00:00:01\tfeat/legacy\ts:1\t%s\tc\tlogical row\tmain\tu\n' "$V32AD" | st_seed tasks "$DB32AD"
+ad32 task-add "$P32AD" feat/again s:3 'same worktree' main
+eq "32 a logical-path row is replaced too" "$(ad32 dump tasks | wc -l | tr -d ' ')" "1"
+eq "32 ...by the canonical row"            "$(ad32 dump tasks | cut -f2)" "feat/again"
+# and a DIFFERENT dir is untouched — without this the replace could just be "task-add clears
+# the store", which passes every assertion above
+ad32 task-add "$D32AD/other" feat/other s:4 'another dir' main
+eq "32 ...while another dir keeps its own row" "$(ad32 dump tasks | wc -l | tr -d ' ')" "2"
+rm -rf "$S32AD" "$V32AD"
 "$CC/cc-state" task-set-launch /d/y surface:9 'uuid=u2:pm=auto'
 eq "32 set-launch fills field 8" "$("$CC/cc-state" task-get /d/y | cut -f8)" "uuid=u2:pm=auto"
 eq "32 set-launch fills field 5" "$("$CC/cc-state" task-get /d/y | cut -f5)" "surface:9"

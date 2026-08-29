@@ -747,13 +747,29 @@ def _usage(text):
 # (7-field legacy rows are legal and must round-trip as 7 fields).
 
 def cmd_task_add(args):
-    """Append the dispatch-time placeholder row — the retired cc-board.sh log's row
-    (its recorded bytes are test.sh §32's frozen oracle, Task 9; including the '?'
+    """The dispatch-time placeholder row — the retired cc-board.sh log's row (its
+    recorded bytes are test.sh §32's frozen oracle, Task 9; including the '?'
     fallbacks for an empty surface ref and an underivable branch) with caller
     and launch-args left empty for task-set-launch. The dir is canonicalized on the
-    way in (the file header's write-side rule). Does NOT stamp the dedup marker:
-    the marker says "a tab actually opened", which only the caller knows — see
-    task-mark-opened."""
+    way in (the file header's write-side rule). Does NOT stamp the dedup timestamp:
+    it says "a tab actually opened", which only the caller knows — see
+    task-mark-opened.
+
+    It REPLACES the dir's row rather than appending a second one (§3.1: "dir 做主键
+    就吃掉了 newest-per-dir 去重"). The replace is here, in the verb, rather than a
+    UNIQUE index on the column, for two measured reasons: the index would key on the
+    raw string, and the rule is dir_match — a legacy row holding the logical /var
+    form is the same worktree as the canonical one this row names, and the index
+    would happily keep both; and it would take `load`'s deliberate "no dedup, raw
+    bytes" contract with it, which is the path a human repairs a store by. So the
+    invariant is enforced at every write the PRODUCT makes and `load` stays the
+    documented footgun; task-prune --compact still collapses what `load` and the
+    legacy import can still put there. docs/state-model-d-plan.md §8.
+
+    The two columns that live outside the line follow the DIR, not the row: _put
+    snapshots them before the rewrite and re-attaches them by dir_match after, so
+    a re-dispatch keeps the worktree's agent state and its tab-opened stamp — which
+    is what they did when they were a sidecar file and a $TMPDIR marker keyed by dir."""
     if len(args) != 5:
         return _usage("task-add <dir> <branch> <ref> <task> <parent>")
     d, branch, ref, task, parent = args
@@ -764,9 +780,15 @@ def cmd_task_add(args):
         branch = _git_branch(d)               # empty arg = derive here, as the retired log did
     ref = ref or "?"                          # the retired log: ref="${2:-?}"
     summary = _sanitize(task, 140, True) or "(idle ccteam, no initial prompt)"
-    append_line("tasks", "\t".join(
-        [now_stamp(), branch, ref, d, "", summary, parent, ""]))
-    return 0
+    fresh = "\t".join([now_stamp(), branch, ref, d, "", summary, parent, ""])
+    # d is already canonical, so both halves of dir_match get the same string; what the
+    # second half still buys is the LEGACY row whose dir is the logical /var form.
+    def fn(rows):
+        return [l for l in rows
+                if not (len(fields(l)) > TASK.dir
+                        and dir_match(fields(l)[TASK.dir], d, d))] + [fresh]
+    rewrite("tasks", fn)                  # failure stays silent: today's append ended in
+    return 0                              # `>> "$f" 2>/dev/null || true`
 
 def cmd_task_set_launch(args):
     """Fill caller-ref (field 5) and launch-args (field 8) on the NEWEST row of the
