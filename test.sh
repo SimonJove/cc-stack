@@ -5167,8 +5167,7 @@ eq "39 schema version is stamped" \
 # empty sidecar over the columns that still hold the real state. Simulated here rather than run
 # against an old binary: the two things old code leaves behind are exactly these two statements.
 DG39="$S39/dg"; mkdir -p "$DG39/w"
-dg39(){ env \
-            CC_STATE_DB="$DG39/cc-state.db" "$CC/cc-state" "$@"; }
+dg39(){ env CC_STATE_DB="$DG39/cc-state.db" "$CC/cc-state" "$@"; }
 dg39 task-add "$DG39/w" feat/dg s:1 'downgrade probe' main >/dev/null
 dg39 task-set-state "$DG39/w" working
 eq "39 state is carried before the downgrade" "$(dg39 dump status | wc -l | tr -d ' ')" "1"
@@ -5248,6 +5247,48 @@ eq "39 ...and renames nothing new"          "$(ls "$M39"/*.migrated.* | wc -l | 
 # the ONE deliberate deviation, asserted rather than tolerated (state-model §3.5 #10)
 eq "39 the newline-less legacy row gained a newline (deviation 10)" \
   "$(m39 dump tasks | tail -c 1 | od -An -tx1 -v | tr -d ' \n')" "0a"
+# D plan Task 1 assertion 6 — v0 → v2 DIRECT. A machine that still has only the four TSVs
+# must land on the current schema in one migration, not build a v1 library and then upgrade it:
+# the two-step would run the fold path over data that was never a sidecar table, and a new
+# machine would carry a transitional shape it never had any reason to have.
+eq "39 a v0 machine migrates straight to v2" \
+  "$(python3 -c 'import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); print("%d/%d" % (c.execute("PRAGMA user_version").fetchone()[0], c.execute("SELECT count(*) FROM sqlite_master WHERE type=\"table\" AND name=\"status\"").fetchone()[0]))' "$M39/cc-state.db")" "2/0"
+# D plan Task 1 assertion 4 / §1.5 deviation A — a sidecar row belonging to NO task row cannot
+# be represented once state is two columns on the task row, so the import drops it. Today's
+# task-prune already sweeps such rows; this turns "will be swept" into "cannot be stored", and
+# the assertion is what keeps the drop deliberate rather than a coincidence of the fold.
+OR39=$(mktemp -d)
+printf '2026-01-01 00:00:01\tfeat/or\ts:1\t/d/or\tc\thas a task row\tmain\n' > "$OR39/worktree-tasks.tsv"
+printf '/d/or\tworking\t100\n/d/nobody\tblocked\t200\n' > "$OR39/worktree-status.tsv"
+or39(){ env CC_STATE_DB="$OR39/cc-state.db" "$CC/cc-state" "$@"; }
+or39 dump tasks >/dev/null                      # first open imports both TSVs
+eq "39 an orphan sidecar row is dropped on import" "$(or39 dump status | wc -l | tr -d ' ')" "1"
+eq "39 ...and it is the one WITH a task row that survived" "$(or39 dump status | cut -f1)" "/d/or"
+rm -rf "$OR39"
+# the same rule at the OTHER entry point: a v1 library (four tables) upgrading in place. The
+# fold has its own matching code, so a v0-only assertion would leave it uncovered.
+U39=$(mktemp -d)
+python3 - "$U39/cc-state.db" <<'PYU'
+import sqlite3, sys
+COLS = {"tasks": 8, "status": 3, "archive": 9, "tabs": 5}
+c = sqlite3.connect(sys.argv[1])
+for t, n in COLS.items():                        # the v1 shape, verbatim
+    c.execute("CREATE TABLE %s (seq INTEGER PRIMARY KEY, nf INTEGER NOT NULL, %s, fx BLOB)"
+              % (t, ", ".join("f%d BLOB" % (i + 1) for i in range(n))))
+c.execute("INSERT INTO tasks (nf,f1,f2,f3,f4,f5,f6,f7,f8,fx) VALUES (7,?,?,?,?,?,?,?,NULL,NULL)",
+          (b"2026-01-01 00:00:01", b"feat/u", b"s:1", b"/d/u", b"c", b"v1 row", b"main"))
+c.execute("INSERT INTO status (nf,f1,f2,f3,fx) VALUES (3,?,?,?,NULL)", (b"/d/u", b"idle", b"300"))
+c.execute("INSERT INTO status (nf,f1,f2,f3,fx) VALUES (3,?,?,?,NULL)", (b"/d/ghost", b"working", b"400"))
+c.execute("PRAGMA user_version=1")
+c.commit()
+PYU
+u39(){ env CC_STATE_DB="$U39/cc-state.db" "$CC/cc-state" "$@"; }
+eq "39 a v1 library upgrades to v2 in place" \
+  "$(u39 dump tasks >/dev/null; python3 -c 'import sqlite3,sys; print(sqlite3.connect(sys.argv[1]).execute("PRAGMA user_version").fetchone()[0])' "$U39/cc-state.db")" "2"
+eq "39 ...folding the sidecar onto its task row"   "$(u39 dump status)" "$(printf '/d/u\tidle\t300')"
+eq "39 ...and dropping the one with no task row"   "$(u39 dump status | grep -c ghost)" "0"
+eq "39 ...while the 7-field task row stays 7"      "$(u39 dump tasks | awk -F'\t' '{print NF}')" "7"
+rm -rf "$U39"
 
 # A migration that fails AFTER the library file was created must take it back down. The
 # fixture below (read-only DIRECTORY) cannot reach that path — sqlite never gets to create
@@ -5257,8 +5298,7 @@ eq "39 the newline-less legacy row gained a newline (deviation 10)" \
 MH39=$(mktemp -d)
 printf '2026-01-01 00:00:01\tfeat/h\ts:1\t/d/h\tc\tunreadable\tmain\n' > "$MH39/worktree-tasks.tsv"
 chmod 000 "$MH39/worktree-tasks.tsv"
-env CC_STATE_DB="$MH39/cc-state.db" \
-    "$CC/cc-state" dump tasks >/dev/null 2>&1; r39u=$?
+env CC_STATE_DB="$MH39/cc-state.db" "$CC/cc-state" dump tasks >/dev/null 2>&1; r39u=$?
 chmod 644 "$MH39/worktree-tasks.tsv"
 eq "39 a mid-flight migration failure removes the library it created" \
   "$(ls "$MH39"/cc-state.db* 2>/dev/null | wc -l | tr -d ' ')" "0"
