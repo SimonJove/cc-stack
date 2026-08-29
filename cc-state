@@ -119,6 +119,22 @@ def _db_path():
 # would put this task's diff on top of that one's and make a regression unattributable.
 COLS = {"tasks": 8, "status": 3, "archive": 9, "tabs": 5}
 
+# D 期（模型收敛）：真正的表只剩三张。`status` 仍是一个 STORE —— 动词、dump / load、沙箱
+# 变量全部照旧 —— 但它不再有自己的表，而是 tasks 上两列的投影（§3.1「sidecar 只是任务行的
+# 两列」）。虚拟化整个发生在 _get / _put 里，上面 20 个动词一行没动，与 C 期换引擎用的是
+# 同一道缝。副作用是一条不变量被结构化了：状态行只能属于一个已存在的任务行，孤儿 sidecar
+# 从此无处可存（今天 task-prune 本来就会扫掉它们）。
+TABLES = ("tasks", "archive", "tabs")
+SCHEMA_VERSION = 2
+# tasks 上因收敛新增的列。前两列吃掉 worktree-status.tsv；tab_opened_ts 吃掉 $TMPDIR 去重
+# 标记（Task 2）；merged_* 吃掉归档行今天存不下的两个事实。全部可空 —— 一行没有状态、
+# 没开过 tab、没合并过，都是常态而不是缺省值。
+STATE_COLS = (("state", "BLOB"), ("state_ts", "BLOB"), ("tab_opened_ts", "INTEGER"),
+              ("merged_at", "INTEGER"), ("merged_into", "BLOB"))
+# 导入顺序：tasks 必须在 status 之前 —— 状态要落到任务行上，任务行还不存在就全丢了。
+# sorted(COLS) 恰好把 status 排在 tasks 前面,所以这个顺序不能靠字典序。
+MIGRATE_ORDER = ("tasks", "archive", "tabs", "status")
+
 # Three things the row↔column round trip needs, none of them optional:
 #   · BLOB, not TEXT. read_lines has always used errors="surrogateescape" so a non-UTF-8
 #     byte rides through the way awk passes it; a TEXT column cannot hold the lone
@@ -138,12 +154,49 @@ def _cols(store):
     return ", ".join("f%d" % (i + 1) for i in range(COLS[store]))
 
 def _schema(conn):
-    for store in sorted(COLS):
+    for store in TABLES:
         conn.execute("CREATE TABLE IF NOT EXISTS %s (seq INTEGER PRIMARY KEY, "
                      "nf INTEGER NOT NULL, %s, fx BLOB)"
                      % (store, ", ".join("f%d BLOB" % (i + 1)
                                          for i in range(COLS[store]))))
-    conn.execute("PRAGMA user_version=1")
+    _upgrade(conn)
+
+def _upgrade(conn):
+    """v1（四张表）→ v2（三张表 + tasks 上的五列）。库内迁移，不碰磁盘上的任何文件。
+
+    幂等：先看 user_version，再逐列检查 PRAGMA table_info —— 一个被打断的升级下次接着做，
+    而不是在已存在的列上 ALTER 失败。整个折叠在一个事务里，失败则库停在 v1、按 v1 路径
+    继续跑（沿用 C 期的降级契约）。"""
+    if conn.execute("PRAGMA user_version").fetchone()[0] >= SCHEMA_VERSION:
+        return
+    have = set(r[1] for r in conn.execute("PRAGMA table_info(tasks)"))
+    todo = [(c, t) for c, t in STATE_COLS if c not in have]
+    sidecar = conn.execute("SELECT count(*) FROM sqlite_master "
+                           "WHERE type='table' AND name='status'").fetchone()[0]
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        for col, typ in todo:
+            conn.execute("ALTER TABLE tasks ADD COLUMN %s %s" % (col, typ))
+        if sidecar:
+            rows = [_to_line(r, 3) for r in conn.execute(
+                "SELECT nf, f1, f2, f3, fx FROM status ORDER BY seq")]
+            # ONLY when the table actually holds rows. _put_status clears every carried
+            # state before re-applying, so folding an EMPTY sidecar would wipe state that
+            # is already in the columns — which is exactly the new→old→new round trip: old
+            # code re-creates an empty `status` and stamps the version back to 1, leaving
+            # the real state sitting untouched in the columns it cannot see. Downgrading
+            # must cost visibility, never data.
+            if rows:
+                _put_status(conn, rows)
+            conn.execute("DROP TABLE status")
+        conn.execute("PRAGMA user_version=%d" % SCHEMA_VERSION)
+        conn.execute("COMMIT")
+    except BaseException:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        raise
 
 def _enc(s):
     return s.encode("utf-8", "surrogateescape")
@@ -199,7 +252,7 @@ def _connect(create):
             conn = _open(p)
             _schema(conn)
         else:
-            legacy = [s for s in sorted(COLS) if _migratable(p, PATHS[s]())]
+            legacy = [s for s in MIGRATE_ORDER if _migratable(p, PATHS[s]())]
             if not legacy and not create:
                 return None
             d = os.path.dirname(p)
@@ -349,8 +402,98 @@ def _migrate(conn, legacy):
                 pass
         raise
 
+def _get_status(conn):
+    """The sidecar as it always looked: dir\tstate\tunix-ts, one row per dir.
+
+    Two rules the file had and the projection must keep:
+      · the KEY IS PHYSICAL. `task-set-state` always wrote the canonical dir and the
+        board render joins on that form — while the tasks row keeps whatever string was
+        recorded at dispatch, which for a legacy row is the logical /var/... path. So
+        the projection canonicalizes on the way out; emitting f4 raw would silently stop
+        the board joining exactly the rows defect 3 was fixed for.
+        It must be canon_or_raw, NOT canon: canon_or_raw is what dir_match applies to
+        the row side, and it deliberately refuses to realpath a path that is not a
+        directory. A dead worktree's row would come out of the projection as a realpath
+        that dir_match then cannot match back — so every read→write round trip (prune,
+        clear-state, the board's prune-on-read) would silently DROP the state of every
+        dir that has already been removed. Same function on both sides, or the
+        projection is not lossless.
+      · ORDER is the tasks row's seq, i.e. dispatch order — the same order the file
+        had, because both answer "when did this dir first appear".
+    Rows whose state is NULL are simply not sidecar rows."""
+    return ["\t".join((canon_or_raw(_dec(d)) if d is not None else "",
+                       "" if st is None else _dec(st),
+                       "" if ts is None else _dec(ts)))
+            for d, st, ts in conn.execute("SELECT f4, state, state_ts FROM tasks "
+                                          "WHERE state IS NOT NULL ORDER BY seq")]
+
+def _put_status(conn, lines):
+    """Replace the sidecar: clear every carried state, then re-apply row by row.
+
+    Matching goes through dir_match — the ONE row-matching rule — not string equality
+    on f4: the caller may name the canonical path while the row holds the logical one
+    (or the reverse), and that pair is exactly what defect 3 was about. Among matches
+    the LAST (highest seq) wins: that is the row every reader means by "this worktree".
+
+    A row naming a dir with NO tasks row lands nowhere and is dropped — the orphan
+    class task-prune already sweeps, now structurally unrepresentable (plan §1.5 A)."""
+    rows = [(seq, "" if d is None else _dec(d))
+            for seq, d in conn.execute("SELECT seq, f4 FROM tasks ORDER BY seq")]
+    conn.execute("UPDATE tasks SET state=NULL, state_ts=NULL")
+    for line in lines:
+        f = line.split("\t")
+        raw = f[0] if f else ""
+        c = canon(raw)
+        hit = None
+        for seq, d in rows:
+            if dir_match(d, raw, c):
+                hit = seq
+        if hit is None:
+            continue
+        conn.execute("UPDATE tasks SET state=?, state_ts=? WHERE seq=?",
+                     (_enc(f[1]) if len(f) > 1 else None,
+                      _enc(f[2]) if len(f) > 2 else None, hit))
+
+# The columns that do NOT live in the TSV line. Every verb above the storage layer still
+# works on whole lines, so a rewrite of `tasks` is DELETE + re-INSERT of f1..f8 — which
+# silently took these with it until this pair existed. `task-set-ref <dir> s:9` wiped the
+# state of every worktree on the board, and the board just rendered "-". Anything keyed to
+# a task row rather than to its text has to be carried across the rewrite by hand.
+CARRIED = ("state", "state_ts", "tab_opened_ts", "merged_at", "merged_into")
+
+def _carry(conn):
+    """Snapshot the carried columns, keyed by the row's dir. Rows carrying nothing are
+    skipped so the common rewrite (no state anywhere) stays free."""
+    out = []
+    for row in conn.execute("SELECT f4, %s FROM tasks ORDER BY seq" % ", ".join(CARRIED)):
+        vals = list(row[1:])
+        if any(v is not None for v in vals):
+            out.append(("" if row[0] is None else _dec(row[0]), vals))
+    return out
+
+def _restore(conn, carried):
+    """Re-attach the snapshot after a rewrite, by dir_match — the same rule every verb
+    uses. A dir the rewrite DROPPED finds no row and its columns are gone with it, which
+    is the point: pruning a task row takes its state with it, no orphan can survive."""
+    if not carried:
+        return
+    rows = [(seq, "" if d is None else _dec(d))
+            for seq, d in conn.execute("SELECT seq, f4 FROM tasks ORDER BY seq")]
+    sets = ", ".join("%s=?" % c for c in CARRIED)
+    for raw, vals in carried:
+        c = canon(raw)
+        hit = None
+        for seq, d in rows:
+            if dir_match(d, raw, c):
+                hit = seq
+        if hit is not None:
+            conn.execute("UPDATE tasks SET %s WHERE seq=?" % sets, tuple(vals) + (hit,))
+
 def _put(conn, store, lines):
     """Replace a table's rows. seq restarts at 1, so insertion order is file order."""
+    if store == "status":
+        return _put_status(conn, lines)
+    carried = _carry(conn) if store == "tasks" else None
     n = COLS[store]
     conn.execute("DELETE FROM %s" % store)
     if lines:
@@ -358,8 +501,12 @@ def _put(conn, store, lines):
             "INSERT INTO %s (nf, %s, fx) VALUES (%s)"
             % (store, _cols(store), ", ".join("?" * (n + 2))),
             [_to_row(l, n) for l in lines])
+    if carried:
+        _restore(conn, carried)
 
 def _get(conn, store):
+    if store == "status":
+        return _get_status(conn)
     n = COLS[store]
     return [_to_line(r, n) for r in conn.execute(
         "SELECT nf, %s, fx FROM %s ORDER BY seq" % (_cols(store), store))]
@@ -443,6 +590,9 @@ def append_line(store, line):
     its always-exit-0 contract."""
     conn = _connect(True)
     if conn is None:
+        return
+    if store == "status":               # a projection has no table to append to
+        rewrite(store, lambda rows: rows + [line])
         return
     n = COLS[store]
     try:

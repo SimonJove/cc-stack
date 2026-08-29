@@ -584,6 +584,8 @@ eq "34 archive --all shows foreign"  "$(brd34 "$B34" --archive --all | grep -c '
 mk34
 printf '2026-01-01 00:00:05\tfeat/34G\tsurface:67\t%s\tsurface:1\t34 dead row\tmain\n' "$B34/gone" | st_append tasks "$DB_34"
 DDEAD34="$(mktemp -u)"                                    # a dir string that never exists
+# D 期：状态是任务行上的列 —— 「无关的 sidecar 行」就是「一条带状态的无关任务行」
+printf '2026-01-01 00:00:07\tfeat/34X\tsurface:69\t%s\tsurface:1\t34 dead sidecar row\tmain\n' "$DDEAD34" | st_append tasks "$DB_34"
 printf '%s\tidle\t%s\n' "$DDEAD34" "$NOW34" | st_append status "$DB_34"
 brd34 "$B34" >/dev/null
 # (Task 8b, §4-trap cases) all four test the SWEEP's side effect on disk, so the read verb is
@@ -594,6 +596,7 @@ eq "34 render prunes dead sidecar rows via facade" "$(CC_STATE_DB="$DB_34" CC_ST
 eq "34 render keeps live task rows"                "$(CC_STATE_DB="$DB_34" CC_TASKS_FILE="$T34" "$CC/cc-state" dump tasks | wc -l | tr -d ' ')" "4"
 eq "34 render keeps live sidecar rows"             "$(CC_STATE_DB="$DB_34" CC_STATUS_FILE="$S34" "$CC/cc-state" dump status | wc -l | tr -d ' ')" "2"
 mk34
+printf '2026-01-01 00:00:07\tfeat/34X\tsurface:69\t%s\tsurface:1\t34 dead sidecar row\tmain\n' "$DDEAD34" | st_append tasks "$DB_34"
 printf '%s\tidle\t%s\n' "$DDEAD34" "$NOW34" | st_append status "$DB_34"
 brd34 "$B34" --archive >/dev/null
 # the dead row is still THERE — "not swept" can only be read raw (a filtered view hides it)
@@ -682,12 +685,16 @@ eq "archive merged-at is 8th on 7-field" "$(st_dump archive | awk -F'\t' -v d="$
 # board already runs per row — before this only gwt-prune/gwt-rm touched it and it grew forever.
 SLIVE="$(cn "$(mktemp -d)")"; SDEAD="/tmp/cc-board-dead-$$"
 mkrows
+# D 期：状态是任务行上的列 —— 「无关的 sidecar 行」就是「一条带状态的无关任务行」
+printf '2026-01-01 00:00:06\tfeat/SL\tsurface:56\t%s\tsurface:1\tsidecar live\tmain\t%s\n' "$SLIVE" "$LA" | st_append tasks
+printf '2026-01-01 00:00:07\tfeat/SD\tsurface:57\t%s\tsurface:1\tsidecar dead\tmain\t%s\n' "$SDEAD" "$LA" | st_append tasks
 printf '%s\tworking\t%s\n' "$SLIVE" "$now20"  | st_seed status
 printf '%s\tidle\t%s\n'    "$SDEAD" "$now20" | st_append status
 bash "$CC/cc-board.sh" --all >/dev/null 2>&1
 # (Task 8b, §4-trap) sweep side effects on the sidecar: raw `dump status`, never a filtered view
 eq "sidecar prune drops a dead dir"     "$("$CC/cc-state" dump status | grep -c "$SDEAD")" "0"
 eq "sidecar prune keeps a live dir"     "$("$CC/cc-state" dump status | grep -c "$SLIVE")" "1"
+printf '2026-01-01 00:00:07\tfeat/SD\tsurface:57\t%s\tsurface:1\tsidecar dead\tmain\t%s\n' "$SDEAD" "$LA" | st_append tasks
 printf '%s\tidle\t%s\n' "$SDEAD" "$now20" | st_append status
 printf '2026-01-01 00:00:05\tfeat/AR\tsurface:55\t%s\tsurface:1\tarch row\tmain\t%s\n' "$E1" "$LA" | st_seed archive
 bash "$CC/cc-board.sh" --archive --all >/dev/null 2>&1
@@ -2218,6 +2225,8 @@ printf '2026-01-01 00:00:05\tfeat/R4\tsurface:11\t%s/gone\tsurface:1\tdead dir r
 printf '2026-01-01 00:00:06\tfeat/R5\tsurface:12\t%s\tsurface:1\tforeign repo row\tmain\tuuid=%s:provider=glm:pm=auto\n' "$OTH17" "$U4" | st_append tasks "$DB_17"
 printf '%s\tblocked\t%s\n' "$D1" 100 |  st_seed status "$DB_17"
 printf '%s\tidle\t%s\n'    "$D2" 100 | st_append status "$DB_17"
+# D 期：状态是任务行上的列 —— 「无关的 sidecar 行」就是「一条带状态的无关任务行」
+printf '2026-01-01 00:00:07\tfeat/UN\tsurface:19\t%s\tsurface:1\tunrelated row\tmain\n' "$UNREL17" | st_append tasks "$DB_17"
 printf '%s\tidle\t%s\n'    "$UNREL17" 100 | st_append status "$DB_17"
 # agent session store fixture in the REAL nested shape (probed live 2026-08-15): the per-session
 # records live under "sessions"; the top level also carries activeSessionsBySurface /
@@ -2653,6 +2662,7 @@ eq "32 tab-prune all-dead removes the file" "$([ -f "$CC_TABS_FILE" ] && echo ye
 # the CLI surface itself
 eq "32 help lists every verb" "$("$CC/cc-state" --help 2>&1 | grep -oE 'task-add|tab-prune|dump' | wc -l | tr -d ' ')" "3"
 "$CC/cc-state" bogus-verb >/dev/null 2>&1; eq "32 unknown verb rc2" "$?" "2"
+printf '\t\t\t/d/x\n' | st_seed tasks      # 状态挂在任务行上,先有行才有状态
 printf '/d/x\tworking\t123\n' | st_seed status
 eq "32 dump status works" "$("$CC/cc-state" dump status)" "$(printf '/d/x\tworking\t123')"
 
@@ -2829,14 +2839,20 @@ eq "32 C5 rc stays 0 through the window" "$r32c5" "0"
 S32CL=$(mktemp -d); D32CL="$S32CL/live dir"; mkdir -p "$D32CL"   # NB: a SPACE in the path
 export CC_STATUS_FILE="$S32CL/s.tsv" CC_TASKS_FILE="$S32CL/t.tsv" CC_STATE_DB="$S32CL/cc-state.db"
 P32CL="$(cd "$D32CL" && pwd -P)"
+# D 期：状态是任务行上的列,所以两条状态行各自要有一条任务行。原夹具故意把 tasks 留空来表达
+# 「清除不受板成员资格约束」—— 那个前提在新模型下结构上不成立(没有任务行就没有状态)。同一条
+# 性质改用它现在的形状表达:清一个不在板上的 dir 是无害的 no-op,rc 0 且不动别人。
+{ printf '2026-01-01 00:00:01\tfeat/cl\ts:1\t%s\tc\tclear-state row\tmain\t\n' "$D32CL"
+  printf '2026-01-01 00:00:02\tfeat/oth\ts:2\t%s\tc\tunrelated row\tmain\t\n' "$S32CL/other"; } | st_seed tasks
 printf '%s\tworking\t111\n%s\tblocked\t222\n' "$D32CL" "$S32CL/other" | st_seed status
-: | st_seed tasks             # deliberately EMPTY: clearing must not be gated on board membership
 "$CC/cc-state" task-clear-state "$D32CL"
 # spec 3.5 defect 1: _ccres_dropstatus' awk had no -F'\t', so it split on whitespace and a
 # dir with a space in it could never be dropped. Byte-matching on the field kills that class.
 eq "32 clear-state drops a dir whose path has a space" "$("$CC/cc-state" dump status | grep -cF "$D32CL	")" "0"
 eq "32 clear-state leaves unrelated rows"              "$("$CC/cc-state" dump status | grep -cF "$S32CL/other")" "1"
-eq "32 clear-state is not gated on board membership"   "$("$CC/cc-state" dump status | wc -l | tr -d ' ')" "1"
+"$CC/cc-state" task-clear-state "$S32CL/nosuchdir"; rc32cl=$?
+eq "32 clear-state on a non-member dir is rc 0"       "$rc32cl" "0"
+eq "32 clear-state is not gated on board membership"  "$("$CC/cc-state" dump status | wc -l | tr -d ' ')" "1"
 # the file-header dir rule, both directions (macOS /var vs /private/var)
 printf '%s\tworking\t111\n%s\tidle\t222\n' "$D32CL" "$S32CL/other" | st_seed status
 "$CC/cc-state" task-clear-state "$P32CL"
@@ -3980,6 +3996,8 @@ printf '2026-01-01 00:00:02\tfeat/f7-35\tsurface:13\t%s\tsurface:1\tseven field 
 printf '2026-01-01 00:00:03\tfeat/log35\tsurface:14\t%s\tsurface:1\tlogical dir row\tmain\tuuid=55555555-5555-5555-5555-555555555555:provider=anthropic:pm=plan\n' "$LOGD35" | st_append tasks "$DB_35"
 printf '%s\tblocked\t100\n' "$DSP35" | st_seed status "$DB_35"
 printf '%s\tidle\t100\n' "$LOGD35" | st_append status "$DB_35"
+# D 期：状态是任务行上的列 —— 「无关的 sidecar 行」就是「一条带状态的无关任务行」
+printf '2026-01-01 00:00:04\tfeat/els35\tsurface:15\t%s\tsurface:1\telsewhere row\tmain\n' "$RD35/elsewhere" | st_append tasks "$DB_35"
 printf '%s\tworking\t100\n' "$RD35/elsewhere" | st_append status "$DB_35"
 python3 - "$SP35" "$DSP35" "$S735" "$D735" > "$S35/store35b.json" <<'PY35'
 import json, sys
@@ -4792,7 +4810,11 @@ eq "37 exists: two arguments is rc 2"         "$(st37 exists tasks tabs >/dev/nu
 for s37 in tasks status archive tabs; do : | st_seed "$s37" "$DB_37"; done
 n37=0; for s37 in tasks status archive tabs; do st37 exists "$s37" || n37=$((n37+1)); done
 eq "37 exists: all four stores answer, empty" "$n37" "4"
-for s37 in tasks status archive tabs; do printf 'r\n' | st_seed "$s37" "$DB_37"; done
+# 状态行只能挂在一条已存在的任务行上（D 期：sidecar 是 tasks 的两列），所以 filled 夹具里
+# tasks 那行要带一个真的 dir(第 4 字段)，status 那行按它来键。
+for s37 in archive tabs; do printf 'r\n' | st_seed "$s37" "$DB_37"; done
+printf 'r\t\t\t/d/s37\n'      | st_seed tasks  "$DB_37"
+printf '/d/s37\tworking\t1\n' | st_seed status "$DB_37"
 n37=0; for s37 in tasks status archive tabs; do st37 exists "$s37" && n37=$((n37+1)); done
 eq "37 exists: all four stores answer, filled" "$n37" "4"
 eq "37 exists is a registered verb"           "$("$CC/cc-state" --help 2>&1 | grep -c '^verbs:.* exists ')" "1"
@@ -5025,10 +5047,10 @@ st38 exists tabs; eq "38 ...and the store then has no rows" "$?" "1"
 # newline still round-trips as that many rows, and the newline is supplied on write. This is a
 # deliberate deviation from `cat`, and the reason a hand-edited file cannot lose its last row.
 printf 'x\ty\nz\tw' > "$S38/nonl"
-st38 load status "$S38/nonl"
-eq "38 a source without a trailing newline keeps both rows" "$(st38 dump status | wc -l | tr -d ' ')" "2"
+st38 load tabs "$S38/nonl"
+eq "38 a source without a trailing newline keeps both rows" "$(st38 dump tabs | wc -l | tr -d ' ')" "2"
 eq "38 ...and the store gains the newline" \
-  "$(st38 dump status | tail -c 1 | od -An -tx1 -v | tr -d ' \n')" "0a"
+  "$(st38 dump tabs | tail -c 1 | od -An -tx1 -v | tr -d ' \n')" "0a"
 # rc contract: 1 = the source could not be read, 2 = usage. Neither may be mistaken for success,
 # and neither may quietly wipe the store it was pointed at.
 N38="$(st38 dump tasks | wc -l | tr -d ' ')"
@@ -5091,7 +5113,30 @@ eq "39 ...and the write landed anyway"           "$(st39 dump tasks | grep -c 'l
 eq "39 the library is in WAL mode" \
   "$(python3 -c 'import sqlite3,sys; print(sqlite3.connect(sys.argv[1]).execute("PRAGMA journal_mode").fetchone()[0])' "$S39/cc-state.db")" "wal"
 eq "39 schema version is stamped" \
-  "$(python3 -c 'import sqlite3,sys; print(sqlite3.connect(sys.argv[1]).execute("PRAGMA user_version").fetchone()[0])' "$S39/cc-state.db")" "1"
+  "$(python3 -c 'import sqlite3,sys; print(sqlite3.connect(sys.argv[1]).execute("PRAGMA user_version").fetchone()[0])' "$S39/cc-state.db")" "2"
+# A DOWNGRADE must cost visibility, never data. Code from before the model convergence opens a v2
+# library happily — it reads f1..f8 and ignores the carried columns — but it also re-creates an
+# empty `status` table and stamps the version back to 1. Coming back UP must not then fold that
+# empty sidecar over the columns that still hold the real state. Simulated here rather than run
+# against an old binary: the two things old code leaves behind are exactly these two statements.
+DG39="$S39/dg"; mkdir -p "$DG39/w"
+dg39(){ env CC_TASKS_FILE="$DG39/t.tsv" CC_STATUS_FILE="$DG39/s.tsv" CC_ARCHIVE_FILE="$DG39/a.tsv" \
+            CC_TABS_FILE="$DG39/b.tsv" CC_STATE_DB="$DG39/cc-state.db" "$CC/cc-state" "$@"; }
+dg39 task-add "$DG39/w" feat/dg s:1 'downgrade probe' main >/dev/null
+dg39 task-set-state "$DG39/w" working
+eq "39 state is carried before the downgrade" "$(dg39 dump status | wc -l | tr -d ' ')" "1"
+python3 - "$DG39/cc-state.db" <<'PYDG'
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+c.execute("CREATE TABLE IF NOT EXISTS status (seq INTEGER PRIMARY KEY, nf INTEGER NOT NULL, "
+          "f1 BLOB, f2 BLOB, f3 BLOB, fx BLOB)")
+c.execute("PRAGMA user_version=1")
+c.commit()
+PYDG
+eq "39 a downgrade round trip keeps the state" "$(dg39 dump status | wc -l | tr -d ' ')" "1"
+eq "39 ...and it is the same state"            "$(dg39 dump status | cut -f2)" "working"
+eq "39 ...and the sidecar table is gone again" \
+  "$(python3 -c 'import sqlite3,sys; print(sqlite3.connect(sys.argv[1]).execute("SELECT count(*) FROM sqlite_master WHERE type=\"table\" AND name=\"status\"").fetchone()[0])' "$DG39/cc-state.db")" "0"
 # -wal/-shm exist only while a connection is open; a clean exit takes them with it. They are
 # NOT asserted in §24's live oracle for exactly that reason, but here the process has ended.
 eq "39 a clean exit leaves no WAL sidecars" \
@@ -5101,9 +5146,11 @@ eq "39 a clean exit leaves no WAL sidecars" \
 # task-prune --compact's newest-per-dir reads file order; without an explicit ordering column
 # this is the assertion that would have caught it, silently, on a table that happened to
 # come back sorted differently after a rewrite.
-{ printf 'r1\tone\nr2\ttwo\nr3\tthree\n'; } | st_seed status "$S39/cc-state.db"
-env CC_STATE_DB="$S39/cc-state.db" "$CC/cc-state" task-clear-state /d/nothing   # a no-op rewrite
-eq "39 rows come back in insertion order" "$(st39 dump status | cut -f1 | tr '\n' ',')" "r1,r2,r3,"
+# D 期起 status 是 tasks 两列的投影,它的序来自 tasks.seq —— 要测「存储层保住插入序」就得测
+# 一个仍逐行存储的表,而这条注释说的 task-prune --compact 读的本来就是 tasks 的序。
+{ printf 'r1\tone\nr2\ttwo\nr3\tthree\n'; } | st_seed tasks "$S39/cc-state.db"
+env CC_STATE_DB="$S39/cc-state.db" "$CC/cc-state" task-set-ref /d/nothing s:1 >/dev/null 2>&1   # a no-op rewrite
+eq "39 rows come back in insertion order" "$(st39 dump tasks | cut -f1 | tr '\n' ',')" "r1,r2,r3,"
 
 # ── the byte classes the column store has to survive ─────────────────────────────────────────
 # A real 0xff (BLOB columns + surrogateescape — a TEXT column cannot hold the lone surrogate
