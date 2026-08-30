@@ -1454,9 +1454,12 @@ grep -q '已归档' "$CC/docs/roadmap.md" \
 grep -q 'audit-0821 campaign 转写' "$CC/docs/known-issues.md" \
   && ok "known-issues: audit-0821 transcription section present" \
   || no "known-issues: audit-0821 transcription section present" missing present
+# The entry is CLOSED (C phase deleted all ten lock copies instead of unifying them), and it
+# stays in the file as a shape worth remembering — so what this pins is that the record of it
+# survives, not that the work is still queued. The label said "2nd-wave queue" until 2026-08-29.
 grep -q '锁 10 处副本' "$CC/docs/known-issues.md" \
-  && ok "known-issues: mkdir-lock stale-recovery entry (2nd-wave queue)" \
-  || no "known-issues: mkdir-lock stale-recovery entry (2nd-wave queue)" missing present
+  && ok "known-issues: the mkdir-lock entry is still on the record" \
+  || no "known-issues: the mkdir-lock entry is still on the record" missing present
 grep -q 'cc-state' "$CC/docs/backlog.md" \
   && ok "backlog: architecture-campaign section transcribed from audit-0821" \
   || no "backlog: architecture-campaign section transcribed from audit-0821" missing present
