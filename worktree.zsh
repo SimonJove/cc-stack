@@ -117,7 +117,7 @@ _gwt_tasks_drop_dir() {
   "$(_gwt_state)" task-drop "$target"
 }
 
-# ── Merged-task archive (worktree-tasks-archive.tsv) ───────────────────────────
+# ── Merged-task archive (the `archive` store) ──────────────────────────────────
 # Rows move here when their branch merges: the row verbatim plus an appended merged-at
 # unix ts. Rendered by gwt-log (cc-board.sh --archive) with the board's columns and repo filter.
 
@@ -235,7 +235,7 @@ gwt-status() {
   return $?
 }
 
-# gwt-log — render the merged-task archive (worktree-tasks-archive.tsv): same columns and repo
+# gwt-log — render the merged-task archive (the `archive` store): same columns and repo
 #   filter as gwt-status, fed by the rows gwt-merge moved out of the live board on merge.
 gwt-log() {
   emulate -L zsh

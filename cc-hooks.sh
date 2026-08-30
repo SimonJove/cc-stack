@@ -301,7 +301,7 @@ exit 0
 
 # ─────────────────────────────────────────────────────────────────────────────
 # status — UserPromptSubmit / Stop / Notification agent-state writer
-#   Keeps a per-sub-task agent-state sidecar (worktree-status.tsv, read by gwt-status's STATUS column)
+#   Keeps a per-sub-task agent state (the task row's state columns, read by gwt-status's STATUS column)
 #   with ZERO model cooperation and ZERO token cost: Claude Code fires these hooks on their own
 #   lifecycle, the hook just records them.
 #   - States: UserPromptSubmit → working; Stop → idle; Notification → blocked ONLY when the message

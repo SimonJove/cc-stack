@@ -348,7 +348,7 @@ _ccsend_calibrate() {  # $1 = ref, $2 = dir — self-calibration (hardening laye
 # (whitespace IFS), so an empty middle field would shift every later field for the reader
 # (docs/known-issues.md, "cc-board 读循环对空 caller 字段的 TAB 塌缩").
 #
-# WHY a SECOND ledger next to the board (worktree-tasks.tsv): the board only knows WORKTREE
+# WHY a SECOND ledger next to the board (the `tasks` store): the board only knows WORKTREE
 # sub-tasks. A leader that opens a helper tab — a runner in the primary checkout, a scratch-dir
 # tab — has no board row for it and therefore no recorded owner, so it could not even name, let
 # alone close, a tab it opened itself. The two ledgers answer different questions and are NEVER
@@ -1106,9 +1106,9 @@ fi
 #   the surface UUIDs recorded at open time (short refs DRIFT — that is how the 2026-08-16
 #   incident closed the parent session itself).
 #     ① resolve dir → live surface, in ledger order:
-#          1. the board row's suuid (worktree-tasks.tsv — the sub-task record, the only source
+#          1. the board row's suuid (the `tasks` store — the sub-task record, the only source
 #             that covers ccteam sub-tasks: the cmux agent session store never sees them),
-#          2. the opened-tabs ledger by dir (opened-tabs.tsv — every tab this stack opened).
+#          2. the opened-tabs ledger by dir (the `tabs` store — every tab this stack opened).
 #             This one survives `gwt-rm`, which DROPS the board row: a leader that removed a
 #             worktree first and only then went to close its tab used to be told "no live tab
 #             resolves to this directory" and had to close it by hand (live incident). The
@@ -1408,7 +1408,7 @@ exit 0
 #      `cld <provider> --resume <uuid> --permission-mode <pm> [--model <m>]` — plain-claude rows
 #      resume without cld; flags not recorded are omitted; rows with NO recorded uuid (pre-feature)
 #      degrade to an idle ccteam tab, visibly listed as such
-#   ④ stale agent-state rows (worktree-status.tsv) cleared for dirs whose tab came back THIS run
+#   ④ stale agent state (the task row's state columns) cleared for dirs whose tab came back THIS run
 #   ⑤ lists BRANCH | summary | dir | disposition first, then ONE y/N (rows to re-open only);
 #      --all skips the confirm AND the repo filter
 #   HARD INVARIANT: step ③ launches in the board's RECORDED dir string verbatim (surface's
