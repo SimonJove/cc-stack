@@ -338,7 +338,8 @@ _ccsend_calibrate() {  # $1 = ref, $2 = dir — self-calibration (hardening laye
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# opened-tabs ledger (2026-08-16) — ~/.config/cc-stack/opened-tabs.tsv, CC_TABS_FILE overrides.
+# opened-tabs ledger (2026-08-16) — a store in the state library (CC_STATE_DB); it was
+# ~/.config/cc-stack/opened-tabs.tsv, which the library imported on first open.
 # EVERY tab this stack opens is recorded here, keyed by the only stable identity a cmux tab has:
 # its surface UUID (short refs like surface:283 DRIFT as panes open and close — they are addresses,
 # never identities).
@@ -347,7 +348,7 @@ _ccsend_calibrate() {  # $1 = ref, $2 = dir — self-calibration (hardening laye
 # (whitespace IFS), so an empty middle field would shift every later field for the reader
 # (docs/known-issues.md, "cc-board 读循环对空 caller 字段的 TAB 塌缩").
 #
-# WHY a SECOND ledger next to the board (worktree-tasks.tsv): the board only knows WORKTREE
+# WHY a SECOND ledger next to the board (the `tasks` store): the board only knows WORKTREE
 # sub-tasks. A leader that opens a helper tab — a runner in the primary checkout, a scratch-dir
 # tab — has no board row for it and therefore no recorded owner, so it could not even name, let
 # alone close, a tab it opened itself. The two ledgers answer different questions and are NEVER
@@ -364,7 +365,6 @@ _ccsend_calibrate() {  # $1 = ref, $2 = dir — self-calibration (hardening laye
 # map and its completeness) and the orchestration that decides on top of both. Writes: tab-add;
 # reads: tab-list / tab-resolve / tab-owner; the prune: tab-prune (it takes the RAW live map and
 # recognizes the !partial sentinel itself, so the invariant below travels with the evidence).
-_cctabs_file(){ printf '%s' "${CC_TABS_FILE:-$HOME/.config/cc-stack/opened-tabs.tsv}"; }
 _cctabs_uc(){ printf '%s' "${1:-}" | tr 'abcdefghijklmnopqrstuvwxyz' 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'; }
 # ── workspace scope (2026-08-16) ────────────────────────────────────────────────────────────
 # `cmux list-pane-surfaces` lists ONE workspace — the caller's ($CMUX_WORKSPACE_ID) — and the CLI
@@ -441,7 +441,10 @@ _cctabs_where(){ # $1 = live map, $2 = surface uuid → the workspace ref it was
   printf '%s\n' "${1:-}" | awk -F'\t' -v u="${2:-}" '$2==u{print $3; exit}'
 }
 _cctabs_prune(){ # $1 = live map (optional; probed when omitted) — drop rows whose surface is gone
-  _tl_f="$(_cctabs_file)"; [ -f "$_tl_f" ] || return 0
+  # No "is there a ledger?" precheck: an empty store makes cc-state tab-prune a no-op that
+  # creates nothing, so asking the facade first would only spend a python start to save one.
+  # (The precheck that used to sit here stat'ed the ledger FILE — the thing this file is no
+  # longer allowed to know the name of.)
   _tlm="${1:-$(_cctabs_livemap)}"
   [ -n "$_tlm" ] || return 0                              # no map = no evidence = no pruning
   # INVARIANT (2026-08-16): absence of evidence is NEVER evidence of death, and it only ever gets
@@ -846,8 +849,14 @@ if [ -z "$rsmode" ]; then
   _mtb="$(git -C "$abspath" symbolic-ref --short HEAD 2>/dev/null)"
   [ -n "$_mtb" ] && [ -n "${root:-}" ] && _mt="$(git -C "$root" config --get "branch.$_mtb.ccMergeInto" 2>/dev/null)"
   "$CC_SELF/cc-state" task-add "$abspath" "" "$ref" "$prompt" "${_mt:-}"
-  "$CC_SELF/cc-state" task-mark-opened "$abspath"
 fi
+# WINDOW B (spec §3.1): the stamp belongs to "a tab was opened for this dir", which is
+# true on BOTH paths — resume reopens a tab too. It used to live inside the branch above,
+# so a resumed tab left no stamp and the very next dispatch for that dir sailed through
+# the 120s dedup gate and opened a SECOND one. task-add stays branch-local (resume's row
+# already exists); the stamp does not. Still AFTER the tab really opened, never before:
+# a dispatch that failed by here must leave nothing that eats the retry.
+"$CC_SELF/cc-state" task-mark-opened "$abspath"
 
 # Wait for the shell to be ready (only counts once the marker command's OUTPUT appears, avoiding the shell-init race)
 # RDY stays a RAW send by decision (2026-08-15): the target is the fresh SHELL, not a claude TUI —
@@ -1097,9 +1106,9 @@ fi
 #   the surface UUIDs recorded at open time (short refs DRIFT — that is how the 2026-08-16
 #   incident closed the parent session itself).
 #     ① resolve dir → live surface, in ledger order:
-#          1. the board row's suuid (worktree-tasks.tsv — the sub-task record, the only source
+#          1. the board row's suuid (the `tasks` store — the sub-task record, the only source
 #             that covers ccteam sub-tasks: the cmux agent session store never sees them),
-#          2. the opened-tabs ledger by dir (opened-tabs.tsv — every tab this stack opened).
+#          2. the opened-tabs ledger by dir (the `tabs` store — every tab this stack opened).
 #             This one survives `gwt-rm`, which DROPS the board row: a leader that removed a
 #             worktree first and only then went to close its tab used to be told "no live tab
 #             resolves to this directory" and had to close it by hand (live incident). The
@@ -1119,7 +1128,7 @@ fi
 #     ④ close by the STABLE uuid
 #   No live tab for that dir = nothing to do (rc 0): gwt-rm --close must stay idempotent.
 # Usage: cc-dispatch.sh close <worktree-dir>
-# Related env: CC_TASKS_FILE (board), CC_TABS_FILE (opened-tabs ledger), CC_CMUX_SESSIONS
+# Related env: CC_STATE_DB (board + opened-tabs ledger), CC_CMUX_SESSIONS
 #   (session store), CC_CALLER_SURFACE_UUID (override for $CMUX_SURFACE_ID)
 close)
 shift
@@ -1332,20 +1341,28 @@ exit 1
 #   nothing is pruned and every unresolved row prints as "dead?" instead of "dead".
 # Usage: cc-dispatch.sh tabs [--all]
 #   (default) only rows this session opened;  --all  every row in the ledger
-# Related env: CC_TABS_FILE (ledger), CC_CALLER_SURFACE_UUID (override for $CMUX_SURFACE_ID)
+# Related env: CC_STATE_DB (ledger), CC_CALLER_SURFACE_UUID (override for $CMUX_SURFACE_ID)
 tabs)
 shift
 tabs_all=""
 if [ "${1:-}" = "--all" ]; then tabs_all=1; shift; fi
 [ $# -eq 0 ] || { echo "usage: cc-dispatch.sh tabs [--all]" >&2; exit 2; }
 
-tabs_f="$(_cctabs_file)"
+# The header names where to look, on purpose — the human troubleshoots this ledger by hand.
+# That used to be a file path; the ledger is a table in the state library now, so "where to
+# look" is a COMMAND. Keeping the old path here would not be conservative, it would be a lie
+# printed on every run: the file it named no longer holds anything.
+echo "── opened tabs (cc-state dump tabs) ──"
+# "no ledger at all" is a different sentence from "a ledger, but no row of yours", and it is the
+# one that must be said BEFORE the cmux warnings and the column header — a reader who has never
+# opened a tab should not be told their workspace enumeration was incomplete. So this stays a
+# PRECHECK (one python start on a command that already forks cmux once per workspace), and it
+# buys back the whole liveness probe on the empty path, which today ran before saying this.
+"$CC_SELF/cc-state" exists tabs || { echo "  (no tabs recorded)"; exit 0; }
 tabs_live="$(_cctabs_livemap)"
 tabs_part=""; _cctabs_partial "$tabs_live" && tabs_part=1
 _cctabs_prune "$tabs_live"
 tabs_self="$(_cctabs_uc "${CC_CALLER_SURFACE_UUID:-${CMUX_SURFACE_ID:-}}")"
-echo "── opened tabs ($tabs_f) ──"
-[ -f "$tabs_f" ] || { echo "  (no tabs recorded)"; exit 0; }
 [ -n "$tabs_live" ] || echo "  ⚠ cmux unreachable — liveness unknown, nothing pruned"
 [ -n "$tabs_part" ] && echo "  ⚠ cmux workspace enumeration incomplete — liveness partial, nothing pruned (rows below print dead? rather than dead)"
 printf '%-12s  %-36s  %-6s  %-36s  %s\n' REF UUID STATE OWNER DIR
@@ -1391,7 +1408,7 @@ exit 0
 #      `cld <provider> --resume <uuid> --permission-mode <pm> [--model <m>]` — plain-claude rows
 #      resume without cld; flags not recorded are omitted; rows with NO recorded uuid (pre-feature)
 #      degrade to an idle ccteam tab, visibly listed as such
-#   ④ stale agent-state rows (worktree-status.tsv) cleared for dirs whose tab came back THIS run
+#   ④ stale agent state (the task row's state columns) cleared for dirs whose tab came back THIS run
 #   ⑤ lists BRANCH | summary | dir | disposition first, then ONE y/N (rows to re-open only);
 #      --all skips the confirm AND the repo filter
 #   HARD INVARIANT: step ③ launches in the board's RECORDED dir string verbatim (surface's
@@ -1409,7 +1426,6 @@ if [ "${1:-}" = "--all" ]; then res_all=1; shift; fi
 command -v cmux >/dev/null 2>&1 && cmux ping >/dev/null 2>&1 || {
   echo "✗ can't reach cmux, aborting (gwt-resume reopens tabs — it needs cmux)" >&2; exit 1; }
 
-tasks="${CC_TASKS_FILE:-$HOME/.config/cc-stack/worktree-tasks.tsv}"
 ccb_canon(){ CDPATH= cd -- "$1" >/dev/null 2>&1 && pwd -P; }   # same canonicalization as the board
 
 # ── ① native restore (fail-soft) ──
@@ -1486,7 +1502,6 @@ fi
 # newest-first output). The row stream is still TSV, so the awk→shell handoff below keeps the
 # same US (0x1f) delimiter discipline as cc-board.sh: TAB is IFS whitespace and collapses runs
 # of it, breaking empty fields (F7).
-[ -f "$tasks" ] || { echo "no registered worktree tasks (nothing to resume)"; exit 0; }
 repo_root=""
 if [ -z "$res_all" ]; then
   # F1 fix: resolve to the main repo root, not the worktree itself (linked worktrees must see
@@ -1598,7 +1613,15 @@ while IFS="$US" read -r c r_dir r_br r_ref r_task r_largs; do
   n_re=$((n_re+1))
 done <<< "$(printf '%s\n' "$rows")"
 
-[ -n "$plan" ] || { echo "no resumable board rows (current repo; try --all)"; exit 0; }
+# Nothing to resume — but WHY not? "no board at all" and "a board with nothing of this repo's on
+# it" send the human to different places (register a sub-task vs. rerun with --all), and telling
+# them apart used to mean stat'ing the task file before the rows were even read. Asked here
+# instead, the question costs a python start only on the path that already came up empty, and
+# nothing is printed between the old call site and this one, so the transcript is unchanged.
+if [ -z "$plan" ]; then
+  "$CC_SELF/cc-state" exists tasks || { echo "no registered worktree tasks (nothing to resume)"; exit 0; }
+  echo "no resumable board rows (current repo; try --all)"; exit 0
+fi
 
 # ── ⑤ list, then ONE confirm for the re-opens (--all skips both repo filter and confirm) ──
 echo "── ② board rows ──"

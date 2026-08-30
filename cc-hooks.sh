@@ -301,7 +301,7 @@ exit 0
 
 # ─────────────────────────────────────────────────────────────────────────────
 # status — UserPromptSubmit / Stop / Notification agent-state writer
-#   Keeps a per-sub-task agent-state sidecar (worktree-status.tsv, read by gwt-status's STATUS column)
+#   Keeps a per-sub-task agent state (the task row's state columns, read by gwt-status's STATUS column)
 #   with ZERO model cooperation and ZERO token cost: Claude Code fires these hooks on their own
 #   lifecycle, the hook just records them.
 #   - States: UserPromptSubmit → working; Stop → idle; Notification → blocked ONLY when the message
@@ -330,13 +330,25 @@ shift
 input="$(cat 2>/dev/null || true)"
 [ -n "$input" ] || exit 0
 
-# F8: with no board file there is nothing this hook could ever write — and it fires on every
+# F8: with no state at all there is nothing this hook could ever write — and it fires on every
 # prompt of every session on the machine, so check BEFORE the python parse. cc-state would make
 # the same call a silent no-op; this gate is what saves its TWO python3 startups on a no-board
 # machine (the common case — measured 4.3ms vs 45.1ms per event without the gate, round-2 gate
 # 2026-08-22). Payload-independent on purpose: it decides on the store, never on the event.
-tasks="${CC_TASKS_FILE:-$HOME/.config/cc-stack/worktree-tasks.tsv}"
-[ -f "$tasks" ] || exit 0
+#
+# This is the ONE place outside cc-state that still knows where state lives, and it is a
+# deliberate exception, not a missed conversion. Since phase D it needs ONE variable to know
+# it: CC_TASKS_FILE and friends are retired, and the legacy TSV is by definition beside the
+# library (cc-state's _p) — so this duplicates a derivation rule, not a second knob. a facade call costs a python3 startup (~15 ms
+# measured) against a `[ -f ]` at 0.019 ms, on the hottest path in the stack. §39 pins the
+# zero-python-starts contract; a comment alone did not survive the last refactor.
+#
+# BOTH legs are required. Library only, and a machine that still has legacy TSVs never triggers
+# the migration that would import them — its state silently stops being recorded. TSVs only, and
+# the hook goes dark forever the moment the migration renames them away.
+db="${CC_STATE_DB:-$HOME/.config/cc-stack/cc-state.db}"
+dbdir="${db%/*}"; [ "$dbdir" = "$db" ] && dbdir="."   # a bare filename has no dirname
+[ -f "$db" ] || [ -f "$dbdir/worktree-tasks.tsv" ] || exit 0
 
 # Parse the three fields we need from the hook payload: event \t cwd \t notification-message
 # (TAB-separated, message last). python reads real stdin via -c (no heredoc here); any parse

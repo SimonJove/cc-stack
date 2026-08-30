@@ -1,35 +1,36 @@
 #!/usr/bin/env python3
 """cc-stack · cc-state — the single reader/writer of the stack's state stores.
 
-Phase A (docs/state-model.md §7): the backend is still today's four TSV files, byte
-for byte. What changes is that there is now ONE implementation of the locking and of
-every field access, instead of nine mkdir-lock copies and 46 awk parse points spread
-over cc-hooks.sh / cc-board.sh / cc-dispatch.sh / worktree.zsh. Producers switch to
-this facade in later tasks; until then the old writers interoperate — same lock file
-path (<file>.lock, atomic mkdir; macOS has no flock), same append discipline.
+Phase C (docs/state-model.md §7): the backend is ONE sqlite library in WAL mode. The
+four TSVs are imported on first open and renamed aside, never deleted. What the facade
+already gave — one implementation of every field access, in place of 46 awk parse
+points spread over cc-hooks.sh / cc-board.sh / cc-dispatch.sh / worktree.zsh — the
+engine adds to: the nine mkdir-lock copies are gone entirely (WAL gives multi-reader /
+single-writer for free) and every write is a transaction instead of a write-tmp-then-
+rename, so the half-applied archive move cannot happen at all.
 
 Verb contract (spec §4): each subcommand answers ONE caller question; output is TSV
 with no header, stdout only; errors go to stderr. rc: 0 = success (including the
 deliberate silent no-ops that mirror today's callers), 1 = a query that found
-nothing (task-get / tab-owner / tab-resolve / task-opened-recently), 2 = usage
-error. Safe to call from sh: nothing reads stdin, no output on failure paths that
-today are silent.
+nothing (task-get / tab-owner / tab-resolve / task-opened-recently / exists), 2 =
+usage error. Safe to call from sh: no verb reads stdin unless explicitly pointed at
+it (`load <store> -`), no output on failure paths that today are silent.
 
-Stores and their overrides (same env names the sandbox uses):
-  tasks   CC_TASKS_FILE    worktree-tasks.tsv           time\\tbranch\\tsurface\\tdir\\tcaller\\ttask\\tparent\\tlargs
-  status  CC_STATUS_FILE   worktree-status.tsv          dir\\tstate\\tunix-ts
-  archive CC_ARCHIVE_FILE  worktree-tasks-archive.tsv   a tasks row verbatim + \\tmerged-at
-  tabs    CC_TABS_FILE     opened-tabs.tsv              suuid\\towner\\tdir\\tsession\\ttime
+Stores, and the legacy TSV each one was imported FROM (phase D retired the four
+per-store overrides: the library's location is the only knob, and the legacy files are
+found beside it — see _p):
+  tasks   worktree-tasks.tsv           time\\tbranch\\tsurface\\tdir\\tcaller\\ttask\\tparent\\tlargs
+  status  worktree-status.tsv          dir\\tstate\\tunix-ts
+  archive worktree-tasks-archive.tsv   a tasks row verbatim + \\tmerged-at[ + \\tmerged-into]
+  tabs    opened-tabs.tsv              suuid\\towner\\tdir\\tsession\\ttime
 
-Phase A mapping note (spec §3.1 / plan Task 2): the API is already the target shape
-but the backend is transitional — state/state_ts live in the status sidecar, the
-tab-opened dedup timestamp lives in the $TMPDIR marker (task-mark-opened stamps it,
-task-opened-recently reads it), and task-archive takes <merged-into> but cannot
-persist it yet (the archive format is frozen at "row + merged-at"; the column
-arrives with the engine swap). task-mark-opened is deliberately NOT part of
-task-add: the marker may only be stamped once the tab actually OPENED — a failed
-dispatch must leave no marker, or it silently eats the retry for 120s
-(cc-dispatch.sh's "Only CHECK here; write the marker after success").
+Phase D (model convergence) closed the last three gaps the Phase A API was written
+against: state/state_ts and the tab-opened dedup timestamp are columns on the task
+row (no status sidecar, no $TMPDIR marker), and task-archive now PERSISTS its
+<merged-into>. task-mark-opened is still deliberately NOT part of task-add: the
+stamp may only be set once the tab actually OPENED — a failed dispatch must leave no
+stamp, or it silently eats the retry for 120s (cc-dispatch.sh's "Only CHECK here;
+write the stamp after success").
 
 Row discipline (the TAB-collapse class, cc-board.sh's access note): rewrites select
 whole lines, modify only the fields they mean to touch, and re-emit the rest by
@@ -55,10 +56,8 @@ Intentional deviations from today's byte stream, both gate-ruled (spec §3.5 #7/
     "HEAD", which today's `$(… || echo '?')` captures as a two-line "HEAD\\n?"
     branch field, corrupting the row; _git_branch returns a clean '?'.
 """
-import contextlib
-import errno
-import hashlib
 import os
+import sqlite3
 import subprocess
 import sys
 import time
@@ -73,155 +72,586 @@ for _s in (sys.stdout, sys.stderr):
     except (AttributeError, OSError):
         pass
 
-# ── store paths ─────────────────────────────────────────────────────────────────
-def _p(env, name):
-    # `or`, not a plain default: an EMPTY override must fall through to the default
-    # path, same as ${VAR:-...} in the shell callers.
-    return os.environ.get(env) or os.path.join(
-        os.path.expanduser("~"), ".config", "cc-stack", name)
+# ── legacy store paths ──────────────────────────────────────────────────────────
+# Phase D, spec §8 invariant 9: the four CC_*_FILE overrides are RETIRED. A legacy TSV
+# is now found beside the library, full stop — which is what the store set has always
+# physically been, and what _migratable already had to re-assert as a RULE because the
+# five paths could be pointed at each other's directories independently. That hole was
+# not hypothetical: one shell command that set CC_STATE_DB and nothing else imported —
+# and renamed away — the live ledgers into a scratch library it then threw away.
+# Deriving the paths makes the same accident unrepresentable instead of merely checked,
+# and collapses the sandbox to ONE variable, which is the actual invariant ("tests never
+# write real state" had been failing on half-set overrides, not on a missing check).
+def _p(name):
+    d = os.path.dirname(os.path.abspath(_db_path()))
+    return os.path.join(d or ".", name)
 
 PATHS = {
-    "tasks":   lambda: _p("CC_TASKS_FILE",   "worktree-tasks.tsv"),
-    "status":  lambda: _p("CC_STATUS_FILE",  "worktree-status.tsv"),
-    "archive": lambda: _p("CC_ARCHIVE_FILE", "worktree-tasks-archive.tsv"),
-    "tabs":    lambda: _p("CC_TABS_FILE",    "opened-tabs.tsv"),
+    "tasks":   lambda: _p("worktree-tasks.tsv"),
+    "status":  lambda: _p("worktree-status.tsv"),
+    "archive": lambda: _p("worktree-tasks-archive.tsv"),
+    "tabs":    lambda: _p("opened-tabs.tsv"),
 }
 
-def _stale_seconds():
-    # CC_STATE_LOCK_STALE, seconds before a lock dir is considered abandoned.
-    # Unparseable values fall back to the default rather than crashing every verb.
-    try:
-        return float(os.environ.get("CC_STATE_LOCK_STALE") or 60)
-    except ValueError:
-        return 60.0
+# The retired names, and which store each one used to point at. Kept ONLY to say so out
+# loud: someone whose shell still exports one would otherwise have their rows go quietly
+# invisible, which is the exact failure shape this campaign keeps hunting.
+RETIRED = (("CC_TASKS_FILE", "tasks"), ("CC_STATUS_FILE", "status"),
+           ("CC_ARCHIVE_FILE", "archive"), ("CC_TABS_FILE", "tabs"))
 
-# ── the one lock ────────────────────────────────────────────────────────────────
-# Atomic mkdir lock, same <file>.lock path today's shell writers already use, so
-# old-code writers and this facade serialize against each other during the
-# transition. Two deliberate properties, both lifted from today's callers:
-#   · a writer never blocks forever: it waits up to 3s — the same 60×0.05s ceiling
-#     every shell lock loop has — and then proceeds UNLOCKED, exactly what
-#     cc-board.sh log (retired, Task 9) / cc-hooks.sh status / _cctabs_log did when
-#     the loop ran out;
-#   · a lock dir older than CC_STATE_LOCK_STALE (default 60s) is reclaimed — the
-#     holder died (today a stale lock dir taxes every later writer the full 3s
-#     wait, forever). No legitimate holder keeps the lock for 60s; the longest
-#     critical section in the stack is a few-file awk rewrite.
-# Readers take NO lock at all, like today's readers: a reading loop that held the
-# lock would make every concurrent writer burn its 3s deadline and then write
-# unlocked, and a reader that reclaimed could drop a slow-but-live holder's lock
-# and admit two writers into the critical section (round-2 gate B12).
-@contextlib.contextmanager
-def lock(path):
-    d, held = path + ".lock", False
-    deadline = time.time() + 3.0
-    while True:
-        try:
-            os.mkdir(d)
-            held = True
-            break
-        except OSError as e:
-            if e.errno != errno.EEXIST:
-                break                      # unusable path: proceed unlocked (today: same)
-            reclaimed = False
-            try:
-                if time.time() - os.stat(d).st_mtime > _stale_seconds():
-                    os.rmdir(d)            # reclaim: the holder died
-                    reclaimed = True
-            except OSError:
-                pass                        # raced or junk-carrying lock dir — not fatal
-            if reclaimed:
-                continue                    # retry mkdir immediately (may lose the race: fine)
-            if time.time() > deadline:
-                break                       # give up waiting, write anyway (today's behaviour)
-            time.sleep(0.05)
-    try:
-        yield held
-    finally:
-        if held:
-            try:
-                os.rmdir(d)
-            except OSError:
-                pass
-
-# ── raw line IO (the discipline: whole lines, lossless reassembly) ─────────────
-# newline="" disables universal-newline translation (a stray \r\n row must not be
-# silently rewritten to \n); surrogateescape makes non-UTF-8 bytes round-trip the
-# way awk passes them through instead of crashing the verb.
 def _open_rd(p):
+    """A caller-supplied file, NOT a store: tab-prune takes the raw cmux live map as an
+    argument and has to read it the same lossless way the stores used to be read."""
     return open(p, encoding="utf-8", errors="surrogateescape", newline="")
 
-def read_lines(store):
-    """Raw lines without the trailing newline. Missing/unreadable file → [] (today:
-    awk on a missing file prints nothing). A final line WITHOUT its newline is
-    still a line — dropping it would make a rewrite eat the row."""
-    try:
-        with _open_rd(PATHS[store]()) as f:
-            lines = f.read().split("\n")
-    except OSError:
-        return []
-    if lines and lines[-1] == "":
-        lines.pop()
-    return lines
+# ── the library ─────────────────────────────────────────────────────────────────
+# One sqlite file in WAL mode replaces the four TSVs and, with them, the mkdir lock:
+# WAL gives multi-reader/single-writer for free, and a write is a transaction instead
+# of a write-tmp-then-rename. CC_STATE_DB is its own override and is NOT derived from
+# one of the four legacy paths — deriving it would put the library wherever whichever
+# variable happened to be set (spec 8 invariant 9). The legacy vars stay meaningful:
+# they are where the MIGRATION looks for data to import.
+#
+# python 3.9 is the floor (the hook resolves to /usr/bin/python3 = 3.9.6 under a
+# stripped PATH), so: no connect(autocommit=) — isolation_level=None plus an explicit
+# BEGIN IMMEDIATE — no match statement, no runtime-evaluated X | Y annotation.
+def _db_path():
+    return os.environ.get("CC_STATE_DB") or os.path.join(
+        os.path.expanduser("~"), ".config", "cc-stack", "cc-state.db")
 
-def _write_unlocked(p, lines):
-    """Returns success. An empty row set removes the file — the behaviour of every
-    one of today's rewriters (`[ -s ] || rm -f`)."""
-    if not lines:
-        try:
-            os.unlink(p)
-        except OSError:
-            pass
-        # an emptied store whose file could not be removed is a FAILED rewrite:
-        # the caller may already have archived these rows (task-archive's shape),
-        # so pretending success would leave the rows in both places, silently
-        return not os.path.exists(p)
-    tmp = "%s.tmp.%d" % (p, os.getpid())
+# The columns each store's row is spread over, BY NAME (§3.1). D2: they used to be
+# f1..fN, which made every verb take fields by POSITION — the same shape as the awk
+# parsing whose field-shift bugs started this whole campaign.
+#
+# What did NOT go away with the names: `nf` and `fx`. The D plan's §1 assumed naming
+# forces dropping them and priced two "costs" on that assumption; both were wrong. They
+# are round-trip MACHINERY, not semantics, and they are orthogonal to what the columns
+# are called — so `dump` stays byte-exact and the C-phase pins hold. See _to_row.
+#
+# `archive` is a tasks row plus two: merged_at, and merged_into which until D2 rode in
+# `fx` (it was appended to the LINE, which is what the board and gwt-log read). Naming
+# it promotes the same fact to a column without changing a byte of dump's output.
+# `tasks` deliberately does NOT carry merged_at/merged_into: §3.1's own trade-off moves
+# an archived row OUT to the archive table, so a live task row can never have them.
+NAMES = {
+    "tasks":   ("created_at", "branch", "surface_ref", "dir",
+                "caller_ref", "task", "parent", "launch_args"),
+    "archive": ("created_at", "branch", "surface_ref", "dir",
+                "caller_ref", "task", "parent", "launch_args", "merged_at", "merged_into"),
+    "tabs":    ("suuid", "owner", "dir", "session", "ts"),
+}
+COLS = dict((store, len(names)) for store, names in NAMES.items())
+COLS["status"] = 3          # a projection, not a table — see _get_status
+# The v1/v2 widths, needed only by the one-way rebuild in _upgrade.
+OLD_COLS = {"tasks": 8, "archive": 9, "tabs": 5}
+
+class _Ix(object):
+    """Field positions BY NAME, derived from the column names above.
+
+    The verbs still work on whole TSV lines — a rewrite has to re-emit the fields it
+    did not mean to touch byte-for-byte, and that is what a line gives you and a
+    reconstructed row does not. What they stopped doing is spelling the position: a
+    hand-written index and the `dir` column could drift apart, `f[TASK.dir]` and the
+    column cannot, because there is now exactly ONE definition of the row's shape.
+    §39 pins that no store row is indexed by a bare number again — which is why this
+    note says "a hand-written index" instead of showing you one."""
+    def __init__(self, names):
+        for i, n in enumerate(names):
+            setattr(self, n, i)
+
+TASK = _Ix(NAMES["tasks"])
+TAB = _Ix(NAMES["tabs"])
+# The sidecar projection has no table of its own (it IS two columns on the task row),
+# but `dump status` / `load status` / task-set-state still speak its 3-field line.
+SIDE = _Ix(("dir", "state", "ts"))
+
+# D 期（模型收敛）：真正的表只剩三张。`status` 仍是一个 STORE —— 动词、dump / load、沙箱
+# 变量全部照旧 —— 但它不再有自己的表，而是 tasks 上两列的投影（§3.1「sidecar 只是任务行的
+# 两列」）。虚拟化整个发生在 _get / _put 里，上面 20 个动词一行没动，与 C 期换引擎用的是
+# 同一道缝。副作用是一条不变量被结构化了：状态行只能属于一个已存在的任务行，孤儿 sidecar
+# 从此无处可存（今天 task-prune 本来就会扫掉它们）。
+TABLES = ("tasks", "archive", "tabs")
+SCHEMA_VERSION = 3
+# tasks 上不属于 TSV 行的列。前两列吃掉 worktree-status.tsv；tab_opened_ts 吃掉 $TMPDIR
+# 去重标记。全部可空 —— 一行没有状态、没开过 tab，都是常态而不是缺省值。
+# （D 期一度还在这里放了 merged_at / merged_into。D2 把它们移到 archive 表上：§3.1 的取舍
+# 段说归档行写入时移出到 archive，所以一条活着的任务行永远不可能带这两个值。）
+STATE_COLS = (("state", "BLOB"), ("state_ts", "BLOB"), ("tab_opened_ts", "INTEGER"))
+# 导入顺序：tasks 必须在 status 之前 —— 状态要落到任务行上，任务行还不存在就全丢了。
+# 字典序恰好把 status 排在 tasks 前面,所以这个顺序不能靠排序得出（变异确认：换成字典序
+# 打红 3 条）。
+MIGRATE_ORDER = ("tasks", "archive", "tabs", "status")
+
+# Three things the row↔column round trip needs, none of them optional:
+#   · BLOB, not TEXT. read_lines has always used errors="surrogateescape" so a non-UTF-8
+#     byte rides through the way awk passes it; a TEXT column cannot hold the lone
+#     surrogate that produces — sqlite3 raises UnicodeEncodeError on the INSERT. BLOB +
+#     encode/decode("utf-8","surrogateescape") round-trips it losslessly. Measured, not
+#     assumed: the TEXT path fails on the first row that carries one.
+#   · nf. tasks holds 7-field legacy rows next to 8-field live ones (archive 8 and 9).
+#     Rendering from fixed columns would pad a 7-field row to 8 and change dump's bytes,
+#     so the row's ORIGINAL field count is stored and the render truncates to it.
+#   · fx. A row wider than its table's columns can only come from a hand edit or `load`,
+#     but silently dropping its tail would be data loss in the one direction the human
+#     cannot undo — the overflow rides in fx so dump gives back exactly what went in.
+# Row ORDER is the fourth: a TSV is insertion-ordered and sqlite has no implicit order,
+# so every table carries a monotonic seq and every read is ORDER BY seq. task-prune
+# --compact's newest-per-dir depends on it; this is not an optimization.
+def _cols(store):
+    return ", ".join(NAMES[store])
+
+def _create(conn):
+    for store in TABLES:
+        conn.execute("CREATE TABLE IF NOT EXISTS %s (seq INTEGER PRIMARY KEY, "
+                     "nf INTEGER NOT NULL, %s, fx BLOB%s)"
+                     % (store, ", ".join("%s BLOB" % c for c in NAMES[store]),
+                        "".join(", %s %s" % (c, t) for c, t in STATE_COLS)
+                        if store == "tasks" else ""))
+
+def _schema(conn):
+    _create(conn)
+    _upgrade(conn)
+
+def _rebuild_named(conn, have):
+    """v1/v2 的 `f1..fN` → v3 的具名列。
+
+    重建而不是 `RENAME COLUMN`，因为形状本身也变了：`archive` 多一列（`merged_into`，
+    此前作为第 10 个字段寄居在 `fx` 里），`tasks` 少两列（`merged_at`/`merged_into`，在
+    那张表上永远是 NULL）。整个搬运走 `_to_line` → `_to_row`，也就是说「第 10 个字段从
+    `fx` 升格成列」是宽度变化的**自然结果**，没有一处手写的字段搬移——手写的那种正是
+    这场战役一直在消灭的东西。"""
+    st = [c for c, _ in STATE_COLS if c in have]     # v2 有这些列，v1 没有
+    carried = []
+    if st:
+        for row in conn.execute("SELECT f4, %s FROM tasks ORDER BY seq" % ", ".join(st)):
+            vals = dict(zip(st, row[1:]))
+            if any(v is not None for v in vals.values()):
+                carried.append(("" if row[0] is None else _dec(row[0]),
+                                [vals.get(c) for c, _ in STATE_COLS]))
+    data = {}
+    for store in TABLES:
+        old_n = OLD_COLS[store]
+        data[store] = [_to_line(r, old_n) for r in conn.execute(
+            "SELECT nf, %s, fx FROM %s ORDER BY seq"
+            % (", ".join("f%d" % (i + 1) for i in range(old_n)), store))]
+    for store in TABLES:
+        conn.execute("DROP TABLE %s" % store)
+    _create(conn)
+    for store in TABLES:
+        n = COLS[store]
+        conn.executemany("INSERT INTO %s (nf, %s, fx) VALUES (%s)"
+                         % (store, _cols(store), ", ".join("?" * (n + 2))),
+                         [_to_row(l, n) for l in data[store]])
+    _restore(conn, carried)
+
+def _upgrade(conn):
+    """v1（四张表）/ v2（三张表 + 位置列）→ v3（具名列）。库内迁移，不碰磁盘上任何文件。
+
+    幂等靠两个独立的问题，不靠版本号一个：`tasks` 到底长什么样（有 `f1` 就是旧形状），
+    以及 `status` 表在不在。一个被打断的升级下次接着做，而不是在已经改过的表上重来。
+    整个过程一个事务，失败则库停在原版本、按原路径继续跑（沿用 C 期的降级契约）。"""
+    if conn.execute("PRAGMA user_version").fetchone()[0] >= SCHEMA_VERSION:
+        return
+    have = set(r[1] for r in conn.execute("PRAGMA table_info(tasks)"))
+    legacy = "f1" in have
+    sidecar = conn.execute("SELECT count(*) FROM sqlite_master "
+                           "WHERE type='table' AND name='status'").fetchone()[0]
+    conn.execute("BEGIN IMMEDIATE")
     try:
-        with open(tmp, "w", encoding="utf-8", errors="surrogateescape", newline="") as f:
-            f.write("\n".join(lines) + "\n")
-        os.replace(tmp, p)
-        return True
-    except OSError:
+        if legacy:
+            _rebuild_named(conn, have)
+        if sidecar:
+            rows = [_to_line(r, 3) for r in conn.execute(
+                "SELECT nf, f1, f2, f3, fx FROM status ORDER BY seq")]
+            # ONLY when the table actually holds rows. _put_status clears every carried
+            # state before re-applying, so folding an EMPTY sidecar would wipe state that
+            # is already in the columns — which is exactly the new→old→new round trip: old
+            # code re-creates an empty `status` and stamps the version back, leaving the
+            # real state sitting untouched in the columns it cannot see. Downgrading must
+            # cost visibility, never data.
+            if rows:
+                _put_status(conn, rows)
+            conn.execute("DROP TABLE status")
+        conn.execute("PRAGMA user_version=%d" % SCHEMA_VERSION)
+        conn.execute("COMMIT")
+    except BaseException:
         try:
-            os.unlink(tmp)
-        except OSError:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        raise
+
+def _enc(s):
+    return s.encode("utf-8", "surrogateescape")
+
+def _dec(b):
+    return b.decode("utf-8", "surrogateescape")
+
+def _to_row(line, n):
+    f = line.split("\t")
+    head = [_enc(x) for x in f[:n]]
+    head += [None] * (n - len(head))
+    tail = _enc("\t".join(f[n:])) if len(f) > n else None
+    return [len(f)] + head + [tail]
+
+def _to_line(row, n):
+    nf, vals, fx = row[0], row[1:1 + n], row[1 + n]
+    out = [("" if v is None else _dec(v)) for v in vals[:min(nf, n)]]
+    if fx is not None:
+        out.extend(_dec(fx).split("\t"))
+    return "\t".join(out)
+
+_CONN = None
+_LAST_ERR = None          # why the last _connect gave up; dump is the only loud reader
+
+def _open(p):
+    conn = sqlite3.connect(p, timeout=3.0, isolation_level=None)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=3000")
+    return conn
+
+def _connect(create):
+    """The library, or None when there is none and none is wanted.
+
+    `create` is load-bearing for COST, not for correctness: a read must not bring the
+    file into existence, because cc-hooks.sh's hot path is `[ -f <db> ] || [ -f <tsv> ]`
+    and an empty library created by some passing read would arm it forever — two python
+    startups on every prompt of every session on a machine that has no state at all
+    (0.1: 15 ms each, and the check itself is 0.019 ms). A read still migrates when
+    legacy TSVs are there, because that is where the data IS.
+
+    Every failure path returns None instead of raising: the hook contract is a silent
+    no-op on a missing python3, a corrupt library, a full disk."""
+    global _CONN, _LAST_ERR
+    _LAST_ERR = None
+    if _CONN is not None:
+        return _CONN
+    p = _db_path()
+    # Before any branch: a read that finds neither library nor importable legacy returns
+    # None below, and that early return is exactly the case the notice is FOR.
+    _warn_retired()
+    try:
+        if os.path.exists(p):
+            conn = _open(p)
+            _schema(conn)
+        else:
+            # Beside the library, or not part of this store set at all — the rule that
+            # used to be _migratable's explicit same-directory check is now the way the
+            # paths are BUILT, so existence is the whole question.
+            legacy = [s for s in MIGRATE_ORDER if os.path.exists(PATHS[s]())]
+            if not legacy and not create:
+                return None
+            d = os.path.dirname(p)
+            if d and not os.path.isdir(d):
+                os.makedirs(d, exist_ok=True)
+            conn = _open(p)
+            try:
+                _schema(conn)
+                if legacy:
+                    _migrate(conn, legacy)
+            except BaseException:
+                # spec 6: a failed migration creates NO library and renames NOTHING —
+                # the machine keeps running the way it did, and the next invocation
+                # retries. Half a library would be worse than none: the legacy rows
+                # would be both imported and still on disk.
+                try:
+                    conn.close()
+                except sqlite3.Error:
+                    pass
+                for suffix in ("", "-wal", "-shm"):
+                    try:
+                        os.unlink(p + suffix)
+                    except OSError:
+                        pass
+                raise
+        _CONN = conn
+        return conn
+    except (sqlite3.Error, OSError, ValueError) as e:
+        _LAST_ERR = e
+        return None
+
+_WARNED = False
+
+def _warn_retired():
+    """The four CC_*_FILE overrides are gone; say so to anyone still exporting one.
+
+    Without this the retirement is a silent behaviour change for the one person it can
+    hurt: a shell that still points CC_TASKS_FILE somewhere now gets a library built from
+    whatever sits beside CC_STATE_DB instead, and the moved file is never read again. The
+    board would just be empty, forever, with nothing to grep for. stderr only, never the
+    rc — the hook path redirects and §39 pins that rather than trusting it — and once per
+    process, so a board render that makes several calls says it once.
+    Note this fires on the VALUE being set, not on the file existing: an override pointing
+    at a path that never existed is still someone who believes it works."""
+    global _WARNED
+    if _WARNED:
+        return
+    hits = [(env, store) for env, store in RETIRED if os.environ.get(env)]
+    if not hits:
+        return
+    _WARNED = True
+    for env, store in hits:
+        v = os.environ[env]
+        print("cc-state: %s is retired and IGNORED — the store set is now whatever sits "
+              "beside CC_STATE_DB. If %s still holds rows: cc-state load %s %s"
+              % (env, v, store, v), file=sys.stderr)
+
+def _read_legacy(path):
+    """A legacy TSV exactly as read_lines used to read it: no universal-newline
+    translation (a stray \\r\\n row must not be rewritten), surrogateescape for the
+    non-UTF-8 bytes, and a final line WITHOUT its newline is still a line."""
+    with open(path, encoding="utf-8", errors="surrogateescape", newline="") as f:
+        rows = f.read().split("\n")
+    if rows and rows[-1] == "":
+        rows.pop()
+    return rows
+
+def _migrate(conn, legacy):
+    """Import the legacy TSVs and rename them aside, in ONE transaction.
+
+    The rename happens INSIDE the transaction on purpose: if it fails the import rolls
+    back with it, so the rows can never end up both in the library and on disk. Old
+    files are renamed, never deleted (spec 9's risk row: a migration that loses the
+    board is unrecoverable; a renamed file is not).
+
+    Two processes racing is safe because BEGIN IMMEDIATE serializes them AND the file
+    existence is re-checked inside the transaction: the loser finds the winner already
+    renamed the TSVs away and imports nothing, instead of importing them twice."""
+    renamed = []
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        ts = str(int(time.time()))
+        for store in legacy:
+            src = PATHS[store]()
+            if not os.path.exists(src):
+                continue                     # the other process won the race
+            rows = _read_legacy(src)
+            _put(conn, store, rows)
+            dst = "%s.migrated.%s" % (src, ts)
+            k = 0
+            while os.path.exists(dst):
+                k += 1
+                dst = "%s.migrated.%s.%d" % (src, ts, k)
+            os.rename(src, dst)
+            renamed.append((src, dst))
+        conn.execute("COMMIT")
+    except BaseException:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        for src, dst in reversed(renamed):
+            try:
+                os.rename(dst, src)
+            except OSError:
+                pass
+        raise
+
+def _get_status(conn):
+    """The sidecar as it always looked: dir\tstate\tunix-ts, one row per dir.
+
+    Two rules the file had and the projection must keep:
+      · the KEY IS PHYSICAL. `task-set-state` always wrote the canonical dir and the
+        board render joins on that form — while the tasks row keeps whatever string was
+        recorded at dispatch, which for a legacy row is the logical /var/... path. So
+        the projection canonicalizes on the way out; emitting f4 raw would silently stop
+        the board joining exactly the rows defect 3 was fixed for.
+        It must be canon_or_raw, NOT canon: canon_or_raw is what dir_match applies to
+        the row side, and it deliberately refuses to realpath a path that is not a
+        directory. A dead worktree's row would come out of the projection as a realpath
+        that dir_match then cannot match back — so every read→write round trip (prune,
+        clear-state, the board's prune-on-read) would silently DROP the state of every
+        dir that has already been removed. Same function on both sides, or the
+        projection is not lossless.
+      · ORDER is the tasks row's seq, i.e. dispatch order — the same order the file
+        had, because both answer "when did this dir first appear".
+    Rows whose state is NULL are simply not sidecar rows."""
+    return ["\t".join((canon_or_raw(_dec(d)) if d is not None else "",
+                       "" if st is None else _dec(st),
+                       "" if ts is None else _dec(ts)))
+            for d, st, ts in conn.execute("SELECT dir, state, state_ts FROM tasks "
+                                          "WHERE state IS NOT NULL ORDER BY seq")]
+
+def _put_status(conn, lines):
+    """Replace the sidecar: clear every carried state, then re-apply row by row.
+
+    Matching goes through dir_match — the ONE row-matching rule — not string equality
+    on f4: the caller may name the canonical path while the row holds the logical one
+    (or the reverse), and that pair is exactly what defect 3 was about. Among matches
+    the LAST (highest seq) wins: that is the row every reader means by "this worktree".
+
+    A row naming a dir with NO tasks row lands nowhere and is dropped — the orphan
+    class task-prune already sweeps, now structurally unrepresentable (plan §1.5 A)."""
+    rows = [(seq, "" if d is None else _dec(d))
+            for seq, d in conn.execute("SELECT seq, dir FROM tasks ORDER BY seq")]
+    conn.execute("UPDATE tasks SET state=NULL, state_ts=NULL")
+    for line in lines:
+        f = line.split("\t")
+        raw = f[SIDE.dir] if f else ""
+        c = canon(raw)
+        hit = None
+        for seq, d in rows:
+            if dir_match(d, raw, c):
+                hit = seq
+        if hit is None:
+            continue
+        conn.execute("UPDATE tasks SET state=?, state_ts=? WHERE seq=?",
+                     (_enc(f[SIDE.state]) if len(f) > SIDE.state else None,
+                      _enc(f[SIDE.ts]) if len(f) > SIDE.ts else None, hit))
+
+# The columns that do NOT live in the TSV line. Every verb above the storage layer still
+# works on whole lines, so a rewrite of `tasks` is DELETE + re-INSERT of the row columns —
+# silently took these with it until this pair existed. `task-set-ref <dir> s:9` wiped the
+# state of every worktree on the board, and the board just rendered "-". Anything keyed to
+# a task row rather than to its text has to be carried across the rewrite by hand.
+CARRIED = ("state", "state_ts", "tab_opened_ts")
+
+def _carry(conn):
+    """Snapshot the carried columns, keyed by the row's dir. Rows carrying nothing are
+    skipped so the common rewrite (no state anywhere) stays free."""
+    out = []
+    for row in conn.execute("SELECT dir, %s FROM tasks ORDER BY seq" % ", ".join(CARRIED)):
+        vals = list(row[1:])
+        if any(v is not None for v in vals):
+            out.append(("" if row[0] is None else _dec(row[0]), vals))
+    return out
+
+def _restore(conn, carried):
+    """Re-attach the snapshot after a rewrite, by dir_match — the same rule every verb
+    uses. A dir the rewrite DROPPED finds no row and its columns are gone with it, which
+    is the point: pruning a task row takes its state with it, no orphan can survive."""
+    if not carried:
+        return
+    rows = [(seq, "" if d is None else _dec(d))
+            for seq, d in conn.execute("SELECT seq, dir FROM tasks ORDER BY seq")]
+    sets = ", ".join("%s=?" % c for c in CARRIED)
+    for raw, vals in carried:
+        c = canon(raw)
+        hit = None
+        for seq, d in rows:
+            if dir_match(d, raw, c):
+                hit = seq
+        if hit is not None:
+            conn.execute("UPDATE tasks SET %s WHERE seq=?" % sets, tuple(vals) + (hit,))
+
+def _put(conn, store, lines):
+    """Replace a table's rows. seq restarts at 1, so insertion order is file order."""
+    if store == "status":
+        return _put_status(conn, lines)
+    carried = _carry(conn) if store == "tasks" else None
+    n = COLS[store]
+    conn.execute("DELETE FROM %s" % store)
+    if lines:
+        conn.executemany(
+            "INSERT INTO %s (nf, %s, fx) VALUES (%s)"
+            % (store, _cols(store), ", ".join("?" * (n + 2))),
+            [_to_row(l, n) for l in lines])
+    if carried:
+        _restore(conn, carried)
+
+def _get(conn, store):
+    if store == "status":
+        return _get_status(conn)
+    n = COLS[store]
+    return [_to_line(r, n) for r in conn.execute(
+        "SELECT nf, %s, fx FROM %s ORDER BY seq" % (_cols(store), store))]
+
+# ── the storage layer (the verbs above it still only ever see whole lines) ──────
+def read_lines(store):
+    """Rows in insertion order. No library and no legacy file → [] (today: awk on a
+    missing file prints nothing). Readers take nothing: WAL readers never block a
+    writer and are never blocked by one, which is what the mkdir lock was imitating."""
+    conn = _connect(False)
+    if conn is None:
+        return []
+    try:
+        return _get(conn, store)
+    except sqlite3.Error as e:
+        globals()["_LAST_ERR"] = e
+        return []
+
+def write_lines(store, lines):
+    """Replace the store in one transaction. Returns success. An empty row set leaves
+    the store with zero rows — the observable end of what used to be `[ -s ] || rm -f`,
+    and the reason `exists` was defined on ROWS in Task 1 (there is no per-store file
+    left to stat). Writing nothing to a store that does not exist yet does NOT create
+    the library: see _connect's note on the hook's hot path."""
+    conn = _connect(bool(lines))
+    if conn is None:
+        return not lines
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        _put(conn, store, lines)
+        conn.execute("COMMIT")
+        return True
+    except sqlite3.Error:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
             pass
         return False
 
-def write_lines(store, lines):
-    with lock(PATHS[store]()):
-        _write_unlocked(PATHS[store](), lines)
-
 def rewrite(store, fn):
-    """Read → transform → write inside ONE lock hold — the shape every shell
-    rewriter already uses (ccb_lock BEFORE ccb_dead_lines; _gwt_tasks_rewrite's
-    comment: "avoid losing a concurrent append during read→mv"). Reading the rows
-    into write_lines' argument instead would re-introduce the race that lost 18 of
-    41 dispatch records under plain campaign concurrency (round-2 gate B1). Skips
-    the write when fn returns the rows unchanged. fn receives a COPY: an in-place
-    fn then shows up as out != rows and the write still fires — without the copy,
-    a mutating fn would return the very object it mutated and the skip check
-    would compare an object against itself (round-3 gate C1)."""
-    p = PATHS[store]()
-    with lock(p):
-        rows = read_lines(store)
+    """Read → transform → write inside ONE transaction. Reading the rows into
+    write_lines' argument instead would re-introduce the race that lost 18 of 41
+    dispatch records under plain campaign concurrency (round-2 gate B1) — the lock
+    is gone, the requirement is not. Skips the write when fn returns the rows
+    unchanged. fn receives a COPY: an in-place fn then shows up as out != rows and the
+    write still fires — without the copy, a mutating fn would return the very object it
+    mutated and the skip check would compare an object against itself (round-3 C1)."""
+    conn = _connect(False)
+    if conn is None:
+        out = fn([])                    # an empty store: only an fn that ADDS rows
+        if not out:                     # is worth creating the library for
+            return True
+        conn = _connect(True)
+        if conn is None:
+            return False
+        return write_lines(store, out)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        rows = _get(conn, store)
         out = fn(list(rows))
         if out != rows:
-            return _write_unlocked(p, out)
+            _put(conn, store, out)
+        conn.execute("COMMIT")
         return True
+    except sqlite3.Error:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        return False
+    except BaseException:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        raise
 
 def append_line(store, line):
-    """Locked append. Failure is silent (rc stays 0): today's appends all end in
-    `>> "$f" 2>/dev/null || true`, and a hook crashing on a full disk would violate
+    """One-row transaction. Failure is silent (rc stays 0): today's appends all ended
+    in `>> "$f" 2>/dev/null || true`, and a hook crashing on a full disk would violate
     its always-exit-0 contract."""
-    with lock(PATHS[store]()):
+    conn = _connect(True)
+    if conn is None:
+        return
+    if store == "status":               # a projection has no table to append to
+        rewrite(store, lambda rows: rows + [line])
+        return
+    n = COLS[store]
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("INSERT INTO %s (nf, %s, fx) VALUES (%s)"
+                     % (store, _cols(store), ", ".join("?" * (n + 2))),
+                     _to_row(line, n))
+        conn.execute("COMMIT")
+    except sqlite3.Error:
         try:
-            with open(PATHS[store](), "a", encoding="utf-8",
-                      errors="surrogateescape", newline="") as f:
-                f.write(line + "\n")
-        except OSError:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
             pass
+
 
 def now_stamp():
     return time.strftime("%Y-%m-%d %H:%M:%S")   # `date '+%Y-%m-%d %H:%M:%S'`
@@ -292,21 +722,21 @@ def _git_branch(dir_):
         return "?"
     return r.stdout.strip()
 
-# Phase A's tab_opened_ts still lives in the $TMPDIR marker (plan Task 2 note); the
-# D-phase engine swap retires it. The hash is today's: sha1 of the dir bytes with
-# NO trailing newline (`printf '%s' | shasum -a 1`). fsencode, not str.encode: a
-# dir straight out of argv may carry lone surrogates, and .encode() would raise
-# where the shell pipeline never fails (round-2 gate B14).
-def _marker(dir_):
-    md = os.path.join(os.environ.get("TMPDIR") or "/tmp", "cc-cmux-tabs")
-    return os.path.join(md, hashlib.sha1(os.fsencode(dir_)).hexdigest())
-
-def _touch_marker(dir_):
-    try:
-        os.makedirs(os.path.dirname(_marker(dir_)), exist_ok=True)
-        open(_marker(dir_), "w").close()      # `: > marker`: truncate + stamp mtime
-    except OSError:
-        pass                                  # `|| true` today; never fail a dispatch
+# The tab-opened dedup timestamp is a COLUMN now (spec §3.1). It replaced a marker FILE
+# under $TMPDIR whose name was the sha1 of the dir, and that path carried a defect that
+# dies with it: when `shasum` was unavailable the hash came back EMPTY, so the marker
+# path resolved to the containing DIRECTORY — `[ -e ]` then answered true forever and
+# every dispatch, for every dir, was silently swallowed for 120s. An integer column
+# cannot have an empty key. (The literal path is deliberately NOT written here: a grep
+# for it is the assertion that the marker never comes back. Story: docs/known-issues.md.)
+def _task_seq(conn, dir_):
+    """seq of the NEWEST tasks row for <dir>, or None. dir_match, like every verb."""
+    c = canon(dir_)
+    hit = None
+    for seq, d in conn.execute("SELECT seq, dir FROM tasks ORDER BY seq"):
+        if dir_match("" if d is None else _dec(d), dir_, c):
+            hit = seq
+    return hit
 
 def _usage(text):
     print("usage: cc-state " + text, file=sys.stderr)
@@ -317,13 +747,29 @@ def _usage(text):
 # (7-field legacy rows are legal and must round-trip as 7 fields).
 
 def cmd_task_add(args):
-    """Append the dispatch-time placeholder row — the retired cc-board.sh log's row
-    (its recorded bytes are test.sh §32's frozen oracle, Task 9; including the '?'
+    """The dispatch-time placeholder row — the retired cc-board.sh log's row (its
+    recorded bytes are test.sh §32's frozen oracle, Task 9; including the '?'
     fallbacks for an empty surface ref and an underivable branch) with caller
     and launch-args left empty for task-set-launch. The dir is canonicalized on the
-    way in (the file header's write-side rule). Does NOT stamp the dedup marker:
-    the marker says "a tab actually opened", which only the caller knows — see
-    task-mark-opened."""
+    way in (the file header's write-side rule). Does NOT stamp the dedup timestamp:
+    it says "a tab actually opened", which only the caller knows — see
+    task-mark-opened.
+
+    It REPLACES the dir's row rather than appending a second one (§3.1: "dir 做主键
+    就吃掉了 newest-per-dir 去重"). The replace is here, in the verb, rather than a
+    UNIQUE index on the column, for two measured reasons: the index would key on the
+    raw string, and the rule is dir_match — a legacy row holding the logical /var
+    form is the same worktree as the canonical one this row names, and the index
+    would happily keep both; and it would take `load`'s deliberate "no dedup, raw
+    bytes" contract with it, which is the path a human repairs a store by. So the
+    invariant is enforced at every write the PRODUCT makes and `load` stays the
+    documented footgun; task-prune --compact still collapses what `load` and the
+    legacy import can still put there. docs/state-model-d-plan.md §8.
+
+    The two columns that live outside the line follow the DIR, not the row: _put
+    snapshots them before the rewrite and re-attaches them by dir_match after, so
+    a re-dispatch keeps the worktree's agent state and its tab-opened stamp — which
+    is what they did when they were a sidecar file and a $TMPDIR marker keyed by dir."""
     if len(args) != 5:
         return _usage("task-add <dir> <branch> <ref> <task> <parent>")
     d, branch, ref, task, parent = args
@@ -334,9 +780,15 @@ def cmd_task_add(args):
         branch = _git_branch(d)               # empty arg = derive here, as the retired log did
     ref = ref or "?"                          # the retired log: ref="${2:-?}"
     summary = _sanitize(task, 140, True) or "(idle ccteam, no initial prompt)"
-    append_line("tasks", "\t".join(
-        [now_stamp(), branch, ref, d, "", summary, parent, ""]))
-    return 0
+    fresh = "\t".join([now_stamp(), branch, ref, d, "", summary, parent, ""])
+    # d is already canonical, so both halves of dir_match get the same string; what the
+    # second half still buys is the LEGACY row whose dir is the logical /var form.
+    def fn(rows):
+        return [l for l in rows
+                if not (len(fields(l)) > TASK.dir
+                        and dir_match(fields(l)[TASK.dir], d, d))] + [fresh]
+    rewrite("tasks", fn)                  # failure stays silent: today's append ended in
+    return 0                              # `>> "$f" 2>/dev/null || true`
 
 def cmd_task_set_launch(args):
     """Fill caller-ref (field 5) and launch-args (field 8) on the NEWEST row of the
@@ -350,10 +802,10 @@ def cmd_task_set_launch(args):
         out = list(rows)                       # build NEW rows — fn must never
         for i in range(len(out) - 1, -1, -1):  # mutate in place, or rewrite()'s
             f = fields(out[i])                 # out != rows change check compares
-            if len(f) >= 4 and dir_match(f[3], d, c):   # an object against itself
-                f[4] = caller                 # written raw — exactly the retired log's $caller
-                if len(f) >= 8:
-                    f[7] = _sanitize(largs, 200, False)
+            if len(f) > TASK.dir and dir_match(f[TASK.dir], d, c):   # an object against itself
+                f[TASK.caller_ref] = caller   # written raw — exactly the retired log's $caller
+                if len(f) > TASK.launch_args:
+                    f[TASK.launch_args] = _sanitize(largs, 200, False)
                 out[i] = "\t".join(f)
                 break
         return out
@@ -368,7 +820,7 @@ def cmd_task_get(args):
     c = canon(args[0])
     for line in reversed(read_lines("tasks")):
         f = fields(line)
-        if len(f) >= 4 and dir_match(f[3], args[0], c):
+        if len(f) > TASK.dir and dir_match(f[TASK.dir], args[0], c):
             print(line)
             return 0
     return 1
@@ -415,8 +867,9 @@ def cmd_task_list(args):
         if not with_state:
             return line
         for sf in state_rows:
-            if len(sf) >= 2 and dir_match(sf[0], row_dir, row_canon):
-                return line + "\t" + sf[1] + "\t" + (sf[2] if len(sf) > 2 else "")
+            if len(sf) > SIDE.state and dir_match(sf[SIDE.dir], row_dir, row_canon):
+                return (line + "\t" + sf[SIDE.state] + "\t"
+                        + (sf[SIDE.ts] if len(sf) > SIDE.ts else ""))
         return line + "\t-\t"
     repo = None if all_flag or repo_val is None else canon(repo_val)
     def under(c):
@@ -424,20 +877,20 @@ def cmd_task_list(args):
     if archive:
         for line in read_lines("archive"):
             f = fields(line)
-            if len(f) >= 4 and under(canon_or_raw(f[3])):
-                print(decorate(line, f[3], canon(f[3])))
+            if len(f) > TASK.dir and under(canon_or_raw(f[TASK.dir])):
+                print(decorate(line, f[TASK.dir], canon(f[TASK.dir])))
         return 0
     seen = set()
     for line in reversed(read_lines("tasks")):
         f = fields(line)
-        if len(f) < 4 or not f[3] or not os.path.isdir(f[3]):
+        if len(f) <= TASK.dir or not f[TASK.dir] or not os.path.isdir(f[TASK.dir]):
             continue
-        c = canon(f[3])
+        c = canon(f[TASK.dir])
         if c in seen:
             continue
         seen.add(c)
         if under(c):
-            print(decorate(line, f[3], c))
+            print(decorate(line, f[TASK.dir], c))
     return 0
 
 def cmd_task_set_state(args):
@@ -456,13 +909,14 @@ def cmd_task_set_state(args):
         return 2
     state = _sanitize_field(state)
     c = canon(d)
-    if not any(len(f) >= 4 and dir_match(f[3], d, c)
+    if not any(len(f) > TASK.dir and dir_match(f[TASK.dir], d, c)
                for f in (fields(l) for l in read_lines("tasks"))):
         return 0
     fresh = "\t".join([c, state, str(int(time.time()))])
     def fn(rows):
         return [l for l in rows
-                if not (len(fields(l)) >= 1 and dir_match(fields(l)[0], d, c))] + [fresh]
+                if not (len(fields(l)) > SIDE.dir
+                        and dir_match(fields(l)[SIDE.dir], d, c))] + [fresh]
     rewrite("status", fn)
     return 0
 
@@ -480,7 +934,8 @@ def cmd_task_clear_state(args):
     c = canon(d)
     def fn(rows):
         return [l for l in rows
-                if not (len(fields(l)) >= 1 and dir_match(fields(l)[0], d, c))]
+                if not (len(fields(l)) > SIDE.dir
+                        and dir_match(fields(l)[SIDE.dir], d, c))]
     rewrite("status", fn)
     return 0
 
@@ -512,10 +967,10 @@ def cmd_task_set_ref(args):
         out = list(rows)                       # new list, not in-place (see
         for i, line in enumerate(out):         # task-set-launch's note)
             f = fields(line)
-            if len(f) >= 4 and dir_match(f[3], d, c):
-                f[2] = ref
-                if su and len(f) >= 8:
-                    f[7] = _swap_suuid(f[7], su)
+            if len(f) > TASK.dir and dir_match(f[TASK.dir], d, c):
+                f[TASK.surface_ref] = ref
+                if su and len(f) > TASK.launch_args:
+                    f[TASK.launch_args] = _swap_suuid(f[TASK.launch_args], su)
                 out[i] = "\t".join(f)
         return out
     rewrite("tasks", fn)
@@ -529,7 +984,8 @@ def cmd_task_drop(args):
     c = canon(d)
     def fn(rows):
         return [l for l in rows
-                if not (len(fields(l)) >= 4 and dir_match(fields(l)[3], d, c))]
+                if not (len(fields(l)) > TASK.dir
+                        and dir_match(fields(l)[TASK.dir], d, c))]
     rewrite("tasks", fn)
     return 0
 
@@ -558,7 +1014,7 @@ def cmd_task_prune(args):
         seen, out = set(), []
         for l in reversed(rows):
             f = fields(l)
-            d = f[3] if len(f) > 3 else ""
+            d = f[TASK.dir] if len(f) > TASK.dir else ""
             if not d or d in seen:
                 continue
             seen.add(d)
@@ -566,13 +1022,13 @@ def cmd_task_prune(args):
         out.reverse()
         return out
 
-    ok = rewrite("tasks", lambda rows: newest_per_dir(live(rows, 3)) if compact
-                 else live(rows, 3))
+    ok = rewrite("tasks", lambda rows: newest_per_dir(live(rows, TASK.dir)) if compact
+                 else live(rows, TASK.dir))
     if not ok:
         # today's gwt-prune on a failed compaction: the list is left as it was, loudly
         print("cc-state: compaction failed — task list left untouched", file=sys.stderr)
         return 1
-    rewrite("status", lambda rows: live(rows, 0))
+    rewrite("status", lambda rows: live(rows, SIDE.dir))
     return 0
 
 def cmd_task_archive(args):
@@ -583,9 +1039,15 @@ def cmd_task_archive(args):
     so merging feat/x in one repo archived another repo's feat/x rows too. Without
     the flag the semantics are today's, global — every existing caller and fixture
     keeps working unchanged.
-    <merged-into> is accepted for the target API but not persisted in Phase A: the
-    archive format is frozen at `row + merged-at` until the engine swap. Under the
-    tasks lock like today (the archive write borrows it), plus the archive's own
+    <merged-into> — "where this actually landed" — is appended after merged-at, and
+    ONLY when there is something to record. That condition is the whole design: every
+    caller before phase D passed "", so an empty one has to leave the row byte-identical
+    to what the frozen archive fixtures pin, while a real one grows the row the same way
+    merged-at already does (a 7-field legacy row archives to 8, then 9). It is the branch
+    the merge LANDED ON, which gwt-merge's --into override and a fast-forwarded target
+    both make different from the parent recorded at dispatch — and only this one is
+    history. Sanitized like every other caller-supplied string: a TAB in it would forge a
+    field. Under the tasks lock like today (the archive write borrows it), plus the archive's own
     lock — ordering is always tasks→archive, so no deadlock. A failed tasks rewrite
     is LOUD (stderr + rc 1), matching _gwt_archive_branch: the task list stays
     untouched and the archive may have gained the rows — visible, never silent."""
@@ -604,32 +1066,60 @@ def cmd_task_archive(args):
     branch = rest[0]
     if not branch:
         return 0
+    into = _sanitize_field(rest[1])
     root_canon = canon(root) if root else None
     ts = str(int(time.time()))
-    tp, ap = PATHS["tasks"](), PATHS["archive"]()
-    with lock(tp), lock(ap):
-        lines = read_lines("tasks")          # inside the lock (B1's rule)
-        kept, moved_rows, moved_dirs = [], [], []
+    conn = _connect(False)
+    ok, moved_dirs = True, []
+    if conn is None:
+        # Two very different Nones. No store at all means there is nothing of this branch to
+        # move — rc 0, today's behaviour. A store that EXISTS but cannot be opened (unwritable
+        # library, corrupt file) is the failure the old unwritable-store-dir path used to
+        # produce, and it has to stay LOUD: swallowing it would report "archived nothing" for
+        # a branch whose rows are still sitting there.
+        if _LAST_ERR is None:
+            return 0
+        ok = False
+    try:
+        if conn is None:
+            raise sqlite3.Error("state library unavailable")
+        conn.execute("BEGIN IMMEDIATE")
+        lines = _get(conn, "tasks")          # inside the transaction (B1's rule)
+        kept, moved_rows = [], []
         for line in lines:
             f = fields(line)
-            hit = len(f) >= 2 and f[1] == branch
+            hit = len(f) > TASK.branch and f[TASK.branch] == branch
             if hit and root_canon is not None:
-                hit = under_root(f[3] if len(f) > 3 else "", root_canon)
+                hit = under_root(f[TASK.dir] if len(f) > TASK.dir else "", root_canon)
             if hit:
-                moved_rows.append(line + "\t" + ts)
-                if len(f) >= 4 and f[3]:
-                    moved_dirs.append(f[3])
+                moved_rows.append(line + "\t" + ts + ("\t" + into if into else ""))
+                if len(f) > TASK.dir and f[TASK.dir]:
+                    moved_dirs.append(f[TASK.dir])
             else:
                 kept.append(line)
+        # The whole move is ONE transaction, which is what retires spec 3.5 defect 5: the
+        # archive append and the task-list rewrite used to be two separate writes, so a
+        # failure between them left rows in both places and the error message had to admit
+        # it. The message below is kept verbatim anyway — it is user-visible text, its
+        # defensive wording costs nothing, and the C2b report carries the reachability
+        # analysis rather than a silent edit.
+        # ONE exit, one COMMIT: "nothing matched" still has a transaction open and has to
+        # close it, and writing that as a second COMMIT would make "this function opens
+        # exactly one transaction" unassertable — the property §39 pins is structural, so
+        # the structure has to stay legible.
+        if moved_rows:
+            _put(conn, "archive", _get(conn, "archive") + moved_rows)
+            _put(conn, "tasks", kept)
+        conn.execute("COMMIT")
         if not moved_rows:
             return 0
-        try:
-            with open(ap, "a", encoding="utf-8",
-                      errors="surrogateescape", newline="") as f:
-                f.write("".join(r + "\n" for r in moved_rows))
-        except OSError:
-            pass
-        ok = _write_unlocked(tp, kept)
+    except sqlite3.Error:
+        if conn is not None:                  # may never have opened at all
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+        ok = False
     if not ok:
         print("cc-state: archive rewrite failed — task list left untouched "
               "(the archive may have gained rows)", file=sys.stderr)
@@ -637,7 +1127,7 @@ def cmd_task_archive(args):
     moved_canon = [(d, canon(d)) for d in moved_dirs]
     def fn(rows):
         return [l for l in rows
-                if not any(dir_match(fields(l)[0], d, c) for d, c in moved_canon)]
+                if not any(dir_match(fields(l)[SIDE.dir], d, c) for d, c in moved_canon)]
     rewrite("status", fn)
     for d in moved_dirs:
         print(d)
@@ -650,7 +1140,21 @@ def cmd_task_mark_opened(args):
     for 120s (cc-dispatch.sh: "failures leave no blocking marker")."""
     if len(args) != 1:
         return _usage("task-mark-opened <dir>")
-    _touch_marker(args[0])
+    conn = _connect(True)
+    if conn is None:
+        return 0                       # `|| true` today; never fail a dispatch
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        seq = _task_seq(conn, args[0])
+        if seq is not None:
+            conn.execute("UPDATE tasks SET tab_opened_ts=? WHERE seq=?",
+                         (int(time.time()), seq))
+        conn.execute("COMMIT")
+    except sqlite3.Error:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
     return 0
 
 def cmd_task_opened_recently(args):
@@ -662,11 +1166,23 @@ def cmd_task_opened_recently(args):
         win = int(args[1])
     except ValueError:
         return _usage("task-opened-recently <dir> <seconds>")
-    try:
-        mt = os.stat(_marker(args[0])).st_mtime
-    except OSError:
+    conn = _connect(False)             # a read must not bring the library into existence
+    if conn is None:
         return 1
-    return 0 if (time.time() - mt) < win else 1
+    try:
+        seq = _task_seq(conn, args[0])
+        if seq is None:
+            return 1
+        row = conn.execute("SELECT tab_opened_ts FROM tasks WHERE seq=?",
+                           (seq,)).fetchone()
+    except sqlite3.Error:
+        return 1
+    # tab_opened_ts ONLY, never created_at (spec §3.1, window B): a row re-opened by
+    # resume keeps its original created_at, so reading that would let the dispatch right
+    # after a resume through the dedup gate and open a SECOND tab for the same dir.
+    if not row or row[0] is None:
+        return 1
+    return 0 if (time.time() - row[0]) < win else 1
 
 # ── tabs store ──────────────────────────────────────────────────────────────────
 # Row: suuid \t owner \t dir \t session \t time. Empty owner/dir/session are written
@@ -729,9 +1245,9 @@ def cmd_tab_list(args):
     self_u = _self_uuid()
     for line in read_lines("tabs"):
         f = fields(line)
-        if not f[0]:
+        if not f[TAB.suuid]:
             continue
-        owner = ("" if len(f) < 2 or f[1] == "-" else f[1])
+        owner = ("" if len(f) <= TAB.owner or f[TAB.owner] == "-" else f[TAB.owner])
         if args == [] and self_u and owner != self_u:
             continue
         print(line)
@@ -742,8 +1258,8 @@ def _tabs_owner_of(suuid):
     owner ("-" and empty do not count)."""
     for line in reversed(read_lines("tabs")):
         f = fields(line)
-        if len(f) > 1 and f[0] == suuid and f[1] not in ("", "-"):
-            return f[1]
+        if len(f) > TAB.owner and f[TAB.suuid] == suuid and f[TAB.owner] not in ("", "-"):
+            return f[TAB.owner]
     return ""
 
 def cmd_tab_resolve(args):
@@ -769,21 +1285,24 @@ def cmd_tab_resolve(args):
     out = []
     for line in reversed(read_lines("tasks")):   # newest board row for the dir
         f = fields(line)
-        if len(f) >= 4 and f[3] and dir_match(f[3], raw_given, canon_given):
+        if (len(f) > TASK.dir and f[TASK.dir]
+                and dir_match(f[TASK.dir], raw_given, canon_given)):
             su, owner = "", ""
-            if len(f) >= 8:
-                su = _identity(_largs_seg(f[7], "suuid"))
-                owner = _largs_seg(f[7], "csuuid").upper()
+            if len(f) > TASK.launch_args:
+                su = _identity(_largs_seg(f[TASK.launch_args], "suuid"))
+                owner = _largs_seg(f[TASK.launch_args], "csuuid").upper()
             if su:
                 if not owner:
                     owner = _tabs_owner_of(su)
                 out.append("\t".join(
-                    ["board", su, owner or "-", (f[1] if len(f) > 1 and f[1] else "-")]))
+                    ["board", su, owner or "-",
+                     (f[TASK.branch] if len(f) > TASK.branch and f[TASK.branch] else "-")]))
             break                               # close reads the newest row only
     for line in reversed(read_lines("tabs")):    # _cctabs_by_dir: RAW row dir ==
         f = fields(line)                         # canon(given) or the given string
-        if len(f) >= 3 and f[0] and dir_match(f[2], raw_given, canon_given):
-            su = _identity(f[0])
+        if (len(f) > TAB.dir and f[TAB.suuid]
+                and dir_match(f[TAB.dir], raw_given, canon_given)):
+            su = _identity(f[TAB.suuid])
             if su:
                 out.append("\t".join(
                     ["tabs", su, _tabs_owner_of(su) or "-", "-"]))
@@ -826,15 +1345,15 @@ def cmd_tab_prune(args):
     if any(l.strip() == "!partial" for l in map_lines):
         return 0
     keys = set()
-    for l in map_lines:
-        f = l.split("\t")
-        if len(f) >= 2 and f[1]:
-            keys.add(f[1].upper())
+    for l in map_lines:                   # cmux's live map, NOT a store: its own format
+        mf = l.split("\t")               # (surface-ref \t uuid \t workspace). Named `mf`
+        if len(mf) >= 2 and mf[1]:        # so the "no bare position on a store row" pin
+            keys.add(mf[1].upper())       # in §39 does not have to carve out an exception
     if not keys:
         return 0
     def fn(rows):
         return [l for l in rows
-                if len(fields(l)) > 1 and fields(l)[0] in keys]
+                if len(fields(l)) > TAB.owner and fields(l)[TAB.suuid] in keys]
     rewrite("tabs", fn)
     return 0
 
@@ -843,27 +1362,105 @@ def cmd_dump(args):
     if len(args) != 1 or args[0] not in PATHS:
         print("usage: cc-state dump tasks|status|archive|tabs", file=sys.stderr)
         return 2
-    # raw byte passthrough — byte-identical to `cat`, including a missing trailing
-    # newline. Never reconstruct from parsed fields, and never touch the lock:
-    # today's readers take no lock at all (see the lock block's note). A missing
-    # store is an empty store (silent rc 0, today's behaviour) and a vanished
-    # downstream reader is not an error either — but a genuine read failure is
-    # LOUD, like cat's non-zero exit: swallowing it with a blanket `except
-    # OSError` (BrokenPipeError is an OSError!) would report partial output as
-    # success (round-3 gate C3).
-    p = PATHS[args[0]]()
+    # This used to be a raw byte passthrough of the store FILE, with a comment saying
+    # "never reconstruct from parsed fields". There is no file any more, so dump can
+    # ONLY reconstruct — byte equivalence stops being a passthrough guarantee and
+    # becomes a REBUILD guarantee, paid for by nf (a 7-field legacy row renders as 7
+    # fields) and seq (rows come back in insertion order). §32's frozen oracle is what
+    # keeps that honest: F32OR1/F32OR2 are literals recorded from the writer this
+    # facade replaced, so they compare the rebuild against something independent of it.
+    # ONE deliberate deviation lands here, written up in state-model §3.5: a hand-edited
+    # final line with no trailing newline gets one on the way through.
+    #
+    # An empty store is silent rc 0 (today's behaviour for a missing file) and a
+    # vanished downstream reader is not an error either — but a library that cannot be
+    # opened or read IS loud, like cat's non-zero exit. Swallowing that with a blanket
+    # `except OSError` (BrokenPipeError is an OSError!) would report partial output as
+    # success (round-3 gate C3), so the two are separated by hand.
+    lines = read_lines(args[0])
+    if _LAST_ERR is not None:
+        print("cc-state: dump %s: %s" % (args[0], _LAST_ERR), file=sys.stderr)
+        return 1
     try:
-        with open(p, "rb") as f:
-            sys.stdout.buffer.write(f.read())
-    except (FileNotFoundError, BrokenPipeError):
+        if lines:
+            sys.stdout.buffer.write(_enc("\n".join(lines) + "\n"))
+    except BrokenPipeError:
         pass
     except OSError as e:
         print("cc-state: dump %s: %s" % (args[0], e), file=sys.stderr)
         return 1
     return 0
 
+def cmd_load(args):
+    """`dump`'s inverse: REPLACE a store's rows with the raw lines of <file> ('-' =
+    stdin). rc 0 = written, 1 = the source could not be read (or the write failed),
+    2 = usage.
+
+    Why this exists. Until the stores were files, "fix one corrupted row" was
+    `$EDITOR worktree-tasks.tsv` — the move this project actually made all through
+    audit-0821. `dump` alone gives that back only as far as READING; the pair
+    `dump > f && $EDITOR f && load f` gives back the whole move. The same property
+    is what the suite needs from a fixture: 7-field legacy rows, an empty middle
+    field, a lone non-UTF-8 byte are expressible as BYTES and in no other way, so
+    the fixtures that used to `printf` straight at the file come through here.
+
+    It deliberately bypasses every verb's semantics — no canonicalization, no
+    sanitization, no membership rule, no dedup — and replaces the whole store
+    rather than merging into it. That is a footgun, and it is exactly the footgun a
+    text editor pointed at the TSV always was, so it gets documentation (--help,
+    README) rather than a gate.
+
+    One normalization, the same one the row reader already applies: the source is
+    split on \\n and a missing final newline is supplied on write, so a hand-edited
+    file whose last line lacks one still round-trips as that many rows. Bytes are
+    read RAW and decoded with surrogateescape — a store holding a non-UTF-8 byte
+    must survive dump → load → dump unchanged, and a locale-dependent decode (the
+    text-mode default under LC_ALL=C) would corrupt it."""
+    if len(args) != 2 or args[0] not in PATHS:
+        return _usage("load tasks|status|archive|tabs <file>   "
+                      "(- = stdin; REPLACES the whole store)")
+    store, src = args
+    try:
+        if src == "-":
+            raw = sys.stdin.buffer.read()
+        else:
+            with open(src, "rb") as f:
+                raw = f.read()
+    except OSError as e:
+        print("cc-state: load %s: %s" % (store, e), file=sys.stderr)
+        return 1
+    lines = raw.decode("utf-8", "surrogateescape").split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    # C2a had to reach past the storage layer here (lock + _write_unlocked) to keep the
+    # five storage functions byte-frozen for that task's gate. The engine swap folds it
+    # back in, alongside task-archive's identical bypass: write_lines now returns success,
+    # so the one verb whose whole job IS the write can say the write did not happen.
+    if not write_lines(store, lines):
+        print("cc-state: load %s: write failed, store left as it was" % store,
+              file=sys.stderr)
+        return 1
+    return 0
+
+def cmd_exists(args):
+    """rc 0 = this store holds at least one row, rc 1 = it does not. Zero output on
+    both — the callers are `||` guards in shell, and a guard that prints is a guard
+    that leaks into a board's output.
+
+    The callers this replaces all asked `[ -f <store> ]`, and they asked it for one
+    reason: to tell "there is no store" apart from "the store is there and nothing
+    in it matched", which are two different sentences to a human. Those two
+    questions were the same question only because the old rewriter DELETED a store it
+    emptied, so a file that existed always had a row in it. Defining the verb on ROWS
+    is what keeps the sentence the caller prints correct now that the four TSVs ARE
+    one library and there is no per-store file left to stat. The contract did not move
+    for the engine swap — only its implementation did, exactly as Task 1 predicted."""
+    if len(args) != 1 or args[0] not in PATHS:
+        return _usage("exists tasks|status|archive|tabs")
+    return 0 if read_lines(args[0]) else 1
+
 VERBS = {
-    "dump": cmd_dump,
+    "dump": cmd_dump, "load": cmd_load, "exists": cmd_exists,
     "task-add": cmd_task_add, "task-set-launch": cmd_task_set_launch,
     "task-get": cmd_task_get, "task-list": cmd_task_list,
     "task-set-state": cmd_task_set_state, "task-clear-state": cmd_task_clear_state,
@@ -879,12 +1476,40 @@ def main(argv):
     if not argv or argv[0] in ("-h", "--help"):
         print("usage: cc-state <verb> ... — the single reader/writer of cc-stack state")
         print("verbs: " + " ".join(sorted(VERBS)))
+        print("note: `load <store> <file|->` REPLACES that whole store, bypassing "
+              "every verb's semantics — it is the write half of the hand-edit path "
+              "in README's troubleshooting section.")
         return 2
     v = argv[0]
     if v not in VERBS:
         print("cc-state: unknown verb: " + v, file=sys.stderr)
         return 2
     return VERBS[v](argv[1:])
+
+def _shutdown():
+    """Close the library before the interpreter goes away.
+
+    Deterministic release of the file lock instead of whatever the interpreter does on
+    the way out — which is not the same everywhere, and the difference is measured:
+    3.14.7 (sqlite 3.53) ends up with `x.db`, 3.9.6 (macOS's system sqlite 3.51 — the
+    build /usr/bin/python3 links, and therefore the one the HOOK runs on every prompt of
+    every session) ends up with `x.db x.db-shm x.db-wal`.
+
+    Note what this does NOT do: it does not make the two outcomes the same. The sidecars
+    surviving a clean `close()` is the sqlite build's behaviour, not the interpreter's —
+    measured directly, connect → write → close still leaves them on 3.51. They are
+    harmless (the next open recovers them, sqlite owns their lifetime) and §39 asserts
+    the honest invariant instead: a clean exit leaves nothing beside the library EXCEPT
+    those two, and the next process sees every row.
+    Never raises — this runs on the hook's path, where every failure must stay silent."""
+    global _CONN
+    if _CONN is None:
+        return
+    try:
+        _CONN.close()
+    except (sqlite3.Error, OSError):
+        pass
+    _CONN = None
 
 if __name__ == "__main__":
     try:
@@ -903,3 +1528,7 @@ if __name__ == "__main__":
         # (85 bytes of traceback noise per `dump | head` on a big store — B13).
         os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
         sys.exit(0)
+    finally:
+        # finally, not a call in each branch: an unhandled error is exactly when the
+        # connection is most likely to be open, and SystemExit passes through here too.
+        _shutdown()

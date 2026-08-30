@@ -79,7 +79,9 @@ rules-docs;各线修掉的条目在 known-issues 标「修于 2026-08-21(feature
 
 audit-0821 定界,每项单独立项:
 
-- **A 状态散落 8 处 → 单一 `cc-state` 模块**(python3 已是硬依赖)
+- ~~**A 状态散落 8 处 → 单一 `cc-state` 模块**(python3 已是硬依赖)~~ —— **已完成 2026-08-29**,
+  五期全落(A 门面 / B 测试脱格式 / C 换 sqlite+WAL / D 收敛模型 / D2 具名列 + 一个 dir 一行)。
+  设计与偏离见 `docs/state-model.md`,D 与 D2 的实施记录见 `docs/state-model-d-plan.md`。
 - **B zsh/bash 双实现 → `gwt <verb>` 单一 bash 入口**,worktree.zsh 只留 cd 与补全
   (吞掉队列 #3 的形态决定)。**2026-08-22 人工决定:暂不实施,只记录。**
   痛点是真的(本轮父会话全程用 `zsh -c 'source worktree.zsh; gwt-merge …'` 驱动落地),

@@ -104,9 +104,13 @@ if [ -n "$SRC" ] && [ "$SRC" != "$DEST" ]; then
     # 2026-08-16 by the commit-gate migration, whose own test run leaked a hook this way.
     ( cd "$SRC" && find . -type f ! -path './.git/*' ! -name '.git' ! -name '*.bak.*' \
         ! -name 'worktree-tasks.tsv' ! -name 'worktree-tasks-archive.tsv' ! -name 'worktree-status.tsv' \
-        ! -name 'opened-tabs.tsv' ! -name 'cc-failures.log' ! -name '.DS_Store' -print0 ) \
+        ! -name 'opened-tabs.tsv' ! -name 'cc-failures.log' ! -name '.DS_Store' \
+        ! -name 'cc-state.db' ! -name 'cc-state.db-wal' ! -name 'cc-state.db-shm' \
+        ! -name '*.migrated.*' -print0 ) \
       | while IFS= read -r -d '' f; do mkdir -p "$DEST/$(dirname "$f")"; cp -p "$SRC/$f" "$DEST/$f"; done
     say "  ✓ installed"
+    say "    state: the four *.tsv ledgers become one sqlite library (cc-state.db) on first"
+    say "           use; the old files are kept as <name>.migrated.<ts>, never deleted."
   fi
 else
   say "  ✓ source is the target, configuring in place"

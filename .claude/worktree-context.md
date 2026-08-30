@@ -21,7 +21,7 @@
 - unchanged: cc-merge.sh, cc-trust.sh, cc-worktree-shared.sh (+ the cc-claude router); install.sh registers the hooks and strips stale pre-consolidation registrations
 
 ## Environment traps
-- tests never write the live TSVs — always via CC_TASKS_FILE / CC_STATUS_FILE / CC_ARCHIVE_FILE / CC_TABS_FILE / CC_TRUST_CFG_OVERRIDE / CC_SEND_FAILLOG overrides
+- tests never write live state — always via CC_STATE_DB (D 期起这是状态的唯一路径开关：遗留 TSV 一律在库的同一目录里找，四个 CC_*_FILE 已退役) / CC_TRUST_CFG_OVERRIDE / CC_SEND_FAILLOG overrides
 - **a sub-task edits only inside its own worktree.** The primary checkout is ALSO the live install dir, so a draft written there becomes the hook/dispatcher every session on this machine runs, and sibling worktrees read it through the hardcoded `~/.config/cc-stack/` paths. Briefs quote absolute paths for READING; writing there is out of bounds (2026-08-21: three of four lines did it — one left a half-edited dispatcher live, another poisoned a sibling's test run)
 - **any test that can reach `cc-dispatch.sh workspace|surface` must shim cmux on PATH.** They only check `command -v cmux` + `cmux ping`, both true on this machine, so an unshimmed case opens a REAL workspace and can steal focus (2026-08-22: 11 leaked). Count `cmux list-workspaces` before and after a suite run
 - test.sh must not use fixed `/tmp/<name>` scratch files: several worktrees run the suite in parallel and overwrite each other's, which shows up as isolated §1/§28 failures that look like code bugs — use `mktemp`
