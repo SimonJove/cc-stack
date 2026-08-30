@@ -1486,6 +1486,31 @@ def main(argv):
         return 2
     return VERBS[v](argv[1:])
 
+def _shutdown():
+    """Close the library before the interpreter goes away.
+
+    Deterministic release of the file lock instead of whatever the interpreter does on
+    the way out — which is not the same everywhere, and the difference is measured:
+    3.14.7 (sqlite 3.53) ends up with `x.db`, 3.9.6 (macOS's system sqlite 3.51 — the
+    build /usr/bin/python3 links, and therefore the one the HOOK runs on every prompt of
+    every session) ends up with `x.db x.db-shm x.db-wal`.
+
+    Note what this does NOT do: it does not make the two outcomes the same. The sidecars
+    surviving a clean `close()` is the sqlite build's behaviour, not the interpreter's —
+    measured directly, connect → write → close still leaves them on 3.51. They are
+    harmless (the next open recovers them, sqlite owns their lifetime) and §39 asserts
+    the honest invariant instead: a clean exit leaves nothing beside the library EXCEPT
+    those two, and the next process sees every row.
+    Never raises — this runs on the hook's path, where every failure must stay silent."""
+    global _CONN
+    if _CONN is None:
+        return
+    try:
+        _CONN.close()
+    except (sqlite3.Error, OSError):
+        pass
+    _CONN = None
+
 if __name__ == "__main__":
     try:
         _rc = main(sys.argv[1:])
@@ -1503,3 +1528,7 @@ if __name__ == "__main__":
         # (85 bytes of traceback noise per `dump | head` on a big store — B13).
         os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
         sys.exit(0)
+    finally:
+        # finally, not a call in each branch: an unhandled error is exactly when the
+        # connection is most likely to be open, and SystemExit passes through here too.
+        _shutdown()

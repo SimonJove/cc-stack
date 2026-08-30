@@ -5242,10 +5242,40 @@ eq "39 a downgrade round trip keeps the state" "$(dg39 dump status | wc -l | tr 
 eq "39 ...and it is the same state"            "$(dg39 dump status | cut -f2)" "working"
 eq "39 ...and the sidecar table is gone again" \
   "$(python3 -c 'import sqlite3,sys; print(sqlite3.connect(sys.argv[1]).execute("SELECT count(*) FROM sqlite_master WHERE type=\"table\" AND name=\"status\"").fetchone()[0])' "$DG39/cc-state.db")" "0"
-# -wal/-shm exist only while a connection is open; a clean exit takes them with it. They are
-# NOT asserted in §24's live oracle for exactly that reason, but here the process has ended.
-eq "39 a clean exit leaves no WAL sidecars" \
-  "$(ls "$S39"/cc-state.db-wal "$S39"/cc-state.db-shm 2>/dev/null | wc -l | tr -d ' ')" "0"
+# CHANGED 2026-08-29. This used to assert the -wal/-shm sidecars are GONE after a clean exit.
+# That belief is FALSE on the floor python: macOS's system sqlite (3.51, the build
+# /usr/bin/python3 links — and therefore the one the HOOK runs on every prompt of every
+# session) keeps them across close(); a newer sqlite (3.53) removes them. Measured directly,
+# connect → write → close, not inferred. The suite could not see it because a developer shell
+# has a much newer python3 first on PATH — which is what the floor probe below now covers.
+# The honest invariant, and the one this replaced the mkdir-lock assertions with: a clean exit
+# leaves nothing a next process has to clean up — no litter other than the library's own two
+# sidecars, and every row already visible.
+WL39=$(mktemp -d)
+env CC_STATE_DB="$WL39/cc-state.db" "$CC/cc-state" task-add /d/wl feat/wl s:1 'wal probe' p
+eq "39 a clean exit leaves no litter beside the library" \
+  "$(ls -A "$WL39" | grep -vE '^cc-state\.db(-wal|-shm)?$' | wc -l | tr -d ' ')" "0"
+eq "39 ...and the next process sees the row" \
+  "$(env CC_STATE_DB="$WL39/cc-state.db" "$CC/cc-state" dump tasks | wc -l | tr -d ' ')" "1"
+rm -rf "$WL39"
+# ── the FLOOR python, by name ────────────────────────────────────────────────────────────────
+# Everything else in this suite runs on whatever python3 is first on PATH, which in a developer
+# shell is not the one that matters: cc-hooks.sh resolves to /usr/bin/python3 under a stripped
+# PATH. 1354 assertions were green on 3.14 while the floor behaved differently, so the floor
+# gets asked for BY NAME — migration, read and write, on the schema it actually lands on.
+if [ -x /usr/bin/python3 ]; then
+  FL39=$(mktemp -d)
+  printf '2026-01-01 00:00:01\tfeat/fl\ts:1\t/d/fl\tc\tfloor row\tmain\n' > "$FL39/worktree-tasks.tsv"
+  fl39(){ env CC_STATE_DB="$FL39/cc-state.db" /usr/bin/python3 "$CC/cc-state" "$@"; }
+  eq "39 the floor python migrates a legacy TSV" "$(fl39 dump tasks | cut -f2)" "feat/fl"
+  fl39 task-add /d/fl2 feat/fl2 s:2 'floor add' main
+  fl39 task-set-state /d/fl2 working
+  eq "39 ...writes"                    "$(fl39 dump tasks | wc -l | tr -d ' ')" "2"
+  eq "39 ...and its state columns"     "$(fl39 dump status | cut -f2)" "working"
+  eq "39 ...onto the current schema"   \
+    "$(/usr/bin/python3 -c 'import sqlite3,sys; print(sqlite3.connect(sys.argv[1]).execute("PRAGMA user_version").fetchone()[0])' "$FL39/cc-state.db")" "3"
+  rm -rf "$FL39"
+fi
 
 # ── row ORDER is insertion order (seq), not whatever sqlite feels like ───────────────────────
 # task-prune --compact's newest-per-dir reads file order; without an explicit ordering column
