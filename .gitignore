@@ -25,4 +25,6 @@ __pycache__/
 # transient design docs (local only)
 /docs/plans/
 /docs/specs/
+# local reference repositories (not part of cc-stack)
+/refrepos/
 worktree-status.tsv
