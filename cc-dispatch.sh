@@ -801,8 +801,16 @@ fi
 # CC_CALLER_SURFACE_UUID overrides it (tests; a caller that knows better).
 csuuid="${CC_CALLER_SURFACE_UUID:-${CMUX_SURFACE_ID:-}}"
 case "$csuuid" in *[!0-9A-Fa-f-]*) csuuid="" ;; esac
-ident="$(cmux identify 2>/dev/null)"
+# Pin identity resolution to the stable caller UUID whenever it is available. A bare identify can
+# follow mutable UI focus when an agent dispatches in the background; the explicit target keeps
+# nested/background children attached to the tab that actually launched them.
+if [ -n "$csuuid" ]; then
+  ident="$(cmux identify --surface "$csuuid" 2>/dev/null)"
+else
+  ident="$(cmux identify 2>/dev/null)"
+fi
 caller_surface="$(printf '%s' "$ident" | python3 -c 'import json,sys; print((json.load(sys.stdin).get("caller") or {}).get("surface_ref",""))' 2>/dev/null)"
+caller_pane="$(printf '%s' "$ident" | python3 -c 'import json,sys; print((json.load(sys.stdin).get("caller") or {}).get("pane_ref",""))' 2>/dev/null)"
 caller_ws="$(printf '%s' "$ident" | python3 -c 'import json,sys; print((json.load(sys.stdin).get("caller") or {}).get("workspace_ref",""))' 2>/dev/null)"
 
 # Open the new surface (tab): in the caller's workspace, background, no focus steal. Short retry to ride out hiccups.
@@ -813,7 +821,9 @@ caller_ws="$(printf '%s' "$ident" | python3 -c 'import json,sys; print((json.loa
 #   flag simply print the ref; the list-pane-surfaces join below fills the uuid in.
 ref=""; nsout=""
 for _ in 1 2 3 4 5; do
-  if [ -n "$caller_ws" ]; then
+  if [ -n "$caller_ws" ] && [ -n "$caller_pane" ]; then
+    nsout="$(cmux new-surface --type terminal --working-directory "$abspath" --focus false --workspace "$caller_ws" --pane "$caller_pane" --id-format both 2>/dev/null)"
+  elif [ -n "$caller_ws" ]; then
     nsout="$(cmux new-surface --type terminal --working-directory "$abspath" --focus false --workspace "$caller_ws" --id-format both 2>/dev/null)"
   else
     nsout="$(cmux new-surface --type terminal --working-directory "$abspath" --focus false --id-format both 2>/dev/null)"
@@ -823,6 +833,16 @@ for _ in 1 2 3 4 5; do
   sleep 0.4
 done
 [ -n "$ref" ] || { _fail "cmux new-surface failed to open a tab"; exit 1; }
+
+# Keep the child beside the parent that dispatched it. cmux otherwise chooses the insertion index
+# from mutable UI state, so background/nested dispatches can appear at the end or beside whichever
+# tab the human most recently focused. Placement is fail-soft after creation: an ordering hiccup
+# must not turn an already-open tab into an abandoned worktree with no agent, but it is breadcrumbed.
+if [ -n "$caller_surface" ] && [ -n "$caller_ws" ]; then
+  if ! cmux reorder-surface --surface "$ref" --after "$caller_surface" --workspace "$caller_ws" --focus false >/dev/null 2>&1; then
+    _fail "opened $ref, but could not place it immediately after caller $caller_surface"
+  fi
+fi
 
 # The child tab's own STABLE surface uuid (board field suuid; see cc-board.sh). Parsed off the
 # new-surface line by FIELD position (never a sed pattern mixing literal parens with wildcards —

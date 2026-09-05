@@ -3929,7 +3929,9 @@ cat > "$S35/cmux" <<'CMUX35'
 #!/usr/bin/env bash
 case "$1" in
   ping) exit 0 ;;
-  identify) echo '{ "caller": { "surface_ref": "surface:9", "workspace_ref": "workspace:1" } }' ;;
+  identify)
+    shift; printf 'IDENTIFY|%s\n' "$*" >> "$CC_35_LOG"
+    echo '{ "caller": { "surface_ref": "surface:9", "pane_ref": "pane:7", "workspace_ref": "workspace:1" } }' ;;
   list-workspaces)
     [ -n "${CC_35_NOWS:-}" ] && exit 0
     printf '* workspace:1  fake  [selected]\n' ;;
@@ -3937,7 +3939,10 @@ case "$1" in
   new-surface)
     n=$(cat "${CC_35_LOG}.nscnt" 2>/dev/null || echo 500); n=$((n+1)); echo "$n" > "${CC_35_LOG}.nscnt"
     printf 'NEWSURF|surface:%s|%s\n' "$n" "$*" >> "$CC_35_LOG"
-    printf 'OK surface:%s (99999999-7777-7777-7777-%012d) pane:1 (P) workspace:1 (W)\n' "$n" "$n" ;;
+    printf 'OK surface:%s (99999999-7777-7777-7777-%012d) pane:7 (P) workspace:1 (W)\n' "$n" "$n" ;;
+  reorder-surface)
+    shift; printf 'REORDER|%s\n' "$*" >> "$CC_35_LOG"
+    [ -z "${CC_35_REORDER_FAIL:-}" ] || exit 1 ;;
   close-surface) shift; printf 'CLOSE|%s\n' "$*" >> "$CC_35_LOG" ;;
   send)     shift; printf 'SEND|%s\n' "$*" >> "$CC_35_LOG"
             case "$*" in *ccteam*|*"cld "*) : > "${CC_35_LOG}.launched" ;; esac ;;
@@ -3997,6 +4002,12 @@ env PATH="$S35:$OP35" TMPDIR="$TMPDIR" CC_STATE_DB="$DB_35" \
   bash "$CC/cc-dispatch.sh" surface "$DD35" "window probe brief" >/dev/null 2>&1
 eq "35 board row exists while the tab is still settling" "$(cat "${CC_35_LOG}.saw" 2>/dev/null)" "row"
 eq "35 dispatch opened exactly one tab"  "$(grep -c 'NEWSURF' "$CC_35_LOG")" "1"
+eq "35 identify is pinned to the stable caller uuid" \
+  "$(grep -c '^IDENTIFY|--surface CCCCCCCC-3333-3333-3333-333333333333$' "$CC_35_LOG")" "1"
+eq "35 child tab opens in the caller pane" "$(grep -c 'NEWSURF.*--pane pane:7' "$CC_35_LOG")" "1"
+eq "35 child creation stays in the background" "$(grep -c 'NEWSURF.*--focus false' "$CC_35_LOG")" "1"
+eq "35 child tab is immediately right of its caller" \
+  "$(grep -c '^REORDER|--surface surface:501 --after surface:9 --workspace workspace:1 --focus false$' "$CC_35_LOG")" "1"
 # (Task 8) the dispatch row's assertions read through the facade — task-get picks the dir's
 # newest row (what the old '$4==d' awk selected); TF35 is a section-local file, so the read
 # is env-scoped to it. Expected values unchanged.
@@ -4007,12 +4018,27 @@ eq "35 completed row has its caller ref"  "$(CC_STATE_DB="$DB_35" "$CC/cc-state"
 eq "35 dispatch stamped the dedup timestamp" \
   "$(env CC_STATE_DB="$DB_35" "$CC/cc-state" task-opened-recently "$DD35" 120; echo $?)" "0"
 
+# Ordering is presentation, not task creation: if cmux rejects the reorder after opening the tab,
+# the child must still launch and register, while the placement miss leaves a visible breadcrumb.
+DD35F="$(cn35 "$(mktemp -d)")"; : > "$CC_35_LOG"; rm -f "${CC_35_LOG}.nscnt" "${CC_35_LOG}.launched"
+CC_35_SCREEN="$S35/scr-tui" CC_35_REORDER_FAIL=1 \
+env PATH="$S35:$OP35" TMPDIR="$TMPDIR" CC_STATE_DB="$DB_35" \
+  CC_SEND_FAILLOG="$S35/fail-order" CC_SEND_VERIFY_SEC=0.1 CC_WT_PRETRUST=0 \
+  CC_WT_SESSION_ID="abcdef02-1234-4567-890a-bcdef0123456" \
+  CC_CALLER_SURFACE_UUID="CCCCCCCC-3333-3333-3333-333333333333" \
+  bash "$CC/cc-dispatch.sh" surface "$DD35F" "ordering failure probe" >/dev/null 2>&1
+ord35_rc=$?
+eq "35 reorder failure does not abandon the opened child" "$ord35_rc/$(grep -c 'SEND|.*ccteam' "$CC_35_LOG")" "0/1"
+eq "35 reorder failure leaves a placement breadcrumb" \
+  "$(grep -c 'could not place it immediately after caller surface:9' "$S35/fail-order" 2>/dev/null)" "1"
+
 # H2 window: a fresh marker silently eats the retry; a 121s-stale one lets it through
 n35b=$(grep -c 'NEWSURF' "$CC_35_LOG")
+rows35b="$(CC_STATE_DB="$DB_35" "$CC/cc-state" dump tasks | wc -l | tr -d ' ')"
 env PATH="$S35:$OP35" TMPDIR="$TMPDIR" CC_STATE_DB="$DB_35" \
   CC_SEND_FAILLOG="$S35/fail" CC_SEND_VERIFY_SEC=0.1 CC_WT_PRETRUST=0 \
   bash "$CC/cc-dispatch.sh" surface "$DD35" "retry brief" >/dev/null 2>&1
-eq "35 fresh stamp eats the retry"  "$([ "$(grep -c 'NEWSURF' "$CC_35_LOG")" = "$n35b" ] && [ "$(CC_STATE_DB="$DB_35" "$CC/cc-state" dump tasks | wc -l | tr -d ' ')" = 1 ] && echo yes || echo no)" "yes"
+eq "35 fresh stamp eats the retry"  "$([ "$(grep -c 'NEWSURF' "$CC_35_LOG")" = "$n35b" ] && [ "$(CC_STATE_DB="$DB_35" "$CC/cc-state" dump tasks | wc -l | tr -d ' ')" = "$rows35b" ] && echo yes || echo no)" "yes"
 # 把戳记做旧 121 秒（原来是 touch -t 那个标记文件）
 python3 -c 'import sqlite3, sys, time
 c = sqlite3.connect(sys.argv[1])
@@ -4111,7 +4137,7 @@ eq "35 refreshed row keeps its logical dir string" \
 eq "35 logical row's tab reopened in its dir" \
   "$(grep 'NEWSURF' "$CC_35_LOG" | grep -cF -- "--working-directory $PHYD35")" "1"
 
-rm -rf "$S35" "$FH35" "$R35" "$RD35" "$DD35"
+rm -rf "$S35" "$FH35" "$R35" "$RD35" "$DD35" "$DD35F"
 rm -f "$TF35" "$TB35" "$TF35C" "$TB35C" "$TF35R" "$SF35R"
 unset CC_35_LOG CC_35_SCREEN CC_35_DIR CC_35_LIVE
 if [ -n "$sv35TMP" ]; then export TMPDIR="$sv35TMP"; else unset TMPDIR; fi
