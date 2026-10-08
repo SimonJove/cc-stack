@@ -1517,9 +1517,16 @@ case "$cmd" in
   close-surface)
     printf 'CLOSE|%s\n' "$*" >> "$CC_FAKE_LOG26"
     # a uuid resolves inside the WORKSPACE CONTEXT (docs/known-issues.md): the workspace:2 target
-    # needs --workspace or cmux answers "Surface not found" and exits 1
+    # needs --workspace or cmux answers "Surface not found" and exits 1 (0.65 dropped the old
+    # not_found: code prefix — the raw sentence is all the CLI says now)
     if [ "$s" = "BBBBBBBB-2222-2222-2222-222222222222" ] && [ "$w" != "workspace:2" ]; then
-      echo "Error: not_found: Surface not found: $s" >&2; exit 1
+      echo "Error: Surface not found: $s" >&2; exit 1
+    fi
+    # CC_FAKE_CONFIRM26=1: cmux 0.65 layered on top — a FOUND surface with a live process still
+    # demands --force, so the workspace form must clear BOTH hurdles at once
+    if [ -n "${CC_FAKE_CONFIRM26:-}" ]; then
+      case "$*" in *--force*) ;; *)
+        echo "Error: confirmation_required: Surface has a running process; retry with force=true" >&2; exit 1 ;; esac
     fi ;;
   send)     printf 'SEND|%s\n' "$*" >> "$CC_FAKE_LOG26" ;;
   send-key) printf 'KEY|%s\n'  "$*" >> "$CC_FAKE_LOG26" ;;
@@ -1676,6 +1683,22 @@ CO26="$(cl26 "$WA26")"; crc26=$?
 eq "26 same-workspace close exit0"         "$crc26" "0"
 eq "26 same-workspace close is the bare form" "$(grep -cFx "CLOSE|--surface $UA26" "$CC_FAKE_LOG26")" "1"
 eq "26 same-workspace close does not retry"   "$(grep -c 'CLOSE|' "$CC_FAKE_LOG26")" "1"
+
+# — 0.65 stacks on top of the workspace hop: the bare call answers "Surface not found" (a uuid
+#   resolves inside the caller's workspace context), the --workspace form then answers
+#   confirmation_required, and only --workspace TOGETHER WITH --force goes through — never a
+#   --force without its explicit --surface uuid on any hop.
+mk26; : > "$CC_FAKE_LOG26"
+CO26="$( cd "$R26" && env PATH="$WS26:$OP26" CC_STATE_DB="$DB_26" \
+    CC_CMUX_SESSIONS="$ST26" CC_CALLER_SURFACE_UUID="$UP26" CLAUDECODE=1 CC_FAKE_CONFIRM26=1 \
+    bash "$CC/cc-dispatch.sh" close "$WB26" 2>&1 )"; crc26=$?
+eq "26 0.65 cross-ws busy still closes"    "$crc26" "0"
+eq "26 0.65 hop 1: bare uuid"              "$(sed -n 1p "$CC_FAKE_LOG26")" "CLOSE|--surface $UB26"
+eq "26 0.65 hop 2: add --workspace"        "$(sed -n 2p "$CC_FAKE_LOG26")" "CLOSE|--surface $UB26 --workspace workspace:2"
+eq "26 0.65 hop 3: add --force"            "$(sed -n 3p "$CC_FAKE_LOG26")" "CLOSE|--surface $UB26 --workspace workspace:2 --force"
+eq "26 0.65 cascade is exactly 3 calls"    "$(grep -c 'CLOSE|' "$CC_FAKE_LOG26")" "3"
+eq "26 0.65 forced close announces itself" "$(echo "$CO26" | grep -c 'still had a running process')" "1"
+eq "26 0.65 force never fires bare"        "$(grep -c '^CLOSE|--force' "$CC_FAKE_LOG26")" "0"
 
 # ── consequence four: resume must not reopen a tab that is already back elsewhere ───────────
 # gwt-resume matched restored tabs against the same caller-workspace-only list, so a tab cmux
@@ -3547,7 +3570,27 @@ case "$1" in
   # know what it missed, so it now counts as INCOMPLETE evidence and prunes nothing; without this
   # line the section's lazy-prune assertions would be testing the no-evidence path instead.
   list-workspaces) printf '* workspace:1  fake  [selected]\n' ;;
-  close-surface) shift; printf 'CLOSE|%s\n' "$*" >> "$CC_FAKE_LOG" ;;
+  # close-surface knobs, all defaulting to "just succeed" (the pre-0.65 build this section was
+  # written against): CC_FAKE_CONFIRM=1 — cmux ≥0.65 refuses a surface with a live process
+  # (rc 1, confirmation_required on stderr) unless --force rides along; CC_FAKE_CLOSE_FAIL —
+  # every close fails with this exact stderr (a NON-confirmation failure); CC_FAKE_WSFAIL —
+  # only the --workspace form fails, with this stderr (a DIFFERENT error per form, so a test
+  # can tell whether the ✗ line relayed every attempt or only the last); CC_FAKE_NOFORCE=1 —
+  # an OLD CLI that rejects --force as an unknown flag and never says confirmation_required.
+  close-surface)
+    shift; printf 'CLOSE|%s\n' "$*" >> "$CC_FAKE_LOG"
+    if [ -n "${CC_FAKE_WSFAIL:-}" ]; then
+      case "$*" in *--workspace*) echo "$CC_FAKE_WSFAIL" >&2; exit 1 ;; esac
+    fi
+    if [ -n "${CC_FAKE_CLOSE_FAIL:-}" ]; then echo "$CC_FAKE_CLOSE_FAIL" >&2; exit 1; fi
+    if [ -n "${CC_FAKE_NOFORCE:-}" ]; then
+      case "$*" in *--force*) echo "Error: unknown flag: --force" >&2; exit 1 ;; esac
+    fi
+    if [ -n "${CC_FAKE_CONFIRM:-}" ]; then
+      case "$*" in *--force*) ;; *)
+        echo "Error: confirmation_required: Surface has a running process; retry with force=true" >&2
+        exit 1 ;; esac
+    fi ;;
   send)     shift; printf 'SEND|%s\n' "$*" >> "$CC_FAKE_LOG" ;;
   send-key) shift; printf 'KEY|%s\n'  "$*" >> "$CC_FAKE_LOG" ;;
   read-screen) cat "$CF_SCREEN" 2>/dev/null ;;
@@ -3663,6 +3706,114 @@ CO="$(cl18 "$HD18" "$UO")"; crc=$?
 eq "a THIRD session may not close it" "$crc" "1"
 eq "third-session refusal says not a worktree" "$(echo "$CO" | grep -c 'not a worktree checkout')" "1"
 eq "third-session refusal closes nothing"      "$(grep -c 'CLOSE|' "$CC_FAKE_LOG")" "0"
+
+# — cmux 0.65 (build 108): close-surface REFUSES a surface that still has a live process —
+#   rc 1, stderr "Error: confirmation_required: Surface has a running process; retry with
+#   force=true". A sub-task tab holds a live claude by definition, so every campaign cleanup
+#   since 10-06 fail-closed on this (docs/known-issues.md). The sanctioned primitive retries the
+#   SAME form with --force appended — and ONLY on that exact stderr: --surface keeps naming the
+#   explicit uuid (a force without --surface would default it to $CMUX_SURFACE_ID, i.e. close
+#   the CALLER — the 2026-08-16 incident in its force form), and any OTHER error (not_found,
+#   an unknown flag on an old CLI) must leave the retry arm untouched.
+cf18(){ # $1 = dir, $2 = fake-cmux knob env ("VAR=VAL …") for the 0.65 / old-CLI simulations
+  ( cd "$R18" && env PATH="$CF:$OP18" CC_STATE_DB="$DB_18" CC_CMUX_SESSIONS="$ST18" \
+      CC_CALLER_SURFACE_UUID="$UP" CLAUDECODE=1 ${2:-} bash "$CC/cc-dispatch.sh" close "$1" ) 2>&1; }
+cf18f(){ # $1 = dir, $2 = the EXACT stderr every close must fail with (spaces intact)
+  ( cd "$R18" && env PATH="$CF:$OP18" CC_STATE_DB="$DB_18" CC_CMUX_SESSIONS="$ST18" \
+      CC_CALLER_SURFACE_UUID="$UP" CLAUDECODE=1 CC_FAKE_CLOSE_FAIL="$2" \
+      bash "$CC/cc-dispatch.sh" close "$1" ) 2>&1; }
+: > "$CC_FAKE_LOG"
+CO="$(cf18 "$WA" "CC_FAKE_CONFIRM=1")"; crc=$?
+eq "0.65 busy child still closes (rc 0)"  "$crc" "0"
+eq "0.65 busy close prints ✔ closed"      "$(echo "$CO" | grep -c '✔ closed')" "1"
+eq "0.65 busy close says why it forced"   "$(echo "$CO" | grep -c 'still had a running process')" "1"
+eq "0.65 bare form stays FIRST"           "$(sed -n 1p "$CC_FAKE_LOG")" "CLOSE|--surface $UA"
+eq "0.65 force retried on the SAME form"  "$(sed -n 2p "$CC_FAKE_LOG")" "CLOSE|--surface $UA --force"
+eq "0.65 busy close made exactly 2 calls" "$(grep -c 'CLOSE|' "$CC_FAKE_LOG")" "2"
+eq "0.65 every force names the uuid"      "$(grep 'CLOSE|.*--force' "$CC_FAKE_LOG" | grep -cvF -- "--surface $UA")" "0"
+eq "0.65 no force ever fired bare"        "$(grep -c '^CLOSE|--force' "$CC_FAKE_LOG")" "0"
+# a NON-confirmation failure must not reach for --force — and the ✗ line must relay cmux's
+# original stderr instead of swallowing it (the 10-06 campaign failures had to be diagnosed
+# from timeline + repro precisely because the old ✗ line discarded the error text)
+: > "$CC_FAKE_LOG"
+CO="$(cf18f "$WA" "Error: Surface not found: $UA")"; crc=$?
+eq "0.65 other errors stay failed"        "$crc" "1"
+eq "0.65 other errors never force"        "$(grep -c 'CLOSE|.*--force' "$CC_FAKE_LOG")" "0"
+eq "0.65 ✗ relays cmux's raw error"       "$(echo "$CO" | grep -cF "Surface not found: $UA")" "1"
+# an OLD CLI (no --force flag, no confirmation gate — pre-0.65 semantics): the path it always
+# took is the path it still takes. This is H2's compatibility argument, pinned as a test.
+: > "$CC_FAKE_LOG"
+CO="$(cf18 "$WA" "CC_FAKE_NOFORCE=1")"; crc=$?
+eq "old CLI: unchanged rc 0 close"        "$crc" "0"
+eq "old CLI: bare form alone"             "$(grep -c 'CLOSE|' "$CC_FAKE_LOG")" "1"
+eq "old CLI: no --force ever sent"        "$(grep -c 'CLOSE|.*--force' "$CC_FAKE_LOG")" "0"
+# F1 (gate round 1): the old-CLI trio above only pins the SUCCESS path — with the match widened
+# to any-failure they stay green, i.e. they prove nothing about the retry arm on an old CLI.
+# This is the failure path: an old CLI whose bare close fails for a NON-confirmation reason
+# (not_found), and whose --workspace retry fails too. The force arm must never fire — --force
+# is an unknown flag on that build — and the ✗ line carries the raw error.
+: > "$CC_FAKE_LOG"
+CO="$( cd "$R18" && env PATH="$CF:$OP18" CC_STATE_DB="$DB_18" CC_CMUX_SESSIONS="$ST18" \
+    CC_CALLER_SURFACE_UUID="$UP" CLAUDECODE=1 CC_FAKE_NOFORCE=1 \
+    CC_FAKE_CLOSE_FAIL="Error: Surface not found: $UA" \
+    bash "$CC/cc-dispatch.sh" close "$WA" 2>&1 )"; crc=$?
+eq "old CLI failing: rc 1, no force rescue"   "$crc" "1"
+eq "old CLI failing: form 1 is the bare uuid" "$(sed -n 1p "$CC_FAKE_LOG")" "CLOSE|--surface $UA"
+eq "old CLI failing: form 2 is the ws retry"  "$(sed -n 2p "$CC_FAKE_LOG")" "CLOSE|--surface $UA --workspace workspace:1"
+eq "old CLI failing: exactly the two forms"   "$(grep -c 'CLOSE|' "$CC_FAKE_LOG")" "2"
+eq "old CLI failing: no --force in any form"  "$(grep -c 'CLOSE|.*--force' "$CC_FAKE_LOG")" "0"
+eq "old CLI failing: ✗ relays the raw error"  "$(echo "$CO" | grep -cF "Surface not found: $UA")" "1"
+# F2 (gate round 1): the ✗ line relays EVERY failed attempt with its form named — not only the
+# last one. (The 10-06 campaign failures were diagnosed from timeline + repro precisely because
+# errors were discarded; keeping all but the last is the same disease one hop later.) Distinct
+# stderr per form: bare says not_found, the --workspace form says invalid_state.
+: > "$CC_FAKE_LOG"
+CO="$( cd "$R18" && env PATH="$CF:$OP18" CC_STATE_DB="$DB_18" CC_CMUX_SESSIONS="$ST18" \
+    CC_CALLER_SURFACE_UUID="$UP" CLAUDECODE=1 \
+    CC_FAKE_CLOSE_FAIL="Error: Surface not found: $UA" \
+    CC_FAKE_WSFAIL="Error: invalid_state: Cannot close the last surface" \
+    bash "$CC/cc-dispatch.sh" close "$WA" 2>&1 )"; crc=$?
+eq "✗ relays the BARE attempt's error"       "$(echo "$CO" | grep -cF 'Surface not found: ')" "1"
+eq "✗ relays the WORKSPACE attempt's error"  "$(echo "$CO" | grep -cF 'Cannot close the last surface')" "1"
+eq "✗ names the form of each attempt"        "$(echo "$CO" | grep -c 'bare: .*Error: .*; ws workspace:1: .*Error: ')" "1"
+
+# — G1 (gate round 3): the close helper's own entry guard —
+# _ccclose's first parameter is a LABEL. A future edit that forgets it — `_ccclose --surface
+# "$tuuid" --force` — makes the label eat "--surface"; cmux silently ignores the leftover
+# positional and falls back to --surface's default $CMUX_SURFACE_ID (the CALLER), and --force
+# is exactly what disarms 0.65's own live-process barrier (2026-08-16 with kill power). The
+# guard refuses such a call before cmux is ever reached. The helper is LIFTED and sourced the
+# way §21 lifts the ledger block: the invariant has to hold at the helper itself, not only at
+# the call sites that happen to be correct today.
+GU18="$(awk '/^_ccclose\(\)\{/,/^\}/' "$CC/cc-dispatch.sh")"
+eq "G1: the helper is lifted whole"     "$(printf '%s\n' "$GU18" | grep -c '^_ccclose(){')" "1"
+eq "G1: the guard is in the lifted text" "$(printf '%s\n' "$GU18" | grep -c 'refused a close-surface call')" "1"
+g118(){ # $@ = the argv to hand the lifted helper; prints "RC=<n>" then "LOG=<cclog>"
+  ( set -u
+    PATH="$CF:$OP18"; tuuid="$UA"; ccerr=""; cclog=""
+    eval "$GU18"
+    _ccclose "$@" >/dev/null 2>&1; _g=$?
+    printf 'RC=%s\nLOG=%s\n' "$_g" "$cclog" ) ; }
+: > "$CC_FAKE_LOG"
+G1O="$(g118 --surface "$UA" --force)"                     # the label-less misfire
+eq "G1: misfire refused, rc 1"          "$(printf '%s\n' "$G1O" | sed -n 1p)" "RC=1"
+eq "G1: misfire logged as internal"     "$(printf '%s\n' "$G1O" | grep -c 'internal: refused a close-surface call without --surface')" "1"
+eq "G1: cmux never saw the misfire"     "$(grep -c 'CLOSE|' "$CC_FAKE_LOG")" "0"
+: > "$CC_FAKE_LOG"
+G1O="$(g118 bare --surface "$UA")"                        # the well-formed call still goes through
+eq "G1: well-formed call reaches cmux"  "$(grep -cF "CLOSE|--surface $UA" "$CC_FAKE_LOG")" "1"
+eq "G1: well-formed call succeeds"      "$(printf '%s\n' "$G1O" | sed -n 1p)" "RC=0"
+: > "$CC_FAKE_LOG"
+G1O="$(g118 bare --surface DEADBEEF-0000-0000-0000-000000000000)"   # a DIFFERENT uuid
+eq "G1: a different uuid is refused"    "$(printf '%s\n' "$G1O" | sed -n 1p)" "RC=1"
+eq "G1: different-uuid refusal logged"  "$(printf '%s\n' "$G1O" | grep -c 'internal: refused')" "1"
+eq "G1: cmux never saw that one either" "$(grep -c 'CLOSE|' "$CC_FAKE_LOG")" "0"
+# the policy gate sits BEFORE any close-surface call: under the 0.65 knob a refused close
+# fires no CLOSE line at all — force form included
+: > "$CC_FAKE_LOG"
+CO="$(cf18 "$WB" "CC_FAKE_CONFIRM=1")"; crc=$?
+eq "0.65 policy refusal unchanged"        "$crc" "1"
+eq "0.65 refusal fires no close"          "$(grep -c 'CLOSE|' "$CC_FAKE_LOG")" "0"
 
 # — item A: the board row has NO suuid (pre-ledger child) → resolution falls back to opened-tabs —
 TF18P=$(mktemp -u); TB18P=$(mktemp -u); PW18="$(cn18 "$(mktemp -d)")"; PWD18="$PW18/.claude/worktrees/wtP"; mkdir -p "$PWD18"
@@ -4026,6 +4177,7 @@ env PATH="$S35:$OP35" TMPDIR="$TMPDIR" CC_STATE_DB="$DB_35" \
   CC_SEND_FAILLOG="$S35/fail-order" CC_SEND_VERIFY_SEC=0.1 CC_WT_PRETRUST=0 \
   CC_WT_SESSION_ID="abcdef02-1234-4567-890a-bcdef0123456" \
   CC_CALLER_SURFACE_UUID="CCCCCCCC-3333-3333-3333-333333333333" \
+  CC_LAUNCH_FILE="$S35/launch" \
   bash "$CC/cc-dispatch.sh" surface "$DD35F" "ordering failure probe" >/dev/null 2>&1
 ord35_rc=$?
 eq "35 reorder failure does not abandon the opened child" "$ord35_rc/$(grep -c 'SEND|.*ccteam' "$CC_35_LOG")" "0/1"
@@ -4037,6 +4189,7 @@ n35b=$(grep -c 'NEWSURF' "$CC_35_LOG")
 rows35b="$(CC_STATE_DB="$DB_35" "$CC/cc-state" dump tasks | wc -l | tr -d ' ')"
 env PATH="$S35:$OP35" TMPDIR="$TMPDIR" CC_STATE_DB="$DB_35" \
   CC_SEND_FAILLOG="$S35/fail" CC_SEND_VERIFY_SEC=0.1 CC_WT_PRETRUST=0 \
+  CC_LAUNCH_FILE="$S35/launch" \
   bash "$CC/cc-dispatch.sh" surface "$DD35" "retry brief" >/dev/null 2>&1
 eq "35 fresh stamp eats the retry"  "$([ "$(grep -c 'NEWSURF' "$CC_35_LOG")" = "$n35b" ] && [ "$(CC_STATE_DB="$DB_35" "$CC/cc-state" dump tasks | wc -l | tr -d ' ')" = "$rows35b" ] && echo yes || echo no)" "yes"
 # 把戳记做旧 121 秒（原来是 touch -t 那个标记文件）
@@ -4048,6 +4201,7 @@ c.commit()' "$DB_35"
 CC_35_SCREEN="$S35/scr-tui" \
 env PATH="$S35:$OP35" TMPDIR="$TMPDIR" CC_STATE_DB="$DB_35" \
   CC_SEND_FAILLOG="$S35/fail" CC_SEND_VERIFY_SEC=0.1 CC_WT_PRETRUST=0 \
+  CC_LAUNCH_FILE="$S35/launch" \
   bash "$CC/cc-dispatch.sh" surface "$DD35" "retry brief" >/dev/null 2>&1
 eq "35 stale (121s) stamp lets the retry through" "$(grep -c 'NEWSURF' "$CC_35_LOG")" "1"
 

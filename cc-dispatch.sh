@@ -1145,7 +1145,8 @@ fi
 #        claude binary in the PPID chain), never by an env var a caller could strip; a human
 #        shell is the UI path in shell form, so there the ownership check reports instead of
 #        refusing.
-#     ④ close by the STABLE uuid
+#     ④ close by the STABLE uuid (bare form first, --workspace retry; either form retries once
+#        more with --force — the same explicit uuid — when cmux 0.65 answers confirmation_required)
 #   No live tab for that dir = nothing to do (rc 0): gwt-rm --close must stay idempotent.
 # Usage: cc-dispatch.sh close <worktree-dir>
 # Related env: CC_STATE_DB (board + opened-tabs ledger), CC_CMUX_SESSIONS
@@ -1331,22 +1332,71 @@ else
 fi
 
 # ── ④ close by the STABLE uuid ──
-# A uuid is resolved inside the caller's WORKSPACE CONTEXT: a target in another workspace used to
-# answer "Error: not_found: Surface not found: <uuid>" unless --workspace came along
-# (docs/known-issues.md; this build's read-screen does resolve cross-workspace, so the need is
-# version-dependent). The bare call stays FIRST — it is the shape every caller and test knows, and
-# it is the only one used when the tab is in this workspace — and the workspace the live map just
-# told us about is used only to RETRY what would otherwise be a loud failure.
+# A uuid is resolved inside the caller's WORKSPACE CONTEXT: a target in another workspace answers
+# "Surface not found" unless --workspace comes along (docs/known-issues.md; 0.65 dropped the old
+# not_found: code prefix). The bare call stays FIRST — it is the shape every caller and test knows,
+# and it is the only one used when the tab is in this workspace — and the workspace the live map
+# just told us about is used only to RETRY what would otherwise be a loud failure.
+# cmux 0.65 added a confirmation gate on top: a surface with a LIVE PROCESS (any sub-task tab —
+# its claude is alive by definition) answers rc 1, "confirmation_required: … retry with
+# force=true". Pre-0.65 closed such tabs without asking, and campaign cleanup depends on that
+# semantics, so the SAME form is retried with --force appended — under two hard constraints:
+#   · ONLY on that exact stderr (the `case` match below). Any other failure — not_found, an
+#     unknown flag on an OLD CLI that predates --force (which by construction never says
+#     confirmation_required, so it can never reach the retry) — falls through untouched;
+#   · --surface keeps naming the explicit uuid on EVERY call including the forced one. A bare
+#     `close-surface --force` would default --surface to $CMUX_SURFACE_ID, i.e. force-close the
+#     CALLER itself — the 2026-08-16 incident with kill power (the policy above has already run
+#     by the time any of this fires; force never bypasses it).
+# stderr is captured (ccerr) instead of discarded, and EVERY attempt appends its form label +
+# its own stderr to cclog, so the final ✗ line relays each attempt's words — not only the last
+# one. The 10-06 campaign failures had to be diagnosed from timeline + repro precisely because
+# the old line threw the error text away; keeping just the final attempt would be the same
+# disease one hop later.
 tws="$(_cctabs_where "$live" "$tuuid")"
-if cmux close-surface --surface "$tuuid" >/dev/null 2>&1; then
+ccerr=""; cclog=""
+_ccclose(){ # $1 = form label; rest = the close-surface argv after the subcommand
+  # Entry guard: this helper may only ever close THE uuid step ① resolved, named as an
+  # explicit --surface VALUE. A forgotten label (`_ccclose --surface "$tuuid" --force`) makes
+  # the label eat "--surface"; cmux then silently ignores the leftover positional and falls
+  # back to --surface's default $CMUX_SURFACE_ID — the CALLER — and --force is exactly what
+  # disarms 0.65's own live-process barrier that used to catch such a misfire (2026-08-16,
+  # now with kill power). Refused HERE, before cmux is ever reached; the caller then falls
+  # through to the loud ✗ line below. The comparison is against $tuuid itself, never "any
+  # non-empty value": a different uuid is the same bug wearing a different hat.
+  if [ -z "$tuuid" ] || [ "${2:-}" != "--surface" ] || [ "${3:-}" != "$tuuid" ]; then
+    cclog="${cclog:+$cclog; }$1: internal: refused a close-surface call without --surface $tuuid"
+    return 1
+  fi
+  ccerr="$(cmux close-surface "${@:2}" 2>&1 >/dev/null)"; _cc_cr=$?
+  cclog="${cclog:+$cclog; }$1: ${ccerr:-"(rc $_cc_cr, no stderr)"}"
+  return $_cc_cr
+}
+if _ccclose bare --surface "$tuuid"; then
   echo "✔ closed $tref (uuid $tuuid)"
   exit 0
 fi
-if [ -n "$tws" ] && cmux close-surface --surface "$tuuid" --workspace "$tws" >/dev/null 2>&1; then
-  echo "✔ closed $tref (uuid $tuuid, workspace $tws)"
-  exit 0
+case "$ccerr" in *confirmation_required*)
+  if _ccclose "bare --force" --surface "$tuuid" --force; then
+    echo "  (closed with --force: the tab still had a running process (cmux 0.65 confirmation_required))"
+    echo "✔ closed $tref (uuid $tuuid, forced)"
+    exit 0
+  fi ;;
+esac
+if [ -n "$tws" ]; then
+  if _ccclose "ws $tws" --surface "$tuuid" --workspace "$tws"; then
+    echo "✔ closed $tref (uuid $tuuid, workspace $tws)"
+    exit 0
+  fi
+  case "$ccerr" in *confirmation_required*)
+    if _ccclose "ws $tws --force" --surface "$tuuid" --workspace "$tws" --force; then
+      echo "  (closed with --force: the tab still had a running process (cmux 0.65 confirmation_required))"
+      echo "✔ closed $tref (uuid $tuuid, workspace $tws, forced)"
+      exit 0
+    fi ;;
+  esac
 fi
-echo "✗ cmux close-surface failed for uuid $tuuid${tws:+ (also retried in $tws)}" >&2
+echo "✗ cmux close-surface failed for uuid $tuuid${tws:+ (also retried in $tws)} — $cclog" >&2
 exit 1
 ;;
 

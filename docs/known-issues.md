@@ -135,7 +135,20 @@ status.tsv——拿它们当断言会假阳性,而假阳性的门卫最后都会
 **删除动词(实测定界,2026-08-16)**:
 - **关不掉最后一个 surface**:`cmux close-surface` 关 workspace 里仅剩的那个 surface 会报 `invalid_state: Cannot close the last surface`——所以"把 surface 关光,空 workspace 自己消失"这条路**不存在**;
 - workspace 必须显式删:`cmux workspace close --workspace <ref|uuid>`(旧名 `cmux close-workspace` 仍可用,但会打一行 alias 提示,`CMUX_QUIET=1` 可静音);
-- **UUID 目标跨 workspace 需要上下文**:`cmux close-surface --surface <UUID>` 只在目标位于调用者**当前 workspace** 时直接命中;目标在别的 workspace 里会报 `Error: Surface not found: <UUID>`,要补 `--workspace <ref>`。对 `cc-dispatch.sh close` 的影响:子任务 tab 是在派发方 workspace 里开的,常态命中;若有人把 tab 拖到别的 workspace,关闭会**响亮失败**(`✗ cmux close-surface failed for uuid …`),不会误关别的东西——留作已知残留,未加自动补 `--workspace` 的重试。
+- **UUID 目标跨 workspace 需要上下文**:`cmux close-surface --surface <UUID>` 只在目标位于调用者**当前 workspace** 时直接命中;目标在别的 workspace 里会报 `Error: Surface not found: <UUID>`,要补 `--workspace <ref>`。对 `cc-dispatch.sh close` 的影响:子任务 tab 是在派发方 workspace 里开的,常态命中;若有人把 tab 拖到别的 workspace ~~,关闭会**响亮失败**(`✗ cmux close-surface failed for uuid …`),不会误关别的东西——留作已知残留,未加自动补 `--workspace` 的重试~~ **已修(138ba63,`fix(scope): probe surface liveness across every workspace`——非本条所在分支)**:close 现在会用 live map 给出的 workspace 自动补 `--workspace` 重试,失败仍响亮、仍不会误关别的东西。`--force` 重试臂是 feat/close-force 后来在这之上加的,见下方 0.65 条。
+
+## cmux 0.65 起 close-surface 对活进程要确认(confirmation_required)——已修(2026-10-08,feat/close-force)
+
+**现象**:升级 cmux 0.65.0 (build 108;10-05 14:13 写入,10-06 18:23 进程重启后生效)后,`cc-dispatch.sh close`(以及走它的 `gwt-rm --close`)对任何还有进程在跑的 surface 一律失败。子任务 tab 里 claude 恒活着,所以 **campaign 收尾从 10-06 21:13 起每次都关不掉 tab**(cloudoverture triage-1006 一线;cc-stack 代码本身自 9-05 起未动——纯环境变化)。0.65 之前 cmux 对活进程不问一声直接关。
+
+**机理**(父会话 2026-10-08 实测):`cmux close-surface --surface <uuid>` 在 surface 有活进程时 rc 1,stderr `Error: confirmation_required: Surface has a running process; retry with force=true`;带 `--force` 则 rc 0。空闲 shell 的 tab 不带 `--force` 也能关。旧的 close 把 cmux stderr 丢进 `/dev/null`,现场只剩 `✗ cmux close-surface failed for uuid …`,真实原因只能靠复现+时间线倒推。
+
+**修复**(feat/close-force):close 第 ④ 步的两种形态(bare uuid → `--workspace <ws>` 重试)各自在 stderr 命中 `confirmation_required` 时,**同一形态**追加 `--force` 再试一次;全部失败时 ✗ 行原样转述 cmux 的 stderr,不再吞掉。三条硬约束:
+- `--force` 只在 stderr 命中 `confirmation_required` 时用。`not_found`、旧 CLI 把 `--force` 当未知 flag 等其他失败绝不触发重试臂;旧版 cmux 从不报 confirmation_required,结构上到不了 force(兼容性论证 + test.sh §18 old-CLI 假 cmux 的成功与失败两条路径都钉死——失败路径是 gate round 1 补的);
+- 每次 force 调用都带**同一个显式 `--surface <uuid>`**。不带 `--surface` 的 force 会落到默认值 `$CMUX_SURFACE_ID`——把调用者自己强杀,2026-08-16 自杀事故的 force 版;
+- 第 ③ 步策略检查(not-self / owner / gwt-done 解锁)一个字没动,force 永远绕不过它——父会话 2026-10-08 在真 0.65 上实测确认:非 owner、未 ready 的 tab,`--force` 照样被策略拦下,rc 1,tab 无恙。
+
+另:0.65 的 not_found 报错去掉了 `not_found:` 代码前缀(现在是 `Error: Surface not found: <uuid>`),§26 假 cmux 已同步;cc-stack 对该文本没有匹配依赖。`--workspace` 与 `--force` 的组合也已由父会话在真 0.65 上实测:跨 workspace 的活 tab,`--workspace` 报 confirmation_required 后加 `--force` 关闭成功。
 
 ## ~~cc-board 读循环对空 caller 字段的 TAB 塌缩(存量,未修)~~ 已修(2026-08-16,feat/wtz-board)
 
